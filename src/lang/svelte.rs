@@ -41,7 +41,8 @@ pub fn extract(rel_path: &str, src: &str, blake3_hex: String) -> Result<FileExtr
     let mut refs = Vec::new();
     let mut bridges = Vec::new();
     let mut ir_funcs = Vec::new();
-    let mut comp_aliases: std::collections::HashMap<String, String> = std::collections::HashMap::new();
+    let mut comp_aliases: std::collections::HashMap<String, (String, Option<String>)> =
+        std::collections::HashMap::new();
 
     // Extract all <script ...>...</script> blocks
     let mut search_pos = 0;
@@ -54,24 +55,63 @@ pub fn extract(rel_path: &str, src: &str, blake3_hex: String) -> Result<FileExtr
         let body_end = body_start + close_rel;
         let line_offset = src[..body_start].bytes().filter(|&b| b == b'\n').count();
         let script_src = &src[body_start..body_end];
+        let is_module_script = src[abs_open..body_start].contains("module");
         script_ranges.push((abs_open, body_end + "</script>".len()));
         // Parse default Svelte component imports: import PrimaryButton from './Button.svelte'
         for sline in script_src.lines() {
             let t = sline.trim();
             if let Some(rest) = t.strip_prefix("import ") {
                 if let Some((alias_part, path_part)) = rest.split_once(" from ") {
-                    let alias = alias_part.trim();
+                    let alias = alias_part.split(',').next().unwrap_or("").trim();
                     let path = path_part.trim().trim_end_matches(';').trim_matches('"').trim_matches('\'');
-                    if !alias.contains('{') && path.ends_with(".svelte") {
+                    if !alias.is_empty()
+                        && !alias.starts_with('{')
+                        && !alias.starts_with('*')
+                        && !alias.starts_with("type ")
+                        && path.ends_with(".svelte")
+                    {
                         if let Some(stem) = Path::new(path).file_stem().and_then(|s| s.to_str()) {
-                            comp_aliases.insert(alias.to_string(), stem.to_string());
+                            let resolved_file = ts_js::resolve_relative_path(rel_path, path);
+                            comp_aliases.insert(alias.to_string(), (stem.to_string(), resolved_file));
                         }
                     }
                 }
             }
         }
 
-        if let Ok(sub) = ts_js::extract(rel_path, script_src, String::new(), Language::Svelte, line_offset) {
+        if let Ok(mut sub) = ts_js::extract(rel_path, script_src, String::new(), Language::Svelte, line_offset) {
+            let mut renamed_mod_id: Option<(String, String)> = None;
+            for sym in &mut sub.symbols {
+                if sym.kind == SymbolKind::Script && sym.name == "<module>" {
+                    if is_module_script {
+                        let old_id = sym.id.clone();
+                        let new_id = make_symbol_id(rel_path, "<script:module>", sym.span.start_line);
+                        sym.id = new_id.clone();
+                        sym.name = "<script:module>".to_string();
+                        sym.qualified_name = "<script:module>".to_string();
+                        renamed_mod_id = Some((old_id, new_id));
+                    }
+                    refs.push(RawRef {
+                        from_symbol_id: comp_id.clone(),
+                        target_name: sym.id.clone(),
+                        qualifier: None,
+                        kind: EdgeKind::Calls,
+                        line: sym.span.start_line,
+                    });
+                }
+            }
+            if let Some((old_id, new_id)) = renamed_mod_id {
+                for r in &mut sub.refs {
+                    if r.from_symbol_id == old_id {
+                        r.from_symbol_id = new_id.clone();
+                    }
+                }
+                for b in &mut sub.bridges {
+                    if b.from_symbol_id == old_id {
+                        b.from_symbol_id = new_id.clone();
+                    }
+                }
+            }
             imports.extend(sub.imports);
             symbols.extend(sub.symbols);
             refs.extend(sub.refs);
@@ -109,11 +149,14 @@ pub fn extract(rel_path: &str, src: &str, blake3_hex: String) -> Result<FileExtr
             }
             let tag = &src[start..end];
             if !tag.is_empty() {
-                let target = comp_aliases.get(tag).cloned().unwrap_or_else(|| tag.to_string());
+                let (target, qualifier) = comp_aliases
+                    .get(tag)
+                    .cloned()
+                    .unwrap_or_else(|| (tag.to_string(), None));
                 refs.push(RawRef {
                     from_symbol_id: comp_id.clone(),
                     target_name: target,
-                    qualifier: None,
+                    qualifier,
                     kind: EdgeKind::TemplateRef,
                     line: line_num,
                 });

@@ -57,19 +57,57 @@ pub fn extract(
         let root = tree.root_node();
         let mut rc = root.walk();
         for ch in root.children(&mut rc) {
-            if matches!(
-                ch.kind(),
+            match ch.kind() {
+                "import_statement" => {
+                    // Static import of a relative .svelte file executes its <script module> block
+                    // (skip erased whole-declaration type-only imports: import type ...)
+                    let is_type_only = {
+                        let mut ic = ch.walk();
+                        ch.children(&mut ic).any(|k| k.kind() == "type")
+                    };
+                    if !is_type_only {
+                        if let Some(s) = ch.child_by_field_name("source") {
+                            let path = strip_quotes(node_text(s, src));
+                            if path.ends_with(".svelte") {
+                                if let Some(resolved_file) = resolve_relative_path(rel_path, &path) {
+                                    has_top_level_exec = true;
+                                    refs.push(RawRef {
+                                        from_symbol_id: mod_id.clone(),
+                                        target_name: "<script:module>".to_string(),
+                                        qualifier: Some(resolved_file),
+                                        kind: EdgeKind::Calls,
+                                        line: ch.start_position().row + 1 + line_offset,
+                                    });
+                                }
+                            }
+                        }
+                    }
+                }
                 "expression_statement"
-                    | "if_statement"
-                    | "for_statement"
-                    | "for_in_statement"
-                    | "while_statement"
-                    | "try_statement"
-                    | "lexical_declaration"
-                    | "variable_declaration"
-            ) {
-                has_top_level_exec = true;
-                collect_ts_refs_and_bridges(ch, src, line_offset, &mod_id, &mut refs, &mut bridges);
+                | "if_statement"
+                | "for_statement"
+                | "for_in_statement"
+                | "while_statement"
+                | "try_statement" => {
+                    has_top_level_exec = true;
+                    collect_ts_refs_and_bridges(ch, src, line_offset, &mod_id, &mut refs, &mut bridges);
+                }
+                "lexical_declaration" | "variable_declaration" => {
+                    if collect_ts_non_func_var_inits(ch, src, line_offset, &mod_id, &mut refs, &mut bridges) {
+                        has_top_level_exec = true;
+                    }
+                }
+                "export_statement" => {
+                    let mut ec = ch.walk();
+                    for ech in ch.children(&mut ec) {
+                        if matches!(ech.kind(), "lexical_declaration" | "variable_declaration")
+                            && collect_ts_non_func_var_inits(ech, src, line_offset, &mod_id, &mut refs, &mut bridges)
+                        {
+                            has_top_level_exec = true;
+                        }
+                    }
+                }
+                _ => {}
             }
         }
     }
@@ -120,6 +158,60 @@ pub fn extract(
         bridges,
         ir_funcs,
     })
+}
+
+pub(crate) fn resolve_relative_path(current_file: &str, import_path: &str) -> Option<String> {
+    if !import_path.starts_with("./") && !import_path.starts_with("../") {
+        return None;
+    }
+    let mut parts: Vec<&str> = match current_file.rsplit_once('/') {
+        Some((dir, _)) if !dir.is_empty() => dir.split('/').collect(),
+        _ => Vec::new(),
+    };
+    for seg in import_path.split('/') {
+        match seg {
+            "" | "." => {}
+            ".." => {
+                parts.pop()?;
+            }
+            other => parts.push(other),
+        }
+    }
+    if parts.is_empty() {
+        None
+    } else {
+        Some(parts.join("/"))
+    }
+}
+
+fn unwrap_ts_function_value(mut node: Node<'_>) -> Option<Node<'_>> {
+    while node.kind() == "parenthesized_expression" {
+        node = node.named_child(0)?;
+    }
+    matches!(node.kind(), "arrow_function" | "function_expression").then_some(node)
+}
+
+fn collect_ts_non_func_var_inits(
+    decl_node: Node<'_>,
+    src: &str,
+    line_offset: usize,
+    mod_id: &str,
+    refs: &mut Vec<RawRef>,
+    bridges: &mut Vec<BridgeHint>,
+) -> bool {
+    let mut found = false;
+    let mut vc = decl_node.walk();
+    for decl in decl_node.children(&mut vc) {
+        if decl.kind() == "variable_declarator" {
+            if let Some(val) = decl.child_by_field_name("value") {
+                if unwrap_ts_function_value(val).is_none() {
+                    found = true;
+                    collect_ts_refs_and_bridges(decl, src, line_offset, mod_id, refs, bridges);
+                }
+            }
+        }
+    }
+    found
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -185,6 +277,9 @@ fn walk_ts_nodes(
                         package_or_module: rel_path.to_string(),
                     });
                     if let Some(body) = child.child_by_field_name("body") {
+                        if let Some(pnode) = child.child_by_field_name("parameters") {
+                            collect_ts_refs_and_bridges(pnode, src, line_offset, &id, refs, bridges);
+                        }
                         collect_ts_refs_and_bridges(body, src, line_offset, &id, refs, bridges);
                         let params = extract_ts_params(child, src);
                         ir_funcs.push(IrFunc {
@@ -206,7 +301,7 @@ fn walk_ts_nodes(
                         if let (Some(name_node), Some(val)) =
                             (decl.child_by_field_name("name"), decl.child_by_field_name("value"))
                         {
-                            if matches!(val.kind(), "arrow_function" | "function_expression") {
+                            if let Some(fn_val) = unwrap_ts_function_value(val) {
                                 let name = node_text(name_node, src).to_string();
                                 let span = node_span(decl, line_offset);
                                 let id = make_symbol_id(rel_path, &name, span.start_line);
@@ -226,9 +321,12 @@ fn walk_ts_nodes(
                                     is_dynamic_candidate: false,
                                     package_or_module: rel_path.to_string(),
                                 });
-                                if let Some(body) = val.child_by_field_name("body") {
+                                if let Some(pnode) = fn_val.child_by_field_name("parameters") {
+                                    collect_ts_refs_and_bridges(pnode, src, line_offset, &id, refs, bridges);
+                                }
+                                if let Some(body) = fn_val.child_by_field_name("body") {
                                     collect_ts_refs_and_bridges(body, src, line_offset, &id, refs, bridges);
-                                    let params = extract_ts_params(val, src);
+                                    let params = extract_ts_params(fn_val, src);
                                     ir_funcs.push(IrFunc {
                                         symbol_id: id,
                                         name,
@@ -287,6 +385,9 @@ fn walk_ts_nodes(
                                         package_or_module: rel_path.to_string(),
                                     });
                                     if let Some(mbody) = member.child_by_field_name("body") {
+                                        if let Some(pnode) = member.child_by_field_name("parameters") {
+                                            collect_ts_refs_and_bridges(pnode, src, line_offset, &mid, refs, bridges);
+                                        }
                                         collect_ts_refs_and_bridges(mbody, src, line_offset, &mid, refs, bridges);
                                         let params = extract_ts_params(member, src);
                                         ir_funcs.push(IrFunc {

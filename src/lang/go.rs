@@ -186,7 +186,10 @@ pub fn extract(rel_path: &str, src: &str, blake3_hex: String) -> Result<FileExtr
                             let span = node_span(spec, 0);
                             let id = make_symbol_id(rel_path, &name, span.start_line);
                             let is_pkg_init_var = spec.kind() == "var_spec"
-                                && spec.child_by_field_name("value").is_some();
+                                && spec
+                                    .child_by_field_name("value")
+                                    .map(contains_call_outside_func_literal)
+                                    .unwrap_or(false);
                             symbols.push(Symbol {
                                 id: id.clone(),
                                 name: name.clone(),
@@ -222,6 +225,23 @@ pub fn extract(rel_path: &str, src: &str, blake3_hex: String) -> Result<FileExtr
         bridges,
         ir_funcs,
     })
+}
+
+fn contains_call_outside_func_literal(node: Node<'_>) -> bool {
+    let mut stack = vec![node];
+    while let Some(n) = stack.pop() {
+        match n.kind() {
+            "call_expression" => return true,
+            "func_literal" => continue,
+            _ => {
+                let mut c = n.walk();
+                for ch in n.children(&mut c) {
+                    stack.push(ch);
+                }
+            }
+        }
+    }
+    false
 }
 
 fn go_visibility(name: &str) -> Visibility {
