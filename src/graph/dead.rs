@@ -61,24 +61,40 @@ pub fn analyze_dead(graph: &CodeGraph, opts: &DeadOptions) -> DeadReport {
     }
 
     // 2. Mark-and-sweep reachability over outgoing edges (including cross-language bridges!)
-    while let Some(curr) = queue.pop_front() {
-        if let Some(out_edges) = graph.outgoing.get(&curr) {
-            for &eidx in out_edges {
-                let edge = &graph.edges[eidx];
-                if edge.kind == EdgeKind::EnvRef {
-                    continue;
-                }
-                if opts.scope == DeadScope::Prod {
-                    if let Some(src_sym) = graph.symbols.get(&edge.from) {
-                        if src_sym.is_test {
-                            continue;
+    loop {
+        while let Some(curr) = queue.pop_front() {
+            if let Some(out_edges) = graph.outgoing.get(&curr) {
+                for &eidx in out_edges {
+                    let edge = &graph.edges[eidx];
+                    if edge.kind == EdgeKind::EnvRef {
+                        continue;
+                    }
+                    if opts.scope == DeadScope::Prod {
+                        if let Some(src_sym) = graph.symbols.get(&edge.from) {
+                            if src_sym.is_test {
+                                continue;
+                            }
                         }
                     }
-                }
-                if live.insert(edge.to.clone()) {
-                    queue.push_back(edge.to.clone());
+                    if live.insert(edge.to.clone()) {
+                        queue.push_back(edge.to.clone());
+                    }
                 }
             }
+        }
+        let mut added = false;
+        for imp in &graph.interface_impls {
+            if live.contains(&imp.receiver_type_id) && live.contains(&imp.interface_id) {
+                for mid in &imp.method_ids {
+                    if live.insert(mid.clone()) {
+                        queue.push_back(mid.clone());
+                        added = true;
+                    }
+                }
+            }
+        }
+        if !added {
+            break;
         }
     }
 
@@ -124,7 +140,7 @@ pub fn analyze_dead(graph: &CodeGraph, opts: &DeadOptions) -> DeadReport {
                     .iter()
                     .filter(|&&eidx| {
                         let e = &graph.edges[eidx];
-                        if e.kind == EdgeKind::EnvRef {
+                        if e.kind == EdgeKind::EnvRef || e.kind == EdgeKind::Implements {
                             return false;
                         }
                         if opts.scope == DeadScope::Prod {

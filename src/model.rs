@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use serde::{Deserialize, Serialize};
 use crate::ir::IrFunc;
 
@@ -159,6 +160,12 @@ pub struct FileExtract {
     pub refs: Vec<RawRef>,
     pub bridges: Vec<BridgeHint>,
     pub ir_funcs: Vec<IrFunc>,
+    /// Interface symbol ID -> declared method names (e.g. Go interface methods).
+    #[serde(default)]
+    pub interface_methods: HashMap<String, Vec<String>>,
+    /// Struct or interface symbol ID -> embedded type names (e.g. Go embedded fields/interfaces).
+    #[serde(default)]
+    pub embedded_types: HashMap<String, Vec<String>>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

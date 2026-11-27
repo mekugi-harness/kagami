@@ -193,6 +193,8 @@ pub fn extract(
         refs,
         bridges,
         ir_funcs,
+        interface_methods: std::collections::HashMap::new(),
+        embedded_types: std::collections::HashMap::new(),
     })
 }
 

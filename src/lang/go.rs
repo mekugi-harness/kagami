@@ -28,6 +28,8 @@ pub fn extract(rel_path: &str, src: &str, blake3_hex: String) -> Result<FileExtr
     let mut refs = Vec::new();
     let mut bridges = Vec::new();
     let mut ir_funcs = Vec::new();
+    let mut interface_methods: HashMap<String, Vec<String>> = HashMap::new();
+    let mut embedded_types: HashMap<String, Vec<String>> = HashMap::new();
 
     let root = tree.root_node();
     let mut cursor = root.walk();
@@ -74,7 +76,10 @@ pub fn extract(rel_path: &str, src: &str, blake3_hex: String) -> Result<FileExtr
                     });
                     if let Some(body) = child.child_by_field_name("body") {
                         let params = extract_go_params(child, src);
-                        let locals = collect_go_locals(body, src, &params);
+                        let mut seed_locals = params.clone();
+                        seed_locals.extend(extract_go_named_results(child, src));
+                        let locals = collect_go_locals(body, src, &seed_locals);
+                        collect_signature_type_refs(child, src, &id, &mut refs);
                         collect_refs_and_bridges(body, src, &id, &locals, &mut refs, &mut bridges);
                         let ir_body = lower_go_node(body, src);
                         ir_funcs.push(IrFunc {
@@ -117,7 +122,13 @@ pub fn extract(rel_path: &str, src: &str, blake3_hex: String) -> Result<FileExtr
                     });
                     if let Some(body) = child.child_by_field_name("body") {
                         let params = extract_go_params(child, src);
-                        let locals = collect_go_locals(body, src, &params);
+                        let mut seed_locals = params.clone();
+                        seed_locals.extend(extract_go_named_results(child, src));
+                        if let Some(recv_name) = extract_receiver_var_name(child, src) {
+                            seed_locals.push(recv_name);
+                        }
+                        let locals = collect_go_locals(body, src, &seed_locals);
+                        collect_signature_type_refs(child, src, &id, &mut refs);
                         collect_refs_and_bridges(body, src, &id, &locals, &mut refs, &mut bridges);
                         let ir_body = lower_go_node(body, src);
                         ir_funcs.push(IrFunc {
@@ -173,6 +184,27 @@ pub fn extract(rel_path: &str, src: &str, blake3_hex: String) -> Result<FileExtr
                                     confidence: Confidence::Heuristic,
                                 });
                             }
+                            if let Some(type_node) = spec.child_by_field_name("type") {
+                                match type_node.kind() {
+                                    "interface_type" => {
+                                        let (methods, embeds) =
+                                            extract_interface_members(type_node, src);
+                                        if !methods.is_empty() {
+                                            interface_methods.insert(id.clone(), methods);
+                                        }
+                                        if !embeds.is_empty() {
+                                            embedded_types.insert(id.clone(), embeds);
+                                        }
+                                    }
+                                    "struct_type" => {
+                                        let embeds = extract_struct_embeds(type_node, src);
+                                        if !embeds.is_empty() {
+                                            embedded_types.insert(id.clone(), embeds);
+                                        }
+                                    }
+                                    _ => {}
+                                }
+                            }
                             let empty_locals = HashMap::new();
                             collect_refs_and_bridges(spec, src, &id, &empty_locals, &mut refs, &mut bridges);
                         }
@@ -180,35 +212,55 @@ pub fn extract(rel_path: &str, src: &str, blake3_hex: String) -> Result<FileExtr
                 }
             }
             "const_declaration" | "var_declaration" => {
+                let mut specs = Vec::new();
                 let mut vc = child.walk();
-                for spec in child.children(&mut vc) {
-                    if spec.kind() == "const_spec" || spec.kind() == "var_spec" {
-                        if let Some(name_node) = spec.child_by_field_name("name") {
-                            let name = node_text(name_node, src).to_string();
-                            let span = node_span(spec, 0);
-                            let id = make_symbol_id(rel_path, &name, span.start_line);
-                            let is_pkg_init_var = spec.kind() == "var_spec"
-                                && spec
-                                    .child_by_field_name("value")
-                                    .map(contains_call_outside_func_literal)
-                                    .unwrap_or(false);
-                            symbols.push(Symbol {
-                                id: id.clone(),
-                                name: name.clone(),
-                                qualified_name: name.clone(),
-                                kind: SymbolKind::Const,
-                                lang: Language::Go,
-                                file: rel_path.to_string(),
-                                span,
-                                visibility: go_visibility(&name),
-                                is_test: is_test_file,
-                                is_entrypoint: is_pkg_init_var,
-                                is_dynamic_candidate: false,
-                                package_or_module: pkg.clone(),
-                            });
-                            let empty_locals = HashMap::new();
-                            collect_refs_and_bridges(spec, src, &id, &empty_locals, &mut refs, &mut bridges);
+                for ch in child.children(&mut vc) {
+                    match ch.kind() {
+                        "const_spec" | "var_spec" => specs.push(ch),
+                        "var_spec_list" => {
+                            let mut lc = ch.walk();
+                            for sub in ch.children(&mut lc) {
+                                if sub.kind() == "var_spec" {
+                                    specs.push(sub);
+                                }
+                            }
                         }
+                        _ => {}
+                    }
+                }
+                for spec in specs {
+                    if let Some(name_node) = spec.child_by_field_name("name") {
+                        let name = node_text(name_node, src).to_string();
+                        let span = node_span(spec, 0);
+                        let id = make_symbol_id(rel_path, &name, span.start_line);
+                        let is_pkg_init_var = spec.kind() == "var_spec"
+                            && spec
+                                .child_by_field_name("value")
+                                .map(contains_call_outside_func_literal)
+                                .unwrap_or(false);
+                        symbols.push(Symbol {
+                            id: id.clone(),
+                            name: name.clone(),
+                            qualified_name: name.clone(),
+                            kind: SymbolKind::Const,
+                            lang: Language::Go,
+                            file: rel_path.to_string(),
+                            span,
+                            visibility: go_visibility(&name),
+                            is_test: is_test_file,
+                            is_entrypoint: is_pkg_init_var,
+                            is_dynamic_candidate: false,
+                            package_or_module: pkg.clone(),
+                        });
+                        let empty_locals = HashMap::new();
+                        collect_refs_and_bridges(
+                            spec,
+                            src,
+                            &id,
+                            &empty_locals,
+                            &mut refs,
+                            &mut bridges,
+                        );
                     }
                 }
             }
@@ -226,6 +278,8 @@ pub fn extract(rel_path: &str, src: &str, blake3_hex: String) -> Result<FileExtr
         refs,
         bridges,
         ir_funcs,
+        interface_methods,
+        embedded_types,
     })
 }
 
@@ -292,17 +346,207 @@ fn extract_receiver_type(node: Node<'_>, src: &str) -> String {
     let Some(recv) = node.child_by_field_name("receiver") else {
         return String::new();
     };
-    let mut stack = vec![recv];
+    let mut c = recv.walk();
+    for ch in recv.children(&mut c) {
+        if ch.kind() == "parameter_declaration"
+            && let Some(mut ty) = ch.child_by_field_name("type")
+        {
+            loop {
+                match ty.kind() {
+                    "pointer_type" => {
+                        let Some(inner) = ty.named_child(0) else {
+                            break;
+                        };
+                        ty = inner;
+                    }
+                    "generic_type" => {
+                        let Some(base) = ty.child_by_field_name("type") else {
+                            break;
+                        };
+                        ty = base;
+                    }
+                    "type_identifier" => return node_text(ty, src).to_string(),
+                    _ => break,
+                }
+            }
+        }
+    }
+    String::new()
+}
+
+fn extract_receiver_var_name(node: Node<'_>, src: &str) -> Option<String> {
+    let recv = node.child_by_field_name("receiver")?;
+    let mut c = recv.walk();
+    for ch in recv.children(&mut c) {
+        if ch.kind() == "parameter_declaration"
+            && let Some(id) = find_child_by_kind(ch, "identifier")
+        {
+            let name = node_text(id, src).trim();
+            if !name.is_empty() && name != "_" {
+                return Some(name.to_string());
+            }
+        }
+    }
+    None
+}
+
+fn extract_embedded_type_name(node: Node<'_>, src: &str) -> Option<String> {
+    let mut cur = node;
+    loop {
+        match cur.kind() {
+            "pointer_type" => {
+                cur = cur.named_child(0)?;
+            }
+            "generic_type" => {
+                cur = cur.child_by_field_name("type")?;
+            }
+            "type_identifier" => {
+                let t = node_text(cur, src).trim();
+                return (!t.is_empty()).then(|| t.to_string());
+            }
+            "qualified_type" => {
+                let pkg = cur
+                    .child_by_field_name("package")
+                    .map(|p| node_text(p, src).trim())?;
+                let name = cur
+                    .child_by_field_name("name")
+                    .map(|n| node_text(n, src).trim())?;
+                if !pkg.is_empty() && !name.is_empty() {
+                    return Some(format!("{}.{}", pkg, name));
+                }
+                return None;
+            }
+            _ => return None,
+        }
+    }
+}
+
+fn extract_interface_members(node: Node<'_>, src: &str) -> (Vec<String>, Vec<String>) {
+    let mut methods = Vec::new();
+    let mut embeds = Vec::new();
+    let mut c = node.walk();
+    for ch in node.children(&mut c) {
+        match ch.kind() {
+            "method_elem" => {
+                if let Some(name) = ch.child_by_field_name("name") {
+                    let t = node_text(name, src).trim();
+                    if !t.is_empty() {
+                        methods.push(t.to_string());
+                    }
+                }
+            }
+            "type_elem" => {
+                let mut tc = ch.walk();
+                for sub in ch.children(&mut tc) {
+                    if let Some(embed) = extract_embedded_type_name(sub, src) {
+                        embeds.push(embed);
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    (methods, embeds)
+}
+
+fn extract_struct_embeds(node: Node<'_>, src: &str) -> Vec<String> {
+    let mut embeds = Vec::new();
+    let Some(fields) = find_child_by_kind(node, "field_declaration_list") else {
+        return embeds;
+    };
+    let mut c = fields.walk();
+    for ch in fields.children(&mut c) {
+        if ch.kind() == "field_declaration"
+            && ch.child_by_field_name("name").is_none()
+            && let Some(ty) = ch.child_by_field_name("type")
+            && let Some(embed) = extract_embedded_type_name(ty, src)
+        {
+            embeds.push(embed);
+        }
+    }
+    embeds
+}
+
+fn collect_signature_type_refs(node: Node<'_>, src: &str, from_id: &str, refs: &mut Vec<RawRef>) {
+    let mut stack = Vec::new();
+    if let Some(p) = node.child_by_field_name("parameters") {
+        stack.push(p);
+    }
+    if let Some(r) = node.child_by_field_name("result") {
+        stack.push(r);
+    }
     while let Some(n) = stack.pop() {
-        if n.kind() == "type_identifier" {
-            return node_text(n, src).to_string();
+        match n.kind() {
+            "qualified_type" => {
+                emit_qualified_type_ref(n, src, from_id, refs);
+                continue;
+            }
+            "type_identifier" => {
+                emit_type_identifier_ref(n, src, from_id, refs);
+                continue;
+            }
+            _ => {}
         }
         let mut c = n.walk();
         for ch in n.children(&mut c) {
             stack.push(ch);
         }
     }
-    String::new()
+}
+
+fn emit_qualified_type_ref(node: Node<'_>, src: &str, from_id: &str, refs: &mut Vec<RawRef>) {
+    let pkg = node
+        .child_by_field_name("package")
+        .map(|p| node_text(p, src).trim().to_string());
+    let name = node
+        .child_by_field_name("name")
+        .map(|n| node_text(n, src).trim().to_string());
+    if let Some(target_name) = name.filter(|s| !s.is_empty()) {
+        refs.push(RawRef {
+            from_symbol_id: from_id.to_string(),
+            target_name,
+            qualifier: pkg.filter(|s| !s.is_empty()),
+            kind: EdgeKind::TypeRef,
+            line: node.start_position().row + 1,
+        });
+    }
+}
+
+fn emit_type_identifier_ref(node: Node<'_>, src: &str, from_id: &str, refs: &mut Vec<RawRef>) {
+    let target = node_text(node, src);
+    if !matches!(
+        target,
+        "string"
+            | "int"
+            | "int8"
+            | "int16"
+            | "int32"
+            | "int64"
+            | "uint"
+            | "uint8"
+            | "uint16"
+            | "uint32"
+            | "uint64"
+            | "uintptr"
+            | "float32"
+            | "float64"
+            | "complex64"
+            | "complex128"
+            | "bool"
+            | "byte"
+            | "rune"
+            | "error"
+            | "any"
+            | "comparable"
+    ) {
+        refs.push(RawRef {
+            from_symbol_id: from_id.to_string(),
+            target_name: target.to_string(),
+            qualifier: None,
+            kind: EdgeKind::TypeRef,
+            line: node.start_position().row + 1,
+        });
+    }
 }
 
 fn extract_go_params(node: Node<'_>, src: &str) -> Vec<String> {
@@ -323,21 +567,88 @@ fn extract_go_params(node: Node<'_>, src: &str) -> Vec<String> {
     params
 }
 
-fn collect_go_locals(body: Node<'_>, src: &str, params: &[String]) -> HashMap<String, usize> {
-    let mut locals: HashMap<String, usize> = params.iter().map(|p| (p.clone(), 0usize)).collect();
+fn extract_go_named_results(node: Node<'_>, src: &str) -> Vec<String> {
+    let mut names = Vec::new();
+    if let Some(res) = node.child_by_field_name("result")
+        && res.kind() == "parameter_list"
+    {
+        let mut c = res.walk();
+        for ch in res.children(&mut c) {
+            if ch.kind() == "parameter_declaration" {
+                let mut pc = ch.walk();
+                for sub in ch.children(&mut pc) {
+                    if sub.kind() == "identifier" {
+                        let t = node_text(sub, src).trim();
+                        if !t.is_empty() && t != "_" {
+                            names.push(t.to_string());
+                        }
+                    }
+                }
+            }
+        }
+    }
+    names
+}
+
+fn enclosing_scope_end(node: Node<'_>, fallback_end: usize) -> usize {
+    let mut cur = node.parent();
+    while let Some(p) = cur {
+        if matches!(
+            p.kind(),
+            "block"
+                | "for_statement"
+                | "if_statement"
+                | "expression_switch_statement"
+                | "type_switch_statement"
+                | "select_statement"
+                | "communication_case"
+                | "expression_case"
+                | "default_case"
+                | "type_case"
+        ) {
+            return p.end_byte();
+        }
+        cur = p.parent();
+    }
+    fallback_end
+}
+
+fn collect_go_locals(
+    body: Node<'_>,
+    src: &str,
+    params: &[String],
+) -> HashMap<String, Vec<(usize, usize)>> {
+    let body_end = body.end_byte();
+    let mut locals: HashMap<String, Vec<(usize, usize)>> = HashMap::new();
+    for p in params {
+        locals.entry(p.clone()).or_default().push((0, body_end));
+    }
     let mut stack = vec![body];
     while let Some(n) = stack.pop() {
-        let pos = n.start_byte();
         match n.kind() {
             "short_var_declaration" => {
+                let start = n.end_byte();
+                let end = enclosing_scope_end(n, body_end);
                 if let Some(lhs) = n.child_by_field_name("left") {
                     for part in node_text(lhs, src).split(',') {
                         let t = part.trim();
                         if !t.is_empty() && t != "_" {
-                            locals
-                                .entry(t.to_string())
-                                .and_modify(|e| *e = (*e).min(pos))
-                                .or_insert(pos);
+                            locals.entry(t.to_string()).or_default().push((start, end));
+                        }
+                    }
+                }
+            }
+            "range_clause" => {
+                let txt = node_text(n, src);
+                if txt.contains(":=")
+                    && let Some(lhs) = n.child_by_field_name("left")
+                {
+                    let start = n.end_byte();
+                    let end = enclosing_scope_end(n, body_end);
+                    for part in node_text(lhs, src).split(',') {
+                        let t = part.trim();
+                        if !t.is_empty() && t != "_" {
+                            locals.entry(t.to_string()).or_default().push((start, end));
                         }
                     }
                 }
@@ -345,10 +656,18 @@ fn collect_go_locals(body: Node<'_>, src: &str, params: &[String]) -> HashMap<St
             "var_spec" => {
                 if let Some(name) = n.child_by_field_name("name") {
                     let t = node_text(name, src).trim().to_string();
-                    locals
-                        .entry(t)
-                        .and_modify(|e| *e = (*e).min(pos))
-                        .or_insert(pos);
+                    if !t.is_empty() && t != "_" {
+                        let start = n.end_byte();
+                        let end = enclosing_scope_end(n, body_end);
+                        locals.entry(t).or_default().push((start, end));
+                    }
+                }
+            }
+            "func_literal" => {
+                let start = n.start_byte();
+                let end = n.end_byte();
+                for p in extract_go_params(n, src) {
+                    locals.entry(p).or_default().push((start, end));
                 }
             }
             _ => {}
@@ -361,11 +680,83 @@ fn collect_go_locals(body: Node<'_>, src: &str, params: &[String]) -> HashMap<St
     locals
 }
 
+fn emit_value_ref(
+    mut expr: Node<'_>,
+    src: &str,
+    from_id: &str,
+    locals: &HashMap<String, Vec<(usize, usize)>>,
+    refs: &mut Vec<RawRef>,
+) {
+    while expr.kind() == "parenthesized_expression" {
+        let Some(inner) = expr.named_child(0) else {
+            break;
+        };
+        expr = inner;
+    }
+    let line = expr.start_position().row + 1;
+    match expr.kind() {
+        "identifier" => {
+            let target = node_text(expr, src);
+            let pos = expr.start_byte();
+            let shadowed = locals
+                .get(target)
+                .map(|ranges| ranges.iter().any(|&(s, e)| pos >= s && pos < e))
+                .unwrap_or(false);
+            if !matches!(target, "true" | "false" | "nil" | "iota" | "_") && !shadowed {
+                refs.push(RawRef {
+                    from_symbol_id: from_id.to_string(),
+                    target_name: target.to_string(),
+                    qualifier: None,
+                    kind: EdgeKind::Calls,
+                    line,
+                });
+            }
+        }
+        "selector_expression" => {
+            let operand = expr
+                .child_by_field_name("operand")
+                .map(|o| node_text(o, src).to_string());
+            let field = expr
+                .child_by_field_name("field")
+                .map(|f| node_text(f, src).to_string());
+            if let Some(target) = field {
+                refs.push(RawRef {
+                    from_symbol_id: from_id.to_string(),
+                    target_name: target,
+                    qualifier: operand,
+                    kind: EdgeKind::Calls,
+                    line,
+                });
+            }
+        }
+        _ => {}
+    }
+}
+
+fn emit_expr_list_refs(
+    node: Node<'_>,
+    src: &str,
+    from_id: &str,
+    locals: &HashMap<String, Vec<(usize, usize)>>,
+    refs: &mut Vec<RawRef>,
+) {
+    if node.kind() == "expression_list" {
+        let mut c = node.walk();
+        for ch in node.children(&mut c) {
+            if ch.is_named() {
+                emit_value_ref(ch, src, from_id, locals, refs);
+            }
+        }
+    } else {
+        emit_value_ref(node, src, from_id, locals, refs);
+    }
+}
+
 fn collect_refs_and_bridges(
     node: Node<'_>,
     src: &str,
     from_id: &str,
-    locals: &HashMap<String, usize>,
+    locals: &HashMap<String, Vec<(usize, usize)>>,
     refs: &mut Vec<RawRef>,
     bridges: &mut Vec<BridgeHint>,
 ) {
@@ -440,98 +831,63 @@ fn collect_refs_and_bridges(
                     });
                 }
             }
+            "assignment_statement" | "short_var_declaration" => {
+                if let Some(rhs) = n.child_by_field_name("right") {
+                    emit_expr_list_refs(rhs, src, from_id, locals, refs);
+                }
+            }
+            "var_spec" => {
+                if let Some(val) = n.child_by_field_name("value") {
+                    emit_expr_list_refs(val, src, from_id, locals, refs);
+                }
+            }
+            "return_statement" => {
+                let mut rc = n.walk();
+                for ch in n.children(&mut rc) {
+                    if ch.is_named() {
+                        emit_expr_list_refs(ch, src, from_id, locals, refs);
+                    }
+                }
+            }
+            "send_statement" => {
+                if let Some(val) = n.child_by_field_name("value") {
+                    emit_value_ref(val, src, from_id, locals, refs);
+                }
+            }
             "keyed_element" => {
-                let mut kc = n.walk();
-                let named: Vec<_> = n.children(&mut kc).filter(|ch| ch.is_named()).collect();
-                if let Some(val_elem) = named.last() {
+                if let Some(val_elem) = n.child_by_field_name("value") {
                     let val = if val_elem.kind() == "literal_element" {
-                        val_elem.named_child(0).unwrap_or(*val_elem)
+                        val_elem.named_child(0).unwrap_or(val_elem)
                     } else {
-                        *val_elem
+                        val_elem
                     };
-                    let line = val.start_position().row + 1;
-                    match val.kind() {
-                        "identifier" => {
-                            let target = node_text(val, src);
-                            let shadowed = locals.get(target).map(|&p| p < val.start_byte()).unwrap_or(false);
-                            if !matches!(target, "true" | "false" | "nil" | "iota") && !shadowed {
-                                refs.push(RawRef {
-                                    from_symbol_id: from_id.to_string(),
-                                    target_name: target.to_string(),
-                                    qualifier: None,
-                                    kind: EdgeKind::Calls,
-                                    line,
-                                });
-                            }
-                        }
-                        "selector_expression" => {
-                            let operand = val.child_by_field_name("operand").map(|o| node_text(o, src).to_string());
-                            let field = val.child_by_field_name("field").map(|f| node_text(f, src).to_string());
-                            if let Some(target) = field {
-                                refs.push(RawRef {
-                                    from_symbol_id: from_id.to_string(),
-                                    target_name: target,
-                                    qualifier: operand,
-                                    kind: EdgeKind::Calls,
-                                    line,
-                                });
-                            }
-                        }
-                        _ => {}
+                    emit_value_ref(val, src, from_id, locals, refs);
+                }
+            }
+            "literal_value" => {
+                let mut lc = n.walk();
+                for ch in n.children(&mut lc) {
+                    if ch.kind() == "literal_element"
+                        && let Some(inner) = ch.named_child(0)
+                    {
+                        emit_value_ref(inner, src, from_id, locals, refs);
                     }
                 }
             }
             "argument_list" => {
                 let mut ac = n.walk();
                 for ch in n.children(&mut ac) {
-                    let line = ch.start_position().row + 1;
-                    match ch.kind() {
-                        "identifier" => {
-                            let target = node_text(ch, src);
-                            let shadowed = locals.get(target).map(|&p| p < ch.start_byte()).unwrap_or(false);
-                            if !matches!(target, "true" | "false" | "nil" | "err" | "ctx" | "i" | "k" | "v")
-                                && !shadowed
-                            {
-                                refs.push(RawRef {
-                                    from_symbol_id: from_id.to_string(),
-                                    target_name: target.to_string(),
-                                    qualifier: None,
-                                    kind: EdgeKind::Calls,
-                                    line,
-                                });
-                            }
-                        }
-                        "selector_expression" => {
-                            let operand = ch.child_by_field_name("operand").map(|o| node_text(o, src).to_string());
-                            let field = ch.child_by_field_name("field").map(|f| node_text(f, src).to_string());
-                            if let Some(target) = field {
-                                refs.push(RawRef {
-                                    from_symbol_id: from_id.to_string(),
-                                    target_name: target,
-                                    qualifier: operand,
-                                    kind: EdgeKind::Calls,
-                                    line,
-                                });
-                            }
-                        }
-                        _ => {}
+                    if ch.is_named() {
+                        emit_value_ref(ch, src, from_id, locals, refs);
                     }
                 }
             }
+            "qualified_type" => {
+                emit_qualified_type_ref(n, src, from_id, refs);
+                continue;
+            }
             "type_identifier" => {
-                let target = node_text(n, src);
-                if !matches!(
-                    target,
-                    "string" | "int" | "int64" | "int32" | "uint" | "uint64" | "float64" | "bool" | "byte" | "rune" | "error" | "any"
-                ) {
-                    refs.push(RawRef {
-                        from_symbol_id: from_id.to_string(),
-                        target_name: target.to_string(),
-                        qualifier: None,
-                        kind: EdgeKind::TypeRef,
-                        line: n.start_position().row + 1,
-                    });
-                }
+                emit_type_identifier_ref(n, src, from_id, refs);
             }
             _ => {}
         }
