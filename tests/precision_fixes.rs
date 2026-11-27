@@ -2475,6 +2475,10 @@ use crate::unix as platform;
 use crate::portable as platform;
 
 struct Output;
+struct Decoy;
+impl Decoy {
+    fn finish(&self) {}
+}
 impl Output {
     fn finish(&self) {}
 }
@@ -2511,15 +2515,42 @@ macro_rules! collide_m {
 }
 fn macro_called_helper() {}
 
+macro_rules! inner_m {
+    () => {
+        nested_macro_helper()
+    };
+}
+macro_rules! outer_m {
+    () => {
+        inner_m!()
+    };
+}
+fn nested_macro_helper() {}
+
+use inner_m as aliased_m;
+
+mod inline_tools {
+    use crate::factory::MadeWorker as LocalWorker;
+    use self::inline_helper as inline_alias;
+    fn inline_helper() {}
+    pub fn run_inline(w: LocalWorker) {
+        inline_alias();
+        w.do_work();
+    }
+}
+
 fn main() {
     custom_lib::run();
     backend::run();
     platform::init();
     make_worker().do_work();
-    let _ = compute().map_or_else(|err| err.report(), |ok| ok.finish());
+    let _ = compute().map_or_else(|err| err.report(), /* handle success */ |ok| ok.finish());
     let _w = SharedWorker::new(InnerWorker);
     collide();
     collide_m!();
+    outer_m!();
+    aliased_m!();
+    inline_tools::run_inline(make_worker());
 }
 "#,
     )
@@ -2542,6 +2573,8 @@ fn main() {
         ("app/src/main.rs", "Failure::report"),
         ("app/src/main.rs", "collide"),
         ("app/src/main.rs", "macro_called_helper"),
+        ("app/src/main.rs", "nested_macro_helper"),
+        ("app/src/main.rs", "inline_helper"),
     ] {
         assert!(
             !is_dead_in(file, sym),
@@ -2555,6 +2588,7 @@ fn main() {
         ("app/src/main.rs", "InnerWorker::new"),
         ("app/src/main.rs", "macro_only_helper"),
         ("app/src/main.rs", "collide_m"),
+        ("app/src/main.rs", "Decoy::finish"),
     ] {
         assert!(
             is_dead_in(file, sym),

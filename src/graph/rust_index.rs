@@ -476,6 +476,18 @@ impl<'a> RustTypeIndex<'a> {
         type_name: &str,
         symbols: &HashMap<String, Symbol>,
     ) -> Option<String> {
+        self.resolve_type_raw_in_scope(owner_file, owner_pkg, owner_imports, type_name, "", symbols)
+    }
+
+    fn resolve_type_raw_in_scope(
+        &self,
+        owner_file: &str,
+        owner_pkg: &str,
+        owner_imports: &[String],
+        type_name: &str,
+        caller_scope: &str,
+        symbols: &HashMap<String, Symbol>,
+    ) -> Option<String> {
         // Handle module-qualified type paths (e.g. `remote::Worker` or `foo::bar::Worker`).
         if let Some((mod_qual, short_name)) = type_name.rsplit_once("::") {
             let mod_segs: Vec<&str> = mod_qual.split("::").filter(|s| !s.is_empty()).collect();
@@ -539,7 +551,7 @@ impl<'a> RustTypeIndex<'a> {
             for u in uses {
                 if u.local_name == type_name
                     && !u.is_test
-                    && u.mod_scope.is_empty()
+                    && (u.mod_scope == caller_scope || u.mod_scope.is_empty())
                     && let Some((mod_path, target_sym)) = u.target_path.rsplit_once("::")
                 {
                     let mut hits = Vec::new();
@@ -702,7 +714,26 @@ impl<'a> RustTypeIndex<'a> {
         owner_file: &str,
         owner_pkg: &str,
         owner_imports: &[String],
+        raw_type: &str,
+        symbols: &HashMap<String, Symbol>,
+    ) -> Option<(String, usize)> {
+        self.resolve_type_with_slices_in_scope(
+            owner_file,
+            owner_pkg,
+            owner_imports,
+            raw_type,
+            "",
+            symbols,
+        )
+    }
+
+    fn resolve_type_with_slices_in_scope(
+        &self,
+        owner_file: &str,
+        owner_pkg: &str,
+        owner_imports: &[String],
         mut raw_type: &str,
+        caller_scope: &str,
         symbols: &HashMap<String, Symbol>,
     ) -> Option<(String, usize)> {
         let mut depth = 0usize;
@@ -710,7 +741,14 @@ impl<'a> RustTypeIndex<'a> {
             depth += 1;
             raw_type = rest;
         }
-        let tid = self.resolve_type_raw(owner_file, owner_pkg, owner_imports, raw_type, symbols)?;
+        let tid = self.resolve_type_raw_in_scope(
+            owner_file,
+            owner_pkg,
+            owner_imports,
+            raw_type,
+            caller_scope,
+            symbols,
+        )?;
         let (unwrapped, extra_depth) = self.unwrap_type_alias(tid, symbols, true);
         Some((unwrapped, depth + extra_depth))
     }
@@ -999,38 +1037,71 @@ impl<'a> RustTypeIndex<'a> {
         }
 
         if let Some(uses) = self.file_all_uses.get(caller_file) {
+            let (use_lookup_name, macro_suffix) = match target_name.strip_suffix('!') {
+                Some(base) => (base, "!"),
+                None => (target_name, ""),
+            };
             for u in uses {
-                if u.local_name != target_name
+                if u.local_name != use_lookup_name
                     || u.mod_scope != caller_scope
                     || (u.is_test && !caller_is_test)
                 {
                     continue;
                 }
                 if let Some((mod_path, target_sym)) = u.target_path.rsplit_once("::") {
+                    let target_sym_full = if macro_suffix.is_empty() {
+                        target_sym.to_string()
+                    } else {
+                        format!("{}{}", target_sym, macro_suffix)
+                    };
+                    if mod_path == "self" && !caller_scope.is_empty() {
+                        if let Some(ids) = self
+                            .file_non_method_syms
+                            .get(&(caller_file, target_sym_full.as_str()))
+                        {
+                            for id in ids {
+                                if sym_in_scope(id)
+                                    && symbols.get(id).is_some_and(|s| {
+                                        matches!(s.kind, SymbolKind::Function | SymbolKind::Const)
+                                            && (!s.is_test || caller_is_test)
+                                    })
+                                {
+                                    push_unique(&mut out, id.clone());
+                                }
+                            }
+                        }
+                        continue;
+                    }
                     let mut visited = HashSet::new();
                     self.resolve_mod_path_into(
                         caller_file,
                         mod_path,
-                        target_sym,
+                        &target_sym_full,
                         false,
                         symbols,
                         0,
                         &mut visited,
                         &mut out,
                     );
-                } else if u.target_path != target_name
-                    && let Some(ids) = self
+                } else if u.target_path != use_lookup_name {
+                    let target_sym_full = if macro_suffix.is_empty() {
+                        u.target_path.clone()
+                    } else {
+                        format!("{}{}", u.target_path, macro_suffix)
+                    };
+                    if let Some(ids) = self
                         .file_non_method_syms
-                        .get(&(caller_file, u.target_path.as_str()))
-                {
-                    for id in ids {
-                        if sym_in_scope(id)
-                            && symbols.get(id).is_some_and(|s| {
-                                matches!(s.kind, SymbolKind::Function | SymbolKind::Const)
-                                    && (!s.is_test || caller_is_test)
-                            })
-                        {
-                            push_unique(&mut out, id.clone());
+                        .get(&(caller_file, target_sym_full.as_str()))
+                    {
+                        for id in ids {
+                            if sym_in_scope(id)
+                                && symbols.get(id).is_some_and(|s| {
+                                    matches!(s.kind, SymbolKind::Function | SymbolKind::Const)
+                                        && (!s.is_test || caller_is_test)
+                                })
+                            {
+                                push_unique(&mut out, id.clone());
+                            }
                         }
                     }
                 }
@@ -1392,12 +1463,18 @@ impl<'a> RustTypeIndex<'a> {
     ) -> Option<(String, usize)> {
         let mut iter = chain.iter();
         let first = iter.next()?;
+        let caller_scope = self
+            .symbol_mod_scopes
+            .get(caller_id)
+            .map(String::as_str)
+            .unwrap_or("");
         let mut state = match first {
-            ReceiverStep::Type(ty) => self.resolve_type_with_slices(
+            ReceiverStep::Type(ty) => self.resolve_type_with_slices_in_scope(
                 &ext.file,
                 &ext.package_or_module,
                 &ext.imports,
                 ty,
+                caller_scope,
                 symbols,
             )?,
             ReceiverStep::Call {

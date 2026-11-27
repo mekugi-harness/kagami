@@ -1870,7 +1870,7 @@ fn walk_rust_expr(
                     let mut ac = args.walk();
                     let mut named_idx = 0usize;
                     for arg in args.children(&mut ac) {
-                        if !arg.is_named() {
+                        if !arg.is_named() || arg.is_extra() {
                             continue;
                         }
                         let idx = named_idx;
@@ -2538,7 +2538,7 @@ fn scan_rust_token_tree(
                 {
                     refs.push(RawRef {
                         from_symbol_id: from_id.to_string(),
-                        target_name: last.to_string(),
+                        target_name: format!("{}!", last),
                         qualifier: None,
                         kind: EdgeKind::Calls,
                         line,

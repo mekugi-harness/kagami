@@ -150,6 +150,13 @@ fn scip_symbol_matches_name(scip_sym: &str, name: &str) -> bool {
     if name.is_empty() {
         return false;
     }
+    let (is_macro, expected_name) = match name.strip_suffix('!') {
+        Some(base) => (true, base),
+        None => (false, name),
+    };
+    if is_macro != scip_sym.ends_with('!') {
+        return false;
+    }
     // Strip trailing SCIP descriptor punctuation and empty/numeric method disambiguators
     // (e.g. foo()., foo(+1)., bar(+2)().), while preserving parameter descriptors like (x).
     let mut s = scip_sym.trim_end_matches(|c: char| matches!(c, '.' | '#' | '/' | '!' | ':'));
@@ -174,7 +181,7 @@ fn scip_symbol_matches_name(scip_sym: &str, name: &str) -> bool {
         .rsplit(|c: char| !c.is_alphanumeric() && c != '_')
         .next()
         .unwrap_or("");
-    terminal == name
+    terminal == expected_name
 }
 
 /// Apply a SCIP index overlay onto an existing CodeGraph, adding or upgrading edges to Confidence::Exact.
