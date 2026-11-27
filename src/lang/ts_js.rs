@@ -27,6 +27,44 @@ pub(crate) struct TsRefContext {
     pub(crate) svelte_bind_this: HashMap<String, String>,
 }
 
+#[derive(Debug, Clone)]
+struct EnclosingClassInfo {
+    name: String,
+    declared_methods: HashSet<String>,
+    base_class: Option<(String, Option<String>)>,
+}
+
+fn extract_ts_extends_base(
+    class_node: Node<'_>,
+    src: &str,
+    ctx: &TsRefContext,
+) -> Option<(String, Option<String>)> {
+    let mut c = class_node.walk();
+    for ch in class_node.children(&mut c) {
+        if ch.kind() == "class_heritage" {
+            let mut hc = ch.walk();
+            for hch in ch.children(&mut hc) {
+                if hch.kind() == "extends_clause" {
+                    let mut ec = hch.walk();
+                    for ech in hch.children(&mut ec) {
+                        if ech.kind() == "identifier" {
+                            let base_ident = node_text(ech, src);
+                            if let Some(binding) = ctx.imported_bindings.get(base_ident) {
+                                return Some((
+                                    binding.target_name.clone(),
+                                    binding.resolved_file.clone(),
+                                ));
+                            }
+                            return Some((base_ident.to_string(), Some(ctx.file.clone())));
+                        }
+                    }
+                }
+            }
+        }
+    }
+    None
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum TemplateExprKind {
     Expr,
@@ -922,6 +960,22 @@ fn walk_ts_nodes(
                         package_or_module: rel_path.to_string(),
                     });
                     if let Some(body) = child.child_by_field_name("body") {
+                        let mut declared_methods = HashSet::new();
+                        {
+                            let mut mc = body.walk();
+                            for member in body.children(&mut mc) {
+                                if member.kind() == "method_definition"
+                                    && let Some(mname) = member.child_by_field_name("name")
+                                {
+                                    declared_methods.insert(node_text(mname, src).to_string());
+                                }
+                            }
+                        }
+                        let cls_info = EnclosingClassInfo {
+                            name: cls.clone(),
+                            declared_methods,
+                            base_class: extract_ts_extends_base(child, src, ctx),
+                        };
                         let mut bc = body.walk();
                         for member in body.children(&mut bc) {
                             if member.kind() == "method_definition" {
@@ -949,10 +1003,10 @@ fn walk_ts_nodes(
                                         let mut param_names = HashSet::new();
                                         if let Some(pnode) = member.child_by_field_name("parameters") {
                                             collect_ts_param_bindings(pnode, src, &mut param_names);
-                                            collect_ts_refs_and_bridges(pnode, src, line_offset, &mid, ctx, &[], Some(&cls), refs, bridges);
+                                            collect_ts_refs_and_bridges(pnode, src, line_offset, &mid, ctx, &[], Some(&cls_info), refs, bridges);
                                         }
                                         collect_hoisted_var_bindings(mbody, src, &mut param_names);
-                                        collect_ts_refs_and_bridges(mbody, src, line_offset, &mid, ctx, &[param_names], Some(&cls), refs, bridges);
+                                        collect_ts_refs_and_bridges(mbody, src, line_offset, &mid, ctx, &[param_names], Some(&cls_info), refs, bridges);
                                         ir_funcs.push(IrFunc {
                                             symbol_id: mid,
                                             name: qname,
@@ -1234,7 +1288,7 @@ fn resolve_member_target(
     src: &str,
     ctx: &TsRefContext,
     scopes: &[HashSet<String>],
-    enclosing_class: Option<&str>,
+    enclosing_class: Option<&EnclosingClassInfo>,
 ) -> (String, Option<String>) {
     match obj.kind() {
         "identifier" => {
@@ -1250,8 +1304,14 @@ fn resolve_member_target(
             (prop.to_string(), Some(name.to_string()))
         }
         "this" => {
-            if let Some(cls) = enclosing_class {
-                (format!("{}.{}", cls, prop), Some(ctx.file.clone()))
+            if let Some(cls_info) = enclosing_class {
+                if cls_info.declared_methods.contains(prop) {
+                    (format!("{}.{}", cls_info.name, prop), Some(ctx.file.clone()))
+                } else if let Some((ref base_name, ref base_file)) = cls_info.base_class {
+                    (format!("{}.{}", base_name, prop), base_file.clone())
+                } else {
+                    (format!("{}.{}", cls_info.name, prop), Some(ctx.file.clone()))
+                }
             } else {
                 (prop.to_string(), Some("this".to_string()))
             }
@@ -1268,7 +1328,7 @@ fn collect_ts_refs_and_bridges(
     from_id: &str,
     ctx: &TsRefContext,
     initial_scopes: &[HashSet<String>],
-    enclosing_class: Option<&str>,
+    enclosing_class: Option<&EnclosingClassInfo>,
     refs: &mut Vec<RawRef>,
     bridges: &mut Vec<BridgeHint>,
 ) {
@@ -1294,12 +1354,38 @@ fn walk_ts_expr_refs(
     from_id: &str,
     ctx: &TsRefContext,
     scopes: &mut Vec<HashSet<String>>,
-    enclosing_class: Option<&str>,
+    enclosing_class: Option<&EnclosingClassInfo>,
     refs: &mut Vec<RawRef>,
     bridges: &mut Vec<BridgeHint>,
 ) {
     let line = n.start_position().row + 1 + line_offset;
     match n.kind() {
+        "switch_body" => {
+            let mut switch_scope = HashSet::new();
+            let mut sc = n.walk();
+            for clause in n.children(&mut sc) {
+                if matches!(clause.kind(), "switch_case" | "switch_default") {
+                    collect_block_hoisted_fns(clause, src, &mut switch_scope);
+                }
+            }
+            scopes.push(switch_scope);
+            let mut c = n.walk();
+            for ch in n.children(&mut c) {
+                walk_ts_expr_refs(
+                    ch,
+                    src,
+                    line_offset,
+                    from_id,
+                    ctx,
+                    scopes,
+                    enclosing_class,
+                    refs,
+                    bridges,
+                );
+            }
+            scopes.pop();
+            return;
+        }
         "statement_block" | "for_statement" => {
             let mut block_scope = HashSet::new();
             if n.kind() == "statement_block" {
@@ -1413,7 +1499,12 @@ fn walk_ts_expr_refs(
             scopes.pop();
             return;
         }
-        "arrow_function" | "function_expression" | "function_declaration" => {
+        "arrow_function"
+        | "function_expression"
+        | "function_declaration"
+        | "generator_function"
+        | "generator_function_declaration"
+        | "method_definition" => {
             let mut fn_scope = HashSet::new();
             if let Some(name_node) = n.child_by_field_name("name")
                 && name_node.kind() == "identifier"

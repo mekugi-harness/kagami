@@ -351,6 +351,7 @@ fn scan_opening_tag(
                 .as_bytes()
                 .first()
                 .is_some_and(|b| b.is_ascii_uppercase())
+                || matches!(close_name, "svelte:fragment" | "svelte:boundary")
             {
                 TagScopeEvent::CloseComponent(close_name.to_string())
             } else {
@@ -383,6 +384,8 @@ fn scan_opening_tag(
         .as_bytes()
         .first()
         .is_some_and(|b| b.is_ascii_uppercase());
+    let opens_const_scope =
+        is_component_tag || matches!(tag_name, "svelte:fragment" | "svelte:boundary");
     let root_tag_ident = tag_name.split('.').next().unwrap_or(tag_name);
     if is_component_tag && !shadowed.contains(root_tag_ident) {
         if let Some((ns, member)) = tag_name.split_once('.') {
@@ -443,7 +446,7 @@ fn scan_opening_tag(
             break;
         }
         if bytes[i] == b'>' {
-            let ev = if is_component_tag {
+            let ev = if opens_const_scope {
                 TagScopeEvent::OpenComponent(tag_name.to_string())
             } else {
                 TagScopeEvent::None

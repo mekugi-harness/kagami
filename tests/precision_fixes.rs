@@ -3391,6 +3391,8 @@ export function unusedImportedForHoistVar() {}
 export function liveAfterBlockFn() {}
 export function liveAfterObjMethodVar() {}
 export function unusedBareLoopOrCatchImport() {}
+export function unusedSwitchHoistImport() {}
+export function unusedMethodVarHoistImport() {}
 "#,
     )
     .unwrap();
@@ -3418,6 +3420,8 @@ import {
   liveAfterBlockFn,
   liveAfterObjMethodVar,
   unusedBareLoopOrCatchImport,
+  unusedSwitchHoistImport,
+  unusedMethodVarHoistImport,
 } from "./imported";
 import { BaseWorker } from "./b";
 
@@ -3431,6 +3435,10 @@ class Worker {
     this.run();
   }
   run(): void {}
+}
+
+class UnrelatedLocal {
+  inheritedRun(): void {}
 }
 
 class ChildWorker extends BaseWorker {
@@ -3455,9 +3463,22 @@ function boot(config: { sameFileFormat: string }, rows: Array<{ id?: string }>, 
       var liveAfterObjMethodVar = 1;
       return liveAfterObjMethodVar;
     },
+    nestedHoist() {
+      const invoke = () => unusedMethodVarHoistImport();
+      var unusedMethodVarHoistImport = () => {};
+      invoke();
+    },
   };
   void helperObj;
   liveAfterObjMethodVar();
+  switch (rows.length) {
+    case 0:
+      unusedSwitchHoistImport();
+      break;
+    case 1:
+      function unusedSwitchHoistImport() {}
+      break;
+  }
   for (const { id = makeId() } of rows) {
     console.log(id);
   }
@@ -3486,21 +3507,10 @@ boot({ sameFileFormat: "x" }, [], []);
     .unwrap();
 
     // 2. Custom alias Svelte component import (@ui/CustomBtn.svelte)
-    std::fs::write(
-        root.join("src/ui/CustomBtn.svelte"),
-        r#"<button>Click</button>"#,
-    )
-    .unwrap();
-    std::fs::write(
-        root.join("src/ui/Panel.svelte"),
-        r#"<div><slot /></div>"#,
-    )
-    .unwrap();
-    std::fs::write(
-        root.join("src/ui/UnusedWidget.svelte"),
-        r#"<div>unused</div>"#,
-    )
-    .unwrap();
+    std::fs::write(root.join("src/ui/CustomBtn.svelte"), "<button>Click</button>").unwrap();
+    std::fs::write(root.join("src/ui/Panel.svelte"), "<div><slot /></div>").unwrap();
+    std::fs::write(root.join("src/ui/UnusedWidget.svelte"), "<div>unused</div>").unwrap();
+    std::fs::write(root.join("src/ui/SlotWidget.svelte"), "<div>slot</div>").unwrap();
 
     // 3. Script string containing "<!--" must not hide template;
     //    {#each} / {@const} bindings must shadow unused script functions inside block,
@@ -3511,6 +3521,7 @@ boot({ sameFileFormat: "x" }, [], []);
   import PrimaryBtn from "@ui/CustomBtn.svelte";
   import Panel from "../ui/Panel.svelte";
   import UnusedWidget from "../ui/UnusedWidget.svelte";
+  import SlotWidget from "../ui/SlotWidget.svelte";
   const marker = "<!--";
   function renderLabel() { return marker; }
   function label() { return "unused"; }
@@ -3522,7 +3533,11 @@ boot({ sameFileFormat: "x" }, [], []);
 
 <PrimaryBtn />
 <p>{renderLabel()}</p>
-<Panel>{@const afterPanel = "local"}{afterPanel}</Panel>
+<Panel>
+  <svelte:fragment slot="header">{@const SlotWidget = "preview"}<span>{SlotWidget}</span></svelte:fragment>
+  <SlotWidget />
+  {@const afterPanel = "local"}{afterPanel}
+</Panel>
 <p>{afterPanel()}</p>
 {#each widgets as UnusedWidget}
   <UnusedWidget />
@@ -3569,6 +3584,7 @@ boot({ sameFileFormat: "x" }, [], []);
         ("src/imported.ts", "liveAfterObjMethodVar"),
         ("src/ui/CustomBtn.svelte", "CustomBtn"),
         ("src/ui/Panel.svelte", "Panel"),
+        ("src/ui/SlotWidget.svelte", "SlotWidget"),
         ("src/routes/+page.svelte", "renderLabel"),
         ("src/routes/+page.svelte", "afterBlock"),
         ("src/routes/+page.svelte", "afterPanel"),
@@ -3585,6 +3601,9 @@ boot({ sameFileFormat: "x" }, [], []);
         ("src/imported.ts", "unusedImportedForHoistFn"),
         ("src/imported.ts", "unusedImportedForHoistVar"),
         ("src/imported.ts", "unusedBareLoopOrCatchImport"),
+        ("src/imported.ts", "unusedSwitchHoistImport"),
+        ("src/imported.ts", "unusedMethodVarHoistImport"),
+        ("src/a.ts", "UnrelatedLocal.inheritedRun"),
         ("src/b.ts", "Worker.run"),
         ("src/routes/+page.svelte", "label"),
         ("src/ui/UnusedWidget.svelte", "UnusedWidget"),
