@@ -214,9 +214,16 @@ fn collect_tag_blocks(
     }
 }
 
-fn flatten_scopes(scopes: &[HashSet<String>]) -> HashSet<String> {
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum TemplateScopeKind {
+    Root,
+    Block,
+    ComponentTag(String),
+}
+
+fn flatten_scopes(scopes: &[(TemplateScopeKind, HashSet<String>)]) -> HashSet<String> {
     let mut merged = HashSet::new();
-    for s in scopes {
+    for (_, s) in scopes {
         merged.extend(s.iter().cloned());
     }
     merged
@@ -234,7 +241,8 @@ fn scan_template(
     let bytes = src.as_bytes();
     let mut i = 0;
     let mut line_num = 1usize;
-    let mut template_scopes: Vec<HashSet<String>> = vec![HashSet::new()];
+    let mut template_scopes: Vec<(TemplateScopeKind, HashSet<String>)> =
+        vec![(TemplateScopeKind::Root, HashSet::new())];
 
     while i < bytes.len() {
         if let Some(&(_, end)) = skip_ranges.iter().find(|&&(s, e)| i >= s && i < e) {
@@ -258,7 +266,7 @@ fn scan_template(
                     continue;
                 }
                 let shadowed = flatten_scopes(&template_scopes);
-                i = scan_opening_tag(
+                let (next_i, tag_event) = scan_opening_tag(
                     src,
                     i,
                     &mut line_num,
@@ -269,6 +277,22 @@ fn scan_template(
                     exprs,
                     bind_this_map,
                 );
+                match tag_event {
+                    TagScopeEvent::OpenComponent(name) => {
+                        template_scopes
+                            .push((TemplateScopeKind::ComponentTag(name), HashSet::new()));
+                    }
+                    TagScopeEvent::CloseComponent(name) => {
+                        if let Some(pos) = template_scopes
+                            .iter()
+                            .rposition(|(k, _)| k == &TemplateScopeKind::ComponentTag(name.clone()))
+                        {
+                            template_scopes.truncate(pos);
+                        }
+                    }
+                    TagScopeEvent::None => {}
+                }
+                i = next_i;
             }
             b'{' => {
                 let start_line = line_num;
@@ -288,6 +312,12 @@ fn scan_template(
     }
 }
 
+enum TagScopeEvent {
+    None,
+    OpenComponent(String),
+    CloseComponent(String),
+}
+
 #[allow(clippy::too_many_arguments)]
 fn scan_opening_tag(
     src: &str,
@@ -299,24 +329,40 @@ fn scan_opening_tag(
     refs: &mut Vec<RawRef>,
     exprs: &mut Vec<TemplateExpr>,
     bind_this_map: &mut HashMap<String, String>,
-) -> usize {
+) -> (usize, TagScopeEvent) {
     let bytes = src.as_bytes();
     let mut i = lt_idx + 1;
     if i >= bytes.len() {
-        return i;
+        return (i, TagScopeEvent::None);
     }
     // Closing tag </...> or declaration <!...>
     if bytes[i] == b'/' || bytes[i] == b'!' {
+        let is_close = bytes[i] == b'/';
+        let close_start = i + 1;
         while i < bytes.len() && bytes[i] != b'>' {
             if bytes[i] == b'\n' {
                 *line_num += 1;
             }
             i += 1;
         }
-        return (i + 1).min(bytes.len());
+        let event = if is_close && close_start < i {
+            let close_name = src[close_start..i].trim();
+            if close_name
+                .as_bytes()
+                .first()
+                .is_some_and(|b| b.is_ascii_uppercase())
+            {
+                TagScopeEvent::CloseComponent(close_name.to_string())
+            } else {
+                TagScopeEvent::None
+            }
+        } else {
+            TagScopeEvent::None
+        };
+        return ((i + 1).min(bytes.len()), event);
     }
     if !bytes[i].is_ascii_alphabetic() {
-        return i;
+        return (i, TagScopeEvent::None);
     }
     let tag_start = i;
     while i < bytes.len()
@@ -333,11 +379,12 @@ fn scan_opening_tag(
 
     // Resolve component tag references (<MyComp>, <Ns.SubComp>)
     let mut comp_svelte_file: Option<String> = None;
-    if tag_name
+    let is_component_tag = tag_name
         .as_bytes()
         .first()
-        .is_some_and(|b| b.is_ascii_uppercase())
-    {
+        .is_some_and(|b| b.is_ascii_uppercase());
+    let root_tag_ident = tag_name.split('.').next().unwrap_or(tag_name);
+    if is_component_tag && !shadowed.contains(root_tag_ident) {
         if let Some((ns, member)) = tag_name.split_once('.') {
             if let Some(ns_file) = ctx.namespace_imports.get(ns) {
                 refs.push(RawRef {
@@ -396,11 +443,16 @@ fn scan_opening_tag(
             break;
         }
         if bytes[i] == b'>' {
-            return i + 1;
+            let ev = if is_component_tag {
+                TagScopeEvent::OpenComponent(tag_name.to_string())
+            } else {
+                TagScopeEvent::None
+            };
+            return (i + 1, ev);
         }
         if bytes[i] == b'/' {
             if i + 1 < bytes.len() && bytes[i + 1] == b'>' {
-                return i + 2;
+                return (i + 2, TagScopeEvent::None);
             }
             i += 1;
             continue;
@@ -555,13 +607,13 @@ fn scan_opening_tag(
             }
         }
     }
-    i
+    (i, TagScopeEvent::None)
 }
 
 fn push_mustache_exprs(
     raw_inner: &str,
     line: usize,
-    template_scopes: &mut Vec<HashSet<String>>,
+    template_scopes: &mut Vec<(TemplateScopeKind, HashSet<String>)>,
     exprs: &mut Vec<TemplateExpr>,
 ) {
     let inner = raw_inner.trim();
@@ -569,8 +621,11 @@ fn push_mustache_exprs(
         return;
     }
     if inner.starts_with('/') {
-        if template_scopes.len() > 1 {
-            template_scopes.pop();
+        if let Some(pos) = template_scopes
+            .iter()
+            .rposition(|(k, _)| *k == TemplateScopeKind::Block)
+        {
+            template_scopes.truncate(pos);
         }
         return;
     }
@@ -584,12 +639,15 @@ fn push_mustache_exprs(
                 shadowed,
             });
         }
-        template_scopes.push(HashSet::new());
+        template_scopes.push((TemplateScopeKind::Block, HashSet::new()));
         return;
     }
     if let Some(rest) = strip_tag_keyword(inner, ":else if") {
-        if template_scopes.len() > 1 {
-            template_scopes.pop();
+        if let Some(pos) = template_scopes
+            .iter()
+            .rposition(|(k, _)| *k == TemplateScopeKind::Block)
+        {
+            template_scopes.truncate(pos);
         }
         let shadowed = flatten_scopes(template_scopes);
         if !rest.is_empty() {
@@ -600,14 +658,17 @@ fn push_mustache_exprs(
                 shadowed,
             });
         }
-        template_scopes.push(HashSet::new());
+        template_scopes.push((TemplateScopeKind::Block, HashSet::new()));
         return;
     }
     if strip_tag_keyword(inner, ":else").is_some() {
-        if template_scopes.len() > 1 {
-            template_scopes.pop();
+        if let Some(pos) = template_scopes
+            .iter()
+            .rposition(|(k, _)| *k == TemplateScopeKind::Block)
+        {
+            template_scopes.truncate(pos);
         }
-        template_scopes.push(HashSet::new());
+        template_scopes.push((TemplateScopeKind::Block, HashSet::new()));
         return;
     }
     if let Some(rest) = strip_tag_keyword(inner, "#key") {
@@ -620,7 +681,7 @@ fn push_mustache_exprs(
                 shadowed,
             });
         }
-        template_scopes.push(HashSet::new());
+        template_scopes.push((TemplateScopeKind::Block, HashSet::new()));
         return;
     }
     if let Some(rest) = strip_tag_keyword(inner, "@html")
@@ -647,7 +708,7 @@ fn push_mustache_exprs(
                 shadowed: flatten_scopes(template_scopes),
             });
             if let Some((lhs, _)) = split_top_level_char(rest, b'=')
-                && let Some(top) = template_scopes.last_mut()
+                && let Some((_, top)) = template_scopes.last_mut()
             {
                 top.extend(ts_js::extract_ts_binding_names(lhs));
             }
@@ -668,7 +729,7 @@ fn push_mustache_exprs(
             }
             let (pat_part, key_opt) = split_trailing_paren_expr(tail.trim());
             let loop_bindings = ts_js::extract_ts_binding_names(pat_part);
-            template_scopes.push(loop_bindings);
+            template_scopes.push((TemplateScopeKind::Block, loop_bindings));
             if let Some(key_expr) = key_opt
                 && !key_expr.is_empty()
             {
@@ -688,7 +749,7 @@ fn push_mustache_exprs(
                     shadowed: outer_shadowed,
                 });
             }
-            template_scopes.push(HashSet::new());
+            template_scopes.push((TemplateScopeKind::Block, HashSet::new()));
         }
         return;
     }
@@ -709,16 +770,22 @@ fn push_mustache_exprs(
                 shadowed: outer_shadowed,
             });
         }
-        template_scopes.push(bound);
+        template_scopes.push((TemplateScopeKind::Block, bound));
         return;
     }
     if let Some(rest) =
         strip_tag_keyword(inner, ":then").or_else(|| strip_tag_keyword(inner, ":catch"))
     {
-        if template_scopes.len() > 1 {
-            template_scopes.pop();
+        if let Some(pos) = template_scopes
+            .iter()
+            .rposition(|(k, _)| *k == TemplateScopeKind::Block)
+        {
+            template_scopes.truncate(pos);
         }
-        template_scopes.push(ts_js::extract_ts_binding_names(rest));
+        template_scopes.push((
+            TemplateScopeKind::Block,
+            ts_js::extract_ts_binding_names(rest),
+        ));
         return;
     }
     if let Some(rest) = strip_tag_keyword(inner, "#snippet") {
@@ -729,7 +796,7 @@ fn push_mustache_exprs(
         {
             bound.extend(ts_js::extract_ts_binding_names(&rest[open + 1..close]));
         }
-        template_scopes.push(bound);
+        template_scopes.push((TemplateScopeKind::Block, bound));
         return;
     }
     exprs.push(TemplateExpr {

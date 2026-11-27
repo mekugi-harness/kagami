@@ -2987,8 +2987,6 @@ mod tests {
         );
     }
 }
-
-
 #[test]
 fn test_ts_js_function_value_refs_getters_and_lexical_shadowing() {
     let dir = tempfile::tempdir().unwrap();
@@ -3374,8 +3372,6 @@ testOnlyHelper();
         );
     }
 }
-
-
 #[test]
 fn test_svelte5_ts_review_edge_cases() {
     let dir = tempfile::tempdir().unwrap();
@@ -3392,6 +3388,9 @@ fn test_svelte5_ts_review_edge_cases() {
         r#"
 export function unusedImportedForHoistFn() {}
 export function unusedImportedForHoistVar() {}
+export function liveAfterBlockFn() {}
+export function liveAfterObjMethodVar() {}
+export function unusedBareLoopOrCatchImport() {}
 "#,
     )
     .unwrap();
@@ -3401,6 +3400,10 @@ export function unusedImportedForHoistVar() {}
         r#"
 export class Worker {
   run(): void {}
+}
+
+export class BaseWorker {
+  inheritedRun(): void {}
 }
 "#,
     )
@@ -3412,7 +3415,11 @@ export class Worker {
 import {
   unusedImportedForHoistFn as hoistedFn,
   unusedImportedForHoistVar as hoistedVar,
+  liveAfterBlockFn,
+  liveAfterObjMethodVar,
+  unusedBareLoopOrCatchImport,
 } from "./imported";
+import { BaseWorker } from "./b";
 
 function sameFileFormat() {}
 function makeId() { return "id"; }
@@ -3426,24 +3433,50 @@ class Worker {
   run(): void {}
 }
 
+class ChildWorker extends BaseWorker {
+  go(): void {
+    this.inheritedRun();
+  }
+}
+
 function boot(config: { sameFileFormat: string }, rows: Array<{ id?: string }>, target: number[]) {
   console.log(config.sameFileFormat);
   hoistedFn();
   function hoistedFn() {}
   if (rows.length >= 0) {
     var hoistedVar = () => {};
+    function liveAfterBlockFn() {}
+    liveAfterBlockFn();
   }
   hoistedVar();
+  liveAfterBlockFn();
+  const helperObj = {
+    prepare() {
+      var liveAfterObjMethodVar = 1;
+      return liveAfterObjMethodVar;
+    },
+  };
+  void helperObj;
+  liveAfterObjMethodVar();
   for (const { id = makeId() } of rows) {
     console.log(id);
+  }
+  for (const unusedBareLoopOrCatchImport of rows) {
+    void unusedBareLoopOrCatchImport;
   }
   for (target[getIndex()] of [1]) {
     void target;
   }
   try {
     new Worker().start();
+    new ChildWorker().go();
   } catch ({ message = fallbackMessage() }: any) {
     console.log(message);
+  }
+  try {
+    void rows;
+  } catch (unusedBareLoopOrCatchImport) {
+    void unusedBareLoopOrCatchImport;
   }
 }
 
@@ -3458,6 +3491,16 @@ boot({ sameFileFormat: "x" }, [], []);
         r#"<button>Click</button>"#,
     )
     .unwrap();
+    std::fs::write(
+        root.join("src/ui/Panel.svelte"),
+        r#"<div><slot /></div>"#,
+    )
+    .unwrap();
+    std::fs::write(
+        root.join("src/ui/UnusedWidget.svelte"),
+        r#"<div>unused</div>"#,
+    )
+    .unwrap();
 
     // 3. Script string containing "<!--" must not hide template;
     //    {#each} / {@const} bindings must shadow unused script functions inside block,
@@ -3466,15 +3509,24 @@ boot({ sameFileFormat: "x" }, [], []);
         root.join("src/routes/+page.svelte"),
         r#"<script lang="ts">
   import PrimaryBtn from "@ui/CustomBtn.svelte";
+  import Panel from "../ui/Panel.svelte";
+  import UnusedWidget from "../ui/UnusedWidget.svelte";
   const marker = "<!--";
   function renderLabel() { return marker; }
   function label() { return "unused"; }
   function afterBlock() { return "used-after"; }
+  function afterPanel() { return "used-after-panel"; }
   let labels = ["a", "b"];
+  let widgets: any[] = [];
 </script>
 
 <PrimaryBtn />
 <p>{renderLabel()}</p>
+<Panel>{@const afterPanel = "local"}{afterPanel}</Panel>
+<p>{afterPanel()}</p>
+{#each widgets as UnusedWidget}
+  <UnusedWidget />
+{/each}
 {#each labels as label (label)}
   <span>{label.toUpperCase()}</span>
 {/each}
@@ -3512,9 +3564,14 @@ boot({ sameFileFormat: "x" }, [], []);
         ("src/a.ts", "getIndex"),
         ("src/a.ts", "fallbackMessage"),
         ("src/a.ts", "Worker.run"),
+        ("src/b.ts", "BaseWorker.inheritedRun"),
+        ("src/imported.ts", "liveAfterBlockFn"),
+        ("src/imported.ts", "liveAfterObjMethodVar"),
         ("src/ui/CustomBtn.svelte", "CustomBtn"),
+        ("src/ui/Panel.svelte", "Panel"),
         ("src/routes/+page.svelte", "renderLabel"),
         ("src/routes/+page.svelte", "afterBlock"),
+        ("src/routes/+page.svelte", "afterPanel"),
     ] {
         assert!(
             !is_dead(file, sym),
@@ -3527,8 +3584,10 @@ boot({ sameFileFormat: "x" }, [], []);
         ("src/a.ts", "sameFileFormat"),
         ("src/imported.ts", "unusedImportedForHoistFn"),
         ("src/imported.ts", "unusedImportedForHoistVar"),
+        ("src/imported.ts", "unusedBareLoopOrCatchImport"),
         ("src/b.ts", "Worker.run"),
         ("src/routes/+page.svelte", "label"),
+        ("src/ui/UnusedWidget.svelte", "UnusedWidget"),
     ] {
         assert!(
             is_dead(file, sym),

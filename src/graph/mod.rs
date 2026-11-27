@@ -1250,6 +1250,18 @@ fn resolve_ref(
         if let Some(id) = by_file_name.get(&(qual.as_str(), r.target_name.as_str())) {
             return vec![(id.clone(), Confidence::Resolved)];
         }
+        // Inherited `this.method()` fallback: when `Class.method` is not declared on the subclass
+        // in the same file, fall back to the bare method name for inherited/receiver lookup.
+        let ts_this_bare: Option<&str> = if matches!(
+            ext.lang,
+            Language::TypeScript | Language::JavaScript | Language::Svelte
+        ) && qual.as_str() == ext.file.as_str()
+        {
+            r.target_name.split_once('.').map(|(_, bare)| bare)
+        } else {
+            None
+        };
+        let lookup_name = ts_this_bare.unwrap_or(r.target_name.as_str());
         if rel_import_paths.contains(qual.as_str()) {
             // Select the first existing target module by path priority before looking up the binding
             // so we never fall through to a lower-priority file (e.g. worker/index.ts when worker.ts exists).
@@ -1402,7 +1414,7 @@ fn resolve_ref(
         // If qualifier is a same-file or same-package var/const (e.g. Go hooks.Run()),
         // link the var itself so callbacks registered in its initializer remain reachable.
         push_const_qualifier_refs(ext, qual, symbols, by_file_name, by_pkg_name, &mut results);
-        if let Some(id) = by_file_name.get(&(ext.file.as_str(), r.target_name.as_str())) {
+        if let Some(id) = by_file_name.get(&(ext.file.as_str(), lookup_name)) {
             if id != &r.from_symbol_id
                 && symbols.get(id).map(|s| s.kind == SymbolKind::Method).unwrap_or(false)
             {
@@ -1416,7 +1428,7 @@ fn resolve_ref(
             let mut seen_methods: HashSet<String> = HashSet::new();
             let mut candidate_methods: Vec<String> = Vec::new();
             if !ext.package_or_module.is_empty() {
-                if let Some(ids) = by_pkg_name.get(&(ext.lang, ext.package_or_module.as_str(), r.target_name.as_str())) {
+                if let Some(ids) = by_pkg_name.get(&(ext.lang, ext.package_or_module.as_str(), lookup_name)) {
                     for id in ids {
                         if id != &r.from_symbol_id
                             && symbols.get(id).map(|s| s.kind == SymbolKind::Method).unwrap_or(false)
@@ -1465,6 +1477,44 @@ fn resolve_ref(
         }
         if !results.is_empty() {
             return results;
+        }
+        if let Some(bare) = ts_this_bare
+            && let Some(cands) = by_lang_name.get(&(ext.lang, bare))
+        {
+            let methods: Vec<String> = cands
+                .iter()
+                .filter(|id| {
+                    *id != &r.from_symbol_id
+                        && symbols.get(*id).map(|s| s.kind == SymbolKind::Method).unwrap_or(false)
+                })
+                .cloned()
+                .collect();
+            if methods.len() == 1 {
+                return vec![(methods[0].clone(), Confidence::Heuristic)];
+            }
+            if methods.len() <= 4 && !ext.imports.is_empty() {
+                let imported: Vec<String> = methods
+                    .into_iter()
+                    .filter(|id| {
+                        symbols
+                            .get(id)
+                            .map(|s| {
+                                ext.imports.iter().any(|imp| {
+                                    let clean = imp.trim_start_matches("./").trim_start_matches("../");
+                                    !clean.is_empty() && s.file.contains(clean)
+                                })
+                            })
+                            .unwrap_or(false)
+                    })
+                    .collect();
+                if !imported.is_empty() {
+                    return imported
+                        .into_iter()
+                        .map(|id| (id, Confidence::Resolved))
+                        .collect();
+                }
+            }
+            return Vec::new();
         }
     }
 

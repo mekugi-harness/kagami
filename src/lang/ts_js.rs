@@ -1174,15 +1174,14 @@ fn collect_hoisted_var_bindings(node: Node<'_>, src: &str, out: &mut HashSet<Str
     let mut stack = vec![node];
     while let Some(n) = stack.pop() {
         match n.kind() {
-            "arrow_function" | "function_expression" | "class_declaration" | "class" => {
-                continue;
-            }
-            "function_declaration" => {
-                if let Some(name_node) = n.child_by_field_name("name")
-                    && name_node.kind() == "identifier"
-                {
-                    out.insert(node_text(name_node, src).to_string());
-                }
+            "arrow_function"
+            | "function_expression"
+            | "function_declaration"
+            | "generator_function"
+            | "generator_function_declaration"
+            | "method_definition"
+            | "class_declaration"
+            | "class" => {
                 continue;
             }
             "variable_declaration" => {
@@ -1340,22 +1339,24 @@ fn walk_ts_expr_refs(
                 );
             }
             if let Some(left) = n.child_by_field_name("left") {
-                walk_ts_expr_refs(
-                    left,
-                    src,
-                    line_offset,
-                    from_id,
-                    ctx,
-                    scopes,
-                    enclosing_class,
-                    refs,
-                    bridges,
-                );
                 let is_decl = {
                     let mut lc = n.walk();
                     n.children(&mut lc)
                         .any(|ch| matches!(ch.kind(), "const" | "let" | "var"))
                 };
+                if !is_decl || matches!(left.kind(), "object_pattern" | "array_pattern") {
+                    walk_ts_expr_refs(
+                        left,
+                        src,
+                        line_offset,
+                        from_id,
+                        ctx,
+                        scopes,
+                        enclosing_class,
+                        refs,
+                        bridges,
+                    );
+                }
                 if is_decl && let Some(top) = scopes.last_mut() {
                     collect_pattern_bindings(left, src, top);
                 }
@@ -1379,17 +1380,19 @@ fn walk_ts_expr_refs(
         "catch_clause" => {
             scopes.push(HashSet::new());
             if let Some(p) = n.child_by_field_name("parameter") {
-                walk_ts_expr_refs(
-                    p,
-                    src,
-                    line_offset,
-                    from_id,
-                    ctx,
-                    scopes,
-                    enclosing_class,
-                    refs,
-                    bridges,
-                );
+                if matches!(p.kind(), "object_pattern" | "array_pattern") {
+                    walk_ts_expr_refs(
+                        p,
+                        src,
+                        line_offset,
+                        from_id,
+                        ctx,
+                        scopes,
+                        enclosing_class,
+                        refs,
+                        bridges,
+                    );
+                }
                 if let Some(top) = scopes.last_mut() {
                     collect_pattern_bindings(p, src, top);
                 }
