@@ -557,6 +557,26 @@ fn materialize_go_interface_edges(
         InterfaceOnly,
         Ambiguous,
     }
+    fn merge_promoted(
+        eff: &mut HashMap<String, (usize, PromotedMethod)>,
+        name: &str,
+        depth: usize,
+        state: PromotedMethod,
+    ) {
+        match eff.get_mut(name) {
+            None => {
+                eff.insert(name.to_string(), (depth, state));
+            }
+            Some((prev_depth, prev_state)) if depth < *prev_depth => {
+                *prev_depth = depth;
+                *prev_state = state;
+            }
+            Some((prev_depth, prev_state)) if depth == *prev_depth => {
+                *prev_state = PromotedMethod::Ambiguous;
+            }
+            Some(_) => {}
+        }
+    }
     let mut effective_methods_by_type: HashMap<String, HashMap<String, Option<String>>> =
         HashMap::new();
     let concrete_type_ids: Vec<String> = symbols
@@ -570,29 +590,23 @@ fn materialize_go_interface_edges(
         .collect();
     for type_id in &concrete_type_ids {
         let mut eff: HashMap<String, (usize, PromotedMethod)> = HashMap::new();
-        let mut visited: HashSet<String> = HashSet::new();
+        let mut visit_state: HashMap<String, (usize, usize)> = HashMap::new();
         let mut queue: std::collections::VecDeque<(String, usize)> =
             std::collections::VecDeque::from([(type_id.clone(), 0usize)]);
         while let Some((curr_id, depth)) = queue.pop_front() {
-            if !visited.insert(curr_id.clone()) {
+            let entry = visit_state.entry(curr_id.clone()).or_insert((depth, 0));
+            if depth > entry.0 || entry.1 >= 2 {
                 continue;
             }
+            entry.1 += 1;
             if let Some(ms) = go_methods_by_type.get(&curr_id) {
                 for (m_name, m_id) in ms {
-                    match eff.get_mut(m_name) {
-                        None => {
-                            eff.insert(
-                                m_name.clone(),
-                                (depth, PromotedMethod::Concrete(m_id.clone())),
-                            );
-                        }
-                        Some((prev_depth, prev_state)) if *prev_depth == depth => {
-                            if *prev_state != PromotedMethod::Concrete(m_id.clone()) {
-                                *prev_state = PromotedMethod::Ambiguous;
-                            }
-                        }
-                        Some(_) => {}
-                    }
+                    merge_promoted(
+                        &mut eff,
+                        m_name,
+                        depth,
+                        PromotedMethod::Concrete(m_id.clone()),
+                    );
                 }
             }
             if let (Some(owner), Some(embeds)) = (symbols.get(&curr_id), raw_embeds.get(&curr_id)) {
@@ -607,18 +621,12 @@ fn materialize_go_interface_edges(
                     ) {
                         if let Some(ms) = iface_method_sets.get(&target_id) {
                             for m_name in ms {
-                                match eff.get_mut(m_name) {
-                                    None => {
-                                        eff.insert(
-                                            m_name.clone(),
-                                            (depth + 1, PromotedMethod::InterfaceOnly),
-                                        );
-                                    }
-                                    Some((prev_depth, prev_state)) if *prev_depth == depth + 1 => {
-                                        *prev_state = PromotedMethod::Ambiguous;
-                                    }
-                                    Some(_) => {}
-                                }
+                                merge_promoted(
+                                    &mut eff,
+                                    m_name,
+                                    depth + 1,
+                                    PromotedMethod::InterfaceOnly,
+                                );
                             }
                         } else {
                             queue.push_back((target_id, depth + 1));

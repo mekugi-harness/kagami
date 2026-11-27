@@ -76,7 +76,9 @@ pub fn extract(rel_path: &str, src: &str, blake3_hex: String) -> Result<FileExtr
                     });
                     if let Some(body) = child.child_by_field_name("body") {
                         let params = extract_go_params(child, src);
-                        let locals = collect_go_locals(body, src, &params);
+                        let mut seed_locals = params.clone();
+                        seed_locals.extend(extract_go_named_results(child, src));
+                        let locals = collect_go_locals(body, src, &seed_locals);
                         collect_signature_type_refs(child, src, &id, &mut refs);
                         collect_refs_and_bridges(body, src, &id, &locals, &mut refs, &mut bridges);
                         let ir_body = lower_go_node(body, src);
@@ -121,6 +123,7 @@ pub fn extract(rel_path: &str, src: &str, blake3_hex: String) -> Result<FileExtr
                     if let Some(body) = child.child_by_field_name("body") {
                         let params = extract_go_params(child, src);
                         let mut seed_locals = params.clone();
+                        seed_locals.extend(extract_go_named_results(child, src));
                         if let Some(recv_name) = extract_receiver_var_name(child, src) {
                             seed_locals.push(recv_name);
                         }
@@ -562,6 +565,29 @@ fn extract_go_params(node: Node<'_>, src: &str) -> Vec<String> {
         }
     }
     params
+}
+
+fn extract_go_named_results(node: Node<'_>, src: &str) -> Vec<String> {
+    let mut names = Vec::new();
+    if let Some(res) = node.child_by_field_name("result")
+        && res.kind() == "parameter_list"
+    {
+        let mut c = res.walk();
+        for ch in res.children(&mut c) {
+            if ch.kind() == "parameter_declaration" {
+                let mut pc = ch.walk();
+                for sub in ch.children(&mut pc) {
+                    if sub.kind() == "identifier" {
+                        let t = node_text(sub, src).trim();
+                        if !t.is_empty() && t != "_" {
+                            names.push(t.to_string());
+                        }
+                    }
+                }
+            }
+        }
+    }
+    names
 }
 
 fn enclosing_scope_end(node: Node<'_>, fallback_end: usize) -> usize {
