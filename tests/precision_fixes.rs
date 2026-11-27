@@ -2008,3 +2008,377 @@ fn main() {
         dead_scoped_cfgs
     );
 }
+
+#[test]
+fn test_rust_bare_call_method_shadowing_and_aliased_use() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    fs::create_dir_all(root.join("src")).unwrap();
+    fs::write(
+        root.join("src/main.rs"),
+        r#"
+struct PidBackend;
+
+impl PidBackend {
+    fn terminate_process(&self, pid: u32) {
+        terminate_process(pid);
+    }
+
+    fn dead_method(&self) {}
+}
+
+#[cfg(unix)]
+fn terminate_process(_pid: u32) {}
+
+#[cfg(not(any(unix, windows)))]
+fn terminate_process(_pid: u32) {}
+
+#[cfg(windows)]
+fn force_terminate_process(_pid: u32) {}
+
+#[cfg(windows)]
+use force_terminate_process as terminate_process;
+
+struct ConfigManager;
+
+impl ConfigManager {
+    fn apply_runtime(&self) {
+        apply_runtime();
+    }
+}
+
+fn apply_runtime() {}
+fn never_called() {}
+fn prod_test_only_fn() {}
+fn prod_test_only_aliased() {}
+
+#[cfg(test)]
+mod tests {
+    use super::prod_test_only_aliased as test_alias;
+    use super::prod_test_only_fn;
+
+    #[test]
+    fn exercises_prod_only_in_tests() {
+        prod_test_only_fn();
+        test_alias();
+    }
+}
+
+fn main() {
+    let b = PidBackend;
+    b.terminate_process(42);
+    let c = ConfigManager;
+    c.apply_runtime();
+}
+"#,
+    )
+    .unwrap();
+
+    let dead = analyze_rust_dead(root);
+    let is_dead = |sym: &str| dead.symbols.iter().any(|s| s.symbol == sym);
+
+    for live_sym in [
+        "PidBackend::terminate_process",
+        "terminate_process",
+        "force_terminate_process",
+        "ConfigManager::apply_runtime",
+        "apply_runtime",
+    ] {
+        assert!(
+            !is_dead(live_sym),
+            "Expected {live_sym} to be live; dead={:?}",
+            dead.symbols
+        );
+    }
+    for dead_sym in [
+        "PidBackend::dead_method",
+        "never_called",
+        "prod_test_only_fn",
+        "prod_test_only_aliased",
+    ] {
+        assert!(
+            is_dead(dead_sym),
+            "Expected {dead_sym} to remain dead; dead={:?}",
+            dead.symbols
+        );
+    }
+}
+
+#[test]
+fn test_rust_cargo_crate_name_mapping_and_pub_use_reexports() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    fs::create_dir_all(root.join("crates/app-server-daemon/src/backend")).unwrap();
+    fs::create_dir_all(root.join("crates/cli/src")).unwrap();
+    fs::create_dir_all(root.join("crates/cli/tests")).unwrap();
+
+    fs::write(
+        root.join("crates/app-server-daemon/Cargo.toml"),
+        r#"
+[package]
+name = "codex-app-server-daemon"
+version = "0.1.0"
+
+[lib]
+name = "codex_app_server_daemon"
+path = "src/lib.rs"
+"#,
+    )
+    .unwrap();
+    fs::write(
+        root.join("crates/app-server-daemon/src/lib.rs"),
+        r#"
+pub mod backend;
+pub mod launch;
+pub mod transport;
+
+pub use backend::stderr_log::stderr_writer;
+pub use launch::start_with_features;
+pub use launch::unused_reexported_fn;
+pub use transport::start_control_socket_acceptor;
+
+pub fn run() {}
+"#,
+    )
+    .unwrap();
+    fs::write(
+        root.join("crates/app-server-daemon/src/launch.rs"),
+        r#"
+pub fn start_with_features() {}
+pub fn unused_reexported_fn() {}
+"#,
+    )
+    .unwrap();
+    fs::write(
+        root.join("crates/app-server-daemon/src/backend/mod.rs"),
+        "pub mod stderr_log;\n",
+    )
+    .unwrap();
+    fs::write(
+        root.join("crates/app-server-daemon/src/backend/stderr_log.rs"),
+        "pub fn stderr_writer() {}\n",
+    )
+    .unwrap();
+    fs::write(
+        root.join("crates/app-server-daemon/src/transport.rs"),
+        "pub fn start_control_socket_acceptor() {}\n",
+    )
+    .unwrap();
+    fs::write(
+        root.join("crates/cli/Cargo.toml"),
+        "[package]\nname = \"codex-cli\"\nversion = \"0.1.0\"\n",
+    )
+    .unwrap();
+    fs::write(
+        root.join("crates/cli/src/main.rs"),
+        r#"
+use codex_app_server_daemon::stderr_writer;
+
+fn main() {
+    codex_app_server_daemon::run();
+    codex_app_server_daemon::start_with_features();
+    stderr_writer();
+}
+"#,
+    )
+    .unwrap();
+    fs::write(
+        root.join("crates/cli/tests/integration_test.rs"),
+        r#"
+#[test]
+fn only_tests_call_acceptor() {
+    codex_app_server_daemon::start_control_socket_acceptor();
+}
+"#,
+    )
+    .unwrap();
+
+    let dead = analyze_rust_dead(root);
+    let is_dead = |sym: &str| dead.symbols.iter().any(|s| s.symbol == sym);
+
+    for live_sym in ["run", "start_with_features", "stderr_writer"] {
+        assert!(
+            !is_dead(live_sym),
+            "Expected {live_sym} to be live; dead={:?}",
+            dead.symbols
+        );
+    }
+    for dead_sym in ["start_control_socket_acceptor", "unused_reexported_fn"] {
+        assert!(
+            is_dead(dead_sym),
+            "Expected {dead_sym} to remain dead; dead={:?}",
+            dead.symbols
+        );
+    }
+}
+
+#[test]
+fn test_rust_for_loop_mut_ref_and_iterator_closure_inference() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    fs::create_dir_all(root.join("src")).unwrap();
+    fs::write(
+        root.join("src/main.rs"),
+        r#"
+struct SelectionAccumulator<'a> {
+    tag: &'a str,
+}
+
+impl<'a> SelectionAccumulator<'a> {
+    fn new(tag: &'a str) -> Self {
+        Self { tag }
+    }
+
+    fn wants(&self) -> bool {
+        !self.tag.is_empty()
+    }
+
+    fn accept(&mut self) {}
+
+    fn finish(self) {}
+
+    fn unused_method(&self) {}
+}
+
+fn maybe_acc() -> Option<SelectionAccumulator<'static>> {
+    Some(SelectionAccumulator::new("x"))
+}
+
+fn main() {
+    let mut states: Vec<SelectionAccumulator<'_>> = vec![SelectionAccumulator::new("a")];
+    if states.iter().any(|state| state.wants()) {
+        for state in &mut states {
+            state.accept();
+        }
+    }
+    let _done: Vec<()> = states.into_iter().map(|state| state.finish()).collect();
+    if let Some(mut acc) = maybe_acc() {
+        acc.accept();
+    }
+}
+"#,
+    )
+    .unwrap();
+
+    let dead = analyze_rust_dead(root);
+    let is_dead = |sym: &str| dead.symbols.iter().any(|s| s.symbol == sym);
+
+    for live_sym in [
+        "SelectionAccumulator::new",
+        "SelectionAccumulator::wants",
+        "SelectionAccumulator::accept",
+        "SelectionAccumulator::finish",
+    ] {
+        assert!(
+            !is_dead(live_sym),
+            "Expected {live_sym} to be live; dead={:?}",
+            dead.symbols
+        );
+    }
+    assert!(
+        is_dead("SelectionAccumulator::unused_method"),
+        "Expected unused_method to remain dead; dead={:?}",
+        dead.symbols
+    );
+}
+
+#[test]
+fn test_rust_type_alias_wrapper_receiver_chains() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    fs::create_dir_all(root.join("src")).unwrap();
+    fs::write(
+        root.join("src/main.rs"),
+        r#"
+use std::sync::Arc;
+
+struct EnrollmentState;
+
+impl EnrollmentState {
+    fn new() -> Self {
+        Self
+    }
+
+    fn lock_for_request(&self) {}
+
+    fn record_retry_after(&self) {}
+
+    fn ping(&self) {}
+
+    fn unused_method(&self) {}
+
+    fn test_only_method(&self) {}
+}
+
+type CurrentEnrollment = Arc<EnrollmentState>;
+type StateList = Vec<EnrollmentState>;
+
+struct Session {
+    current_enrollment: CurrentEnrollment,
+}
+
+impl Session {
+    fn start_pairing(&self) {
+        self.current_enrollment.lock_for_request();
+    }
+}
+
+fn connect(current_enrollment: &CurrentEnrollment) {
+    current_enrollment.record_retry_after();
+}
+
+fn ping_all(mut list: StateList) {
+    for s in &mut list {
+        s.ping();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn calls_test_only_method() {
+        let e: CurrentEnrollment = Arc::new(EnrollmentState::new());
+        e.test_only_method();
+    }
+}
+
+fn main() {
+    let e: CurrentEnrollment = Arc::new(EnrollmentState::new());
+    connect(&e);
+    let s = Session { current_enrollment: e };
+    s.start_pairing();
+    ping_all(vec![EnrollmentState::new()]);
+}
+"#,
+    )
+    .unwrap();
+
+    let dead = analyze_rust_dead(root);
+    let is_dead = |sym: &str| dead.symbols.iter().any(|s| s.symbol == sym);
+
+    for live_sym in [
+        "EnrollmentState::new",
+        "EnrollmentState::lock_for_request",
+        "EnrollmentState::record_retry_after",
+        "EnrollmentState::ping",
+        "Session::start_pairing",
+    ] {
+        assert!(
+            !is_dead(live_sym),
+            "Expected {live_sym} to be live; dead={:?}",
+            dead.symbols
+        );
+    }
+    for dead_sym in [
+        "EnrollmentState::unused_method",
+        "EnrollmentState::test_only_method",
+    ] {
+        assert!(
+            is_dead(dead_sym),
+            "Expected {dead_sym} to remain dead; dead={:?}",
+            dead.symbols
+        );
+    }
+}

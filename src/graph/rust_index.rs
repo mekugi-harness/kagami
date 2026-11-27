@@ -1,11 +1,100 @@
 use crate::graph::InterfaceImpl;
 use crate::model::{
-    Confidence, Edge, EdgeKind, FileExtract, Language, ReceiverStep, Symbol, SymbolKind,
+    Confidence, Edge, EdgeKind, FileExtract, Language, ReceiverStep, RustUseItem, Symbol,
+    SymbolKind,
 };
 use std::collections::{HashMap, HashSet};
+use std::fs;
+use std::path::Path;
+
+/// Discover Rust crate names from Cargo.toml files ([lib].name and [package].name)
+/// and map each Rust crate identifier (with '-' replaced by '_') to its crate source root
+/// directory relative to `root` (e.g. "codex_app_server_daemon" -> "codex-rs/app-server-daemon/src").
+pub fn discover_cargo_crates(root: &Path, extracts: &[FileExtract]) -> HashMap<String, String> {
+    let mut crate_roots: HashMap<String, String> = HashMap::new();
+    let mut checked_dirs: HashSet<String> = HashSet::new();
+    let mut parsed_manifests: HashSet<String> = HashSet::new();
+
+    for ext in extracts {
+        if ext.lang != Language::Rust {
+            continue;
+        }
+        let mut dir = ext
+            .file
+            .rsplit_once('/')
+            .map(|(d, _)| d.to_string())
+            .unwrap_or_default();
+        loop {
+            if !checked_dirs.insert(dir.clone()) {
+                break;
+            }
+            let manifest_path = if dir.is_empty() {
+                root.join("Cargo.toml")
+            } else {
+                root.join(&dir).join("Cargo.toml")
+            };
+            if manifest_path.is_file()
+                && parsed_manifests.insert(dir.clone())
+                && let Ok(content) = fs::read_to_string(&manifest_path)
+                && let Ok(val) = toml::from_str::<toml::Value>(&content)
+            {
+                let lib_name = val
+                    .get("lib")
+                    .and_then(|t| t.get("name"))
+                    .and_then(|v| v.as_str());
+                let pkg_name = val
+                    .get("package")
+                    .and_then(|t| t.get("name"))
+                    .and_then(|v| v.as_str());
+                if lib_name.is_some() || pkg_name.is_some() {
+                    let lib_path = val
+                        .get("lib")
+                        .and_then(|t| t.get("path"))
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("src/lib.rs");
+                    let lib_dir = lib_path
+                        .rsplit_once('/')
+                        .map(|(d, _)| d.trim_matches('/'))
+                        .unwrap_or("");
+                    let src_root = match (dir.is_empty(), lib_dir.is_empty()) {
+                        (true, true) => String::new(),
+                        (true, false) => lib_dir.to_string(),
+                        (false, true) => dir.clone(),
+                        (false, false) => format!("{}/{}", dir, lib_dir),
+                    };
+                    if let Some(ln) = lib_name {
+                        crate_roots.insert(ln.replace('-', "_"), src_root.clone());
+                    }
+                    if let Some(pn) = pkg_name {
+                        crate_roots.entry(pn.replace('-', "_")).or_insert(src_root);
+                    }
+                    // Stop at the nearest package manifest.
+                    break;
+                }
+            }
+            if dir.is_empty() {
+                break;
+            }
+            dir = dir
+                .rsplit_once('/')
+                .map(|(parent, _)| parent.to_string())
+                .unwrap_or_default();
+        }
+    }
+
+    crate_roots
+}
 
 pub struct RustTypeIndex<'a> {
     file_imports: HashMap<&'a str, &'a [String]>,
+    known_files: HashSet<&'a str>,
+    crate_roots: HashMap<String, String>,
+    file_to_crate_root: HashMap<&'a str, String>,
+    crate_root_to_idents: HashMap<String, Vec<String>>,
+    type_aliases: HashMap<String, String>,
+    file_non_method_syms: HashMap<(&'a str, &'a str), Vec<String>>,
+    file_pub_uses: HashMap<&'a str, Vec<&'a RustUseItem>>,
+    file_all_uses: HashMap<&'a str, Vec<&'a RustUseItem>>,
     types_by_file_name: HashMap<(&'a str, &'a str), String>,
     types_by_pkg_name: HashMap<(&'a str, &'a str), String>,
     types_by_name: HashMap<&'a str, Vec<String>>,
@@ -24,8 +113,17 @@ pub struct RustTypeIndex<'a> {
 }
 
 impl<'a> RustTypeIndex<'a> {
-    pub fn build(extracts: &'a [FileExtract], symbols: &HashMap<String, Symbol>) -> Self {
+    pub fn build(
+        extracts: &'a [FileExtract],
+        symbols: &HashMap<String, Symbol>,
+        crate_roots: HashMap<String, String>,
+    ) -> Self {
         let mut file_imports: HashMap<&'a str, &'a [String]> = HashMap::new();
+        let mut known_files: HashSet<&'a str> = HashSet::new();
+        let mut type_aliases: HashMap<String, String> = HashMap::new();
+        let mut file_non_method_syms: HashMap<(&'a str, &'a str), Vec<String>> = HashMap::new();
+        let mut file_pub_uses: HashMap<&'a str, Vec<&'a RustUseItem>> = HashMap::new();
+        let mut file_all_uses: HashMap<&'a str, Vec<&'a RustUseItem>> = HashMap::new();
         let mut types_by_file_name: HashMap<(&'a str, &'a str), String> = HashMap::new();
         let mut types_by_pkg_name: HashMap<(&'a str, &'a str), String> = HashMap::new();
         let mut types_by_name: HashMap<&'a str, Vec<String>> = HashMap::new();
@@ -45,6 +143,16 @@ impl<'a> RustTypeIndex<'a> {
                 continue;
             }
             file_imports.insert(ext.file.as_str(), ext.imports.as_slice());
+            known_files.insert(ext.file.as_str());
+            for (k, v) in &ext.type_aliases {
+                type_aliases.insert(k.clone(), v.clone());
+            }
+            for u in &ext.rust_uses {
+                file_all_uses.entry(ext.file.as_str()).or_default().push(u);
+                if u.is_pub && !u.is_test {
+                    file_pub_uses.entry(ext.file.as_str()).or_default().push(u);
+                }
+            }
             for (k, v) in &ext.struct_fields {
                 raw_struct_fields.insert(k.clone(), v.clone());
             }
@@ -69,6 +177,12 @@ impl<'a> RustTypeIndex<'a> {
                 cfg_gated_scopes.insert(id.as_str(), scope.as_str());
             }
             for sym in &ext.symbols {
+                if sym.kind != SymbolKind::Method {
+                    file_non_method_syms
+                        .entry((ext.file.as_str(), sym.name.as_str()))
+                        .or_default()
+                        .push(sym.id.clone());
+                }
                 if matches!(
                     sym.kind,
                     SymbolKind::Struct | SymbolKind::Enum | SymbolKind::Type | SymbolKind::Trait
@@ -99,8 +213,45 @@ impl<'a> RustTypeIndex<'a> {
             }
         }
 
+        let mut crate_root_to_idents: HashMap<String, Vec<String>> = HashMap::new();
+        for (ident, root_dir) in &crate_roots {
+            crate_root_to_idents
+                .entry(root_dir.clone())
+                .or_default()
+                .push(ident.clone());
+        }
+        let mut file_to_crate_root: HashMap<&'a str, String> = HashMap::new();
+        for &file in &known_files {
+            let mut best: Option<&str> = None;
+            for root_dir in crate_roots.values() {
+                let matches = if root_dir.is_empty() {
+                    true
+                } else {
+                    file.starts_with(&format!("{}/", root_dir))
+                };
+                if matches && best.is_none_or(|b| root_dir.len() > b.len()) {
+                    best = Some(root_dir.as_str());
+                }
+            }
+            if let Some(b) = best {
+                file_to_crate_root.insert(file, b.to_string());
+            } else if let Some(pos) = file.find("/src/") {
+                file_to_crate_root.insert(file, format!("{}/src", &file[..pos]));
+            } else if file.starts_with("src/") {
+                file_to_crate_root.insert(file, "src".to_string());
+            }
+        }
+
         let mut idx = Self {
             file_imports,
+            known_files,
+            crate_roots,
+            file_to_crate_root,
+            crate_root_to_idents,
+            type_aliases,
+            file_non_method_syms,
+            file_pub_uses,
+            file_all_uses,
             types_by_file_name,
             types_by_pkg_name,
             types_by_name,
@@ -258,8 +409,43 @@ impl<'a> RustTypeIndex<'a> {
         type_name: &str,
         symbols: &HashMap<String, Symbol>,
     ) -> Option<String> {
+        let tid =
+            self.resolve_type_raw(owner_file, owner_pkg, owner_imports, type_name, symbols)?;
+        let (unwrapped, extra_depth) = self.unwrap_type_alias(tid.clone(), symbols);
+        if extra_depth == 0 {
+            Some(unwrapped)
+        } else {
+            Some(tid)
+        }
+    }
+
+    fn resolve_type_raw(
+        &self,
+        owner_file: &str,
+        owner_pkg: &str,
+        owner_imports: &[String],
+        type_name: &str,
+        symbols: &HashMap<String, Symbol>,
+    ) -> Option<String> {
         // Handle module-qualified type paths (e.g. `remote::Worker` or `foo::bar::Worker`).
         if let Some((mod_qual, short_name)) = type_name.rsplit_once("::") {
+            let mod_segs: Vec<&str> = mod_qual.split("::").filter(|s| !s.is_empty()).collect();
+            if !mod_segs.is_empty() {
+                let mut visited = HashSet::new();
+                for mf in self.resolve_module_files(owner_file, &mod_segs) {
+                    let hits = self.resolve_symbol_in_module(
+                        &mf,
+                        short_name,
+                        true,
+                        symbols,
+                        0,
+                        &mut visited,
+                    );
+                    if hits.len() == 1 {
+                        return Some(hits[0].clone());
+                    }
+                }
+            }
             let cands = self.types_by_name.get(short_name)?;
             let matched: Vec<&String> = cands
                 .iter()
@@ -300,6 +486,30 @@ impl<'a> RustTypeIndex<'a> {
         {
             return Some(id.clone());
         }
+        if let Some(uses) = self.file_all_uses.get(owner_file) {
+            for u in uses {
+                if u.local_name == type_name
+                    && !u.is_test
+                    && let Some((mod_path, target_sym)) = u.target_path.rsplit_once("::")
+                {
+                    let mut hits = Vec::new();
+                    let mut visited = HashSet::new();
+                    self.resolve_mod_path_into(
+                        owner_file,
+                        mod_path,
+                        target_sym,
+                        true,
+                        symbols,
+                        0,
+                        &mut visited,
+                        &mut hits,
+                    );
+                    if hits.len() == 1 {
+                        return Some(hits.remove(0));
+                    }
+                }
+            }
+        }
         let cands = self.types_by_name.get(type_name)?;
         if cands.len() == 1 {
             return Some(cands[0].clone());
@@ -309,7 +519,7 @@ impl<'a> RustTypeIndex<'a> {
             .filter(|id| {
                 symbols
                     .get(*id)
-                    .map(|s| rust_imports_match_symbol(owner_imports, s))
+                    .map(|s| self.imports_match_symbol(owner_imports, s))
                     .unwrap_or(false)
             })
             .collect();
@@ -317,6 +527,46 @@ impl<'a> RustTypeIndex<'a> {
             return Some(matched[0].clone());
         }
         None
+    }
+
+    fn unwrap_type_alias(
+        &self,
+        start_id: String,
+        symbols: &HashMap<String, Symbol>,
+    ) -> (String, usize) {
+        let mut curr_id = start_id;
+        let mut extra_depth = 0usize;
+        let mut visited: HashSet<String> = HashSet::from([curr_id.clone()]);
+        for _ in 0..4 {
+            let Some(raw_target) = self.type_aliases.get(&curr_id) else {
+                break;
+            };
+            let Some(sym) = symbols.get(&curr_id) else {
+                break;
+            };
+            let imps = self
+                .file_imports
+                .get(sym.file.as_str())
+                .copied()
+                .unwrap_or(&[]);
+            let mut target_ty = raw_target.as_str();
+            let mut d = 0usize;
+            while let Some(rest) = target_ty.strip_prefix("[]") {
+                d += 1;
+                target_ty = rest;
+            }
+            let Some(next_id) =
+                self.resolve_type_raw(&sym.file, &sym.package_or_module, imps, target_ty, symbols)
+            else {
+                break;
+            };
+            if !visited.insert(next_id.clone()) {
+                break;
+            }
+            curr_id = next_id;
+            extra_depth += d;
+        }
+        (curr_id, extra_depth)
     }
 
     pub fn resolve_trait(
@@ -376,7 +626,7 @@ impl<'a> RustTypeIndex<'a> {
             .filter(|id| {
                 symbols
                     .get(*id)
-                    .map(|s| rust_imports_match_symbol(owner_imports, s))
+                    .map(|s| self.imports_match_symbol(owner_imports, s))
                     .unwrap_or(false)
             })
             .collect();
@@ -399,8 +649,374 @@ impl<'a> RustTypeIndex<'a> {
             depth += 1;
             raw_type = rest;
         }
-        let tid = self.resolve_type(owner_file, owner_pkg, owner_imports, raw_type, symbols)?;
-        Some((tid, depth))
+        let tid = self.resolve_type_raw(owner_file, owner_pkg, owner_imports, raw_type, symbols)?;
+        let (unwrapped, extra_depth) = self.unwrap_type_alias(tid, symbols);
+        Some((unwrapped, depth + extra_depth))
+    }
+
+    pub fn imports_match_symbol(&self, imports: &[String], sym: &Symbol) -> bool {
+        if rust_imports_match_symbol(imports, sym) {
+            return true;
+        }
+        if let Some(root_dir) = self.file_to_crate_root.get(sym.file.as_str())
+            && let Some(idents) = self.crate_root_to_idents.get(root_dir)
+        {
+            return idents
+                .iter()
+                .any(|ident| imports.iter().any(|imp| imp.contains(ident.as_str())));
+        }
+        false
+    }
+
+    fn push_module_candidates(&self, base_dir: &str, rest: &[&str], out: &mut Vec<String>) {
+        let join_dir = |a: &str, b: &str| -> String {
+            match (a.is_empty(), b.is_empty()) {
+                (true, _) => b.to_string(),
+                (_, true) => a.to_string(),
+                (false, false) => format!("{}/{}", a, b),
+            }
+        };
+        let cands = if rest.is_empty() {
+            let mut v = vec![
+                join_dir(base_dir, "lib.rs"),
+                join_dir(base_dir, "mod.rs"),
+                join_dir(base_dir, "main.rs"),
+            ];
+            if !base_dir.is_empty() {
+                v.push(format!("{}.rs", base_dir));
+            }
+            v
+        } else {
+            let sub = rest.join("/");
+            let full = join_dir(base_dir, &sub);
+            vec![
+                format!("{}.rs", full),
+                format!("{}/mod.rs", full),
+                format!("{}/lib.rs", full),
+            ]
+        };
+        for cand in cands {
+            if self.known_files.contains(cand.as_str()) && !out.contains(&cand) {
+                out.push(cand);
+            }
+        }
+    }
+
+    fn resolve_module_files(&self, base_file: &str, segs: &[&str]) -> Vec<String> {
+        let mut out = Vec::new();
+        let Some(&first) = segs.first() else {
+            return out;
+        };
+        let file_dir = base_file.rsplit_once('/').map(|(d, _)| d).unwrap_or("");
+        let file_name = base_file.rsplit('/').next().unwrap_or(base_file);
+        let is_dir_mod = matches!(file_name, "lib.rs" | "mod.rs" | "main.rs");
+
+        if first == "crate" {
+            if let Some(root) = self.file_to_crate_root.get(base_file) {
+                self.push_module_candidates(root, &segs[1..], &mut out);
+            }
+            return out;
+        }
+        if first == "super" {
+            let mut super_count = 0usize;
+            while segs.get(super_count) == Some(&"super") {
+                super_count += 1;
+            }
+            let pops = if is_dir_mod {
+                super_count
+            } else {
+                super_count.saturating_sub(1)
+            };
+            let mut dir = file_dir;
+            for _ in 0..pops {
+                dir = dir.rsplit_once('/').map(|(p, _)| p).unwrap_or("");
+            }
+            self.push_module_candidates(dir, &segs[super_count..], &mut out);
+            return out;
+        }
+        if first == "self" {
+            let self_dir = if is_dir_mod {
+                file_dir.to_string()
+            } else {
+                let stem = file_name.strip_suffix(".rs").unwrap_or(file_name);
+                if file_dir.is_empty() {
+                    stem.to_string()
+                } else {
+                    format!("{}/{}", file_dir, stem)
+                }
+            };
+            self.push_module_candidates(&self_dir, &segs[1..], &mut out);
+            if !is_dir_mod {
+                self.push_module_candidates(file_dir, &segs[1..], &mut out);
+            }
+            return out;
+        }
+        if let Some(crate_root) = self.crate_roots.get(first) {
+            self.push_module_candidates(crate_root, &segs[1..], &mut out);
+            return out;
+        }
+        // Relative to current module directory, submodule directory (if foo.rs), or crate root.
+        self.push_module_candidates(file_dir, segs, &mut out);
+        if !is_dir_mod {
+            let stem = file_name.strip_suffix(".rs").unwrap_or(file_name);
+            let sub_dir = if file_dir.is_empty() {
+                stem.to_string()
+            } else {
+                format!("{}/{}", file_dir, stem)
+            };
+            self.push_module_candidates(&sub_dir, segs, &mut out);
+        }
+        if let Some(root) = self.file_to_crate_root.get(base_file)
+            && root != file_dir
+        {
+            self.push_module_candidates(root, segs, &mut out);
+        }
+        out
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn resolve_mod_path_into(
+        &self,
+        base_file: &str,
+        mod_path: &str,
+        sym_name: &str,
+        only_types: bool,
+        symbols: &HashMap<String, Symbol>,
+        depth: usize,
+        visited: &mut HashSet<(String, String)>,
+        out: &mut Vec<String>,
+    ) {
+        let mod_segs: Vec<&str> = mod_path.split("::").filter(|s| !s.is_empty()).collect();
+        for mf in self.resolve_module_files(base_file, &mod_segs) {
+            for hit in
+                self.resolve_symbol_in_module(&mf, sym_name, only_types, symbols, depth, visited)
+            {
+                push_unique(out, hit);
+            }
+        }
+    }
+
+    fn resolve_symbol_in_module(
+        &self,
+        mod_file: &str,
+        sym_name: &str,
+        only_types: bool,
+        symbols: &HashMap<String, Symbol>,
+        depth: usize,
+        visited: &mut HashSet<(String, String)>,
+    ) -> Vec<String> {
+        if depth > 4 || !visited.insert((mod_file.to_string(), sym_name.to_string())) {
+            return Vec::new();
+        }
+        let kind_matches = |s: &Symbol| -> bool {
+            if only_types {
+                matches!(
+                    s.kind,
+                    SymbolKind::Struct | SymbolKind::Enum | SymbolKind::Type | SymbolKind::Trait
+                )
+            } else {
+                matches!(s.kind, SymbolKind::Function | SymbolKind::Const)
+            }
+        };
+        if let Some(ids) = self.file_non_method_syms.get(&(mod_file, sym_name)) {
+            let hits: Vec<String> = ids
+                .iter()
+                .filter(|id| {
+                    symbols
+                        .get(*id)
+                        .is_some_and(|s| !s.is_test && kind_matches(s))
+                })
+                .cloned()
+                .collect();
+            if !hits.is_empty() {
+                return hits;
+            }
+        }
+        let Some(pub_uses) = self.file_pub_uses.get(mod_file) else {
+            return Vec::new();
+        };
+        let mut out = Vec::new();
+        for u in pub_uses {
+            if u.local_name != sym_name {
+                continue;
+            }
+            if let Some((mod_path, target_sym)) = u.target_path.rsplit_once("::") {
+                self.resolve_mod_path_into(
+                    mod_file,
+                    mod_path,
+                    target_sym,
+                    only_types,
+                    symbols,
+                    depth + 1,
+                    visited,
+                    &mut out,
+                );
+            } else if u.target_path != sym_name {
+                for hit in self.resolve_symbol_in_module(
+                    mod_file,
+                    &u.target_path,
+                    only_types,
+                    symbols,
+                    depth + 1,
+                    visited,
+                ) {
+                    push_unique(&mut out, hit);
+                }
+            }
+        }
+        if !out.is_empty() {
+            return out;
+        }
+        for u in pub_uses {
+            if u.local_name != "*" {
+                continue;
+            }
+            self.resolve_mod_path_into(
+                mod_file,
+                &u.target_path,
+                sym_name,
+                only_types,
+                symbols,
+                depth + 1,
+                visited,
+                &mut out,
+            );
+        }
+        out
+    }
+
+    /// Resolve a bare Rust function/const call (no receiver/qualifier):
+    /// prefers same-file non-method definitions over methods and follows local `use` aliases
+    /// (including `#[cfg(...)] use foo as bar;`) and imported `pub use` re-exports.
+    pub fn resolve_bare_call(
+        &self,
+        caller_file: &str,
+        target_name: &str,
+        caller_is_test: bool,
+        symbols: &HashMap<String, Symbol>,
+    ) -> Vec<(String, Confidence)> {
+        let mut out: Vec<String> = Vec::new();
+
+        if let Some(ids) = self.file_non_method_syms.get(&(caller_file, target_name)) {
+            for id in ids {
+                if symbols.get(id).is_some_and(|s| {
+                    matches!(s.kind, SymbolKind::Function | SymbolKind::Const)
+                        && (!s.is_test || caller_is_test)
+                }) {
+                    push_unique(&mut out, id.clone());
+                }
+            }
+        }
+
+        if let Some(uses) = self.file_all_uses.get(caller_file) {
+            for u in uses {
+                if u.local_name != target_name || (u.is_test && !caller_is_test) {
+                    continue;
+                }
+                if let Some((mod_path, target_sym)) = u.target_path.rsplit_once("::") {
+                    let mut visited = HashSet::new();
+                    self.resolve_mod_path_into(
+                        caller_file,
+                        mod_path,
+                        target_sym,
+                        false,
+                        symbols,
+                        0,
+                        &mut visited,
+                        &mut out,
+                    );
+                } else if u.target_path != target_name
+                    && let Some(ids) = self
+                        .file_non_method_syms
+                        .get(&(caller_file, u.target_path.as_str()))
+                {
+                    for id in ids {
+                        if symbols.get(id).is_some_and(|s| {
+                            matches!(s.kind, SymbolKind::Function | SymbolKind::Const)
+                                && (!s.is_test || caller_is_test)
+                        }) {
+                            push_unique(&mut out, id.clone());
+                        }
+                    }
+                }
+            }
+            if out.is_empty() {
+                for u in uses {
+                    if u.local_name != "*" || (u.is_test && !caller_is_test) {
+                        continue;
+                    }
+                    let mut visited = HashSet::new();
+                    self.resolve_mod_path_into(
+                        caller_file,
+                        &u.target_path,
+                        target_name,
+                        false,
+                        symbols,
+                        0,
+                        &mut visited,
+                        &mut out,
+                    );
+                }
+            }
+        }
+
+        out.into_iter()
+            .map(|id| (id, Confidence::Resolved))
+            .collect()
+    }
+
+    /// Resolve a module- or crate-qualified Rust call (e.g. `codex_app_server_daemon::run`,
+    /// `codex_app_server_daemon::start_with_features`, `auth::connect`) using Cargo.toml
+    /// crate roots, local `use` module aliases, and `pub use` re-exports.
+    pub fn resolve_qualified_path(
+        &self,
+        caller_file: &str,
+        qual: &str,
+        target_name: &str,
+        caller_is_test: bool,
+        symbols: &HashMap<String, Symbol>,
+    ) -> Vec<(String, Confidence)> {
+        let raw_segs: Vec<&str> = qual.split("::").filter(|s| !s.is_empty()).collect();
+        if raw_segs.is_empty() {
+            return Vec::new();
+        }
+
+        let mut candidate_paths: Vec<Vec<&str>> = Vec::new();
+        if let Some(uses) = self.file_all_uses.get(caller_file) {
+            for u in uses {
+                if u.local_name == raw_segs[0] && (!u.is_test || caller_is_test) {
+                    let mut expanded: Vec<&str> = u
+                        .target_path
+                        .split("::")
+                        .filter(|s| !s.is_empty())
+                        .collect();
+                    expanded.extend_from_slice(&raw_segs[1..]);
+                    if !expanded.is_empty() {
+                        candidate_paths.push(expanded);
+                    }
+                }
+            }
+        }
+        candidate_paths.push(raw_segs);
+
+        let mut out: Vec<String> = Vec::new();
+        for segs in candidate_paths {
+            let mut visited = HashSet::new();
+            for mf in self.resolve_module_files(caller_file, &segs) {
+                for hit in
+                    self.resolve_symbol_in_module(&mf, target_name, false, symbols, 0, &mut visited)
+                {
+                    push_unique(&mut out, hit);
+                }
+            }
+            if !out.is_empty() {
+                break;
+            }
+        }
+
+        out.into_iter()
+            .map(|id| (id, Confidence::Resolved))
+            .collect()
     }
 
     fn resolve_field_on_type(
@@ -674,7 +1290,22 @@ impl<'a> RustTypeIndex<'a> {
                     if state.1 > 0 {
                         if matches!(
                             name.as_str(),
-                            "iter" | "iter_mut" | "into_iter" | "values" | "values_mut"
+                            "iter"
+                                | "iter_mut"
+                                | "into_iter"
+                                | "values"
+                                | "values_mut"
+                                | "enumerate"
+                                | "rev"
+                                | "take"
+                                | "skip"
+                                | "filter"
+                                | "drain"
+                                | "copied"
+                                | "cloned"
+                                | "peekable"
+                                | "cycle"
+                                | "step_by"
                         ) {
                             continue;
                         }
@@ -692,6 +1323,12 @@ impl<'a> RustTypeIndex<'a> {
             }
         }
         Some(state)
+    }
+}
+
+fn push_unique(out: &mut Vec<String>, id: String) {
+    if !out.contains(&id) {
+        out.push(id);
     }
 }
 

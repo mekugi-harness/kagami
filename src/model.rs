@@ -185,6 +185,18 @@ pub struct TraitImplInfo {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RustUseItem {
+    /// Local binding name (or "*" for glob use).
+    pub local_name: String,
+    /// Target path (e.g. "force_terminate_process", "auth::connect", "crate::foo::bar").
+    pub target_path: String,
+    #[serde(default)]
+    pub is_pub: bool,
+    #[serde(default)]
+    pub is_test: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct FileExtract {
     pub file: String,
     pub lang: Language,
@@ -217,6 +229,12 @@ pub struct FileExtract {
     /// Non-test #[cfg(...)]-gated symbol ID -> inline module scope path for sibling propagation.
     #[serde(default)]
     pub cfg_gated_symbols: HashMap<String, String>,
+    /// Type alias symbol ID -> normalized target type name (e.g. Rust `type Alias = Arc<Target>`).
+    #[serde(default)]
+    pub type_aliases: HashMap<String, String>,
+    /// Structured Rust `use` items (aliases, imports, and `pub use` re-exports).
+    #[serde(default)]
+    pub rust_uses: Vec<RustUseItem>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

@@ -4,7 +4,7 @@ use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 
-pub const PARSER_VERSION: u32 = 7;
+pub const PARSER_VERSION: u32 = 8;
 
 #[derive(Debug, Default, Serialize, Deserialize)]
 pub struct CacheData {

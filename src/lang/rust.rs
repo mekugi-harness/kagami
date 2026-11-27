@@ -5,7 +5,7 @@ use crate::lang::{
 };
 use crate::model::{
     BridgeHint, BridgeKind, BridgeRole, Confidence, EdgeKind, FileExtract, Language, RawRef,
-    ReceiverStep, Symbol, SymbolKind, TraitImplInfo, Visibility,
+    ReceiverStep, RustUseItem, Symbol, SymbolKind, TraitImplInfo, Visibility,
 };
 use anyhow::Result;
 use std::collections::HashMap;
@@ -27,6 +27,8 @@ struct RustExtractCtx<'a> {
     trait_impls: Vec<TraitImplInfo>,
     impl_macros: Vec<(String, String, usize)>,
     cfg_gated_symbols: HashMap<String, String>,
+    type_aliases: HashMap<String, String>,
+    rust_uses: Vec<RustUseItem>,
 }
 
 /// Lexical scope stack for Rust local variables and inferred receiver chains.
@@ -104,6 +106,8 @@ pub fn extract(rel_path: &str, src: &str, blake3_hex: String) -> Result<FileExtr
         trait_impls: Vec::new(),
         impl_macros: Vec::new(),
         cfg_gated_symbols: HashMap::new(),
+        type_aliases: HashMap::new(),
+        rust_uses: Vec::new(),
     };
 
     let mut top_methods = Vec::new();
@@ -134,6 +138,8 @@ pub fn extract(rel_path: &str, src: &str, blake3_hex: String) -> Result<FileExtr
         trait_impls: ctx.trait_impls,
         impl_macros: ctx.impl_macros,
         cfg_gated_symbols: ctx.cfg_gated_symbols,
+        type_aliases: ctx.type_aliases,
+        rust_uses: ctx.rust_uses,
         package_or_module: pkg,
     })
 }
@@ -465,6 +471,11 @@ fn walk_rust_items(
         match child.kind() {
             "use_declaration" => {
                 ctx.imports.push(node_text(child, ctx.src).to_string());
+                let is_pub = rust_visibility(child, ctx.src) == Visibility::Public;
+                let is_test = in_test_mod || has_test_attr;
+                if let Some(arg) = child.child_by_field_name("argument") {
+                    extract_rust_use_items(arg, ctx.src, "", is_pub, is_test, &mut ctx.rust_uses);
+                }
             }
             "mod_item" => {
                 let sub_test = in_test_mod || has_test_attr;
@@ -835,6 +846,13 @@ fn walk_rust_items(
                         );
                         if !trait_methods.is_empty() {
                             ctx.interface_methods.insert(id.clone(), trait_methods);
+                        }
+                    } else if kind == SymbolKind::Type
+                        && let Some(rhs) = child.child_by_field_name("type")
+                    {
+                        let norm = normalize_rust_type_text(node_text(rhs, ctx.src), impl_type);
+                        if !norm.is_empty() && norm != name {
+                            ctx.type_aliases.insert(id.clone(), norm);
                         }
                     }
                     collect_type_refs(
@@ -1452,15 +1470,17 @@ fn extract_rust_receiver_chain(
     impl_type: Option<&str>,
 ) -> Option<Vec<ReceiverStep>> {
     match expr.kind() {
-        "parenthesized_expression"
-        | "await_expression"
-        | "try_expression"
-        | "reference_expression" => expr
+        "parenthesized_expression" | "await_expression" | "try_expression" => expr
             .named_child(0)
+            .and_then(|inner| extract_rust_receiver_chain(inner, src, env, impl_type)),
+        "reference_expression" => expr
+            .child_by_field_name("value")
+            .or_else(|| expr.named_child(0))
             .and_then(|inner| extract_rust_receiver_chain(inner, src, env, impl_type)),
         "unary_expression" => {
             if node_text(expr, src).trim_start().starts_with('*') {
-                expr.named_child(0)
+                expr.child_by_field_name("value")
+                    .or_else(|| expr.named_child(0))
                     .and_then(|inner| extract_rust_receiver_chain(inner, src, env, impl_type))
             } else {
                 None
@@ -1700,32 +1720,7 @@ fn walk_rust_expr(
             env.pop_scope();
         }
         "closure_expression" => {
-            env.push_scope();
-            if let Some(plist) = node.child_by_field_name("parameters") {
-                let mut c = plist.walk();
-                for ch in plist.children(&mut c) {
-                    if ch.kind() == "parameter" {
-                        let pty = ch.child_by_field_name("type").and_then(|t| {
-                            collect_type_refs(t, src, from_id, impl_type, refs, bridges);
-                            let norm = normalize_rust_type_text(node_text(t, src), impl_type);
-                            if norm.is_empty() {
-                                None
-                            } else {
-                                Some(vec![ReceiverStep::Type(norm)])
-                            }
-                        });
-                        if let Some(pat) = ch.child_by_field_name("pattern") {
-                            bind_rust_pattern(pat, src, pty, env);
-                        }
-                    } else if ch.is_named() {
-                        bind_rust_pattern(ch, src, None, env);
-                    }
-                }
-            }
-            if let Some(body) = node.child_by_field_name("body") {
-                walk_rust_expr(body, src, from_id, impl_type, env, refs, bridges);
-            }
-            env.pop_scope();
+            walk_rust_closure(node, src, from_id, impl_type, env, refs, bridges, None);
         }
         "match_arm" => {
             env.push_scope();
@@ -1758,6 +1753,7 @@ fn walk_rust_expr(
             env.pop_scope();
         }
         "call_expression" => {
+            let mut closure_param_hint: Option<Vec<ReceiverStep>> = None;
             if let Some(raw_func) = node.child_by_field_name("function") {
                 let func = if raw_func.kind() == "generic_function" {
                     if let Some(targs) = raw_func.child_by_field_name("type_arguments") {
@@ -1813,9 +1809,13 @@ fn walk_rust_expr(
                             let qual = val_node.map(|v| node_text(v, src).to_string());
                             let chain = val_node
                                 .and_then(|v| extract_rust_receiver_chain(v, src, env, impl_type));
+                            let mname = node_text(field, src);
+                            if let Some(ref recv_chain) = chain {
+                                closure_param_hint = infer_closure_param_hint(recv_chain, mname);
+                            }
                             refs.push(RawRef {
                                 from_symbol_id: from_id.to_string(),
-                                target_name: node_text(field, src).to_string(),
+                                target_name: mname.to_string(),
                                 qualifier: qual,
                                 kind: EdgeKind::Calls,
                                 line,
@@ -1832,7 +1832,27 @@ fn walk_rust_expr(
                 }
             }
             if let Some(args) = node.child_by_field_name("arguments") {
-                walk_rust_expr(args, src, from_id, impl_type, env, refs, bridges);
+                if closure_param_hint.is_some() {
+                    let mut ac = args.walk();
+                    for arg in args.children(&mut ac) {
+                        if arg.kind() == "closure_expression" {
+                            walk_rust_closure(
+                                arg,
+                                src,
+                                from_id,
+                                impl_type,
+                                env,
+                                refs,
+                                bridges,
+                                closure_param_hint.clone(),
+                            );
+                        } else {
+                            walk_rust_expr(arg, src, from_id, impl_type, env, refs, bridges);
+                        }
+                    }
+                } else {
+                    walk_rust_expr(args, src, from_id, impl_type, env, refs, bridges);
+                }
             }
         }
         "macro_invocation" => {
@@ -1989,6 +2009,246 @@ fn walk_rust_condition(
             walk_rust_expr(cond, src, from_id, impl_type, env, refs, bridges);
         }
     }
+}
+
+fn clean_rust_use_path(raw: &str) -> String {
+    raw.split("::")
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .collect::<Vec<_>>()
+        .join("::")
+}
+
+fn join_rust_use_path(prefix: &str, tail: &str) -> String {
+    match (prefix.is_empty(), tail.is_empty()) {
+        (true, _) => tail.to_string(),
+        (_, true) => prefix.to_string(),
+        (false, false) => format!("{}::{}", prefix, tail),
+    }
+}
+
+fn extract_rust_use_items(
+    node: Node<'_>,
+    src: &str,
+    prefix: &str,
+    is_pub: bool,
+    is_test: bool,
+    out: &mut Vec<RustUseItem>,
+) {
+    match node.kind() {
+        "identifier" | "crate" | "super" | "self" => {
+            let name = node_text(node, src).trim();
+            if name == "self" {
+                if !prefix.is_empty()
+                    && let Some(local) = prefix.rsplit("::").next()
+                {
+                    out.push(RustUseItem {
+                        local_name: local.to_string(),
+                        target_path: prefix.to_string(),
+                        is_pub,
+                        is_test,
+                    });
+                }
+            } else if !name.is_empty() {
+                let full = join_rust_use_path(prefix, name);
+                out.push(RustUseItem {
+                    local_name: name.to_string(),
+                    target_path: full,
+                    is_pub,
+                    is_test,
+                });
+            }
+        }
+        "scoped_identifier" => {
+            let cleaned = clean_rust_use_path(node_text(node, src));
+            if !cleaned.is_empty() {
+                let full = join_rust_use_path(prefix, &cleaned);
+                if let Some(local) = full.rsplit("::").next() {
+                    out.push(RustUseItem {
+                        local_name: local.to_string(),
+                        target_path: full,
+                        is_pub,
+                        is_test,
+                    });
+                }
+            }
+        }
+        "use_as_clause" => {
+            let Some(path_node) = node.child_by_field_name("path") else {
+                return;
+            };
+            let Some(alias_node) = node.child_by_field_name("alias") else {
+                return;
+            };
+            let alias = node_text(alias_node, src).trim();
+            if alias.is_empty() || alias == "_" {
+                return;
+            }
+            let ptxt = clean_rust_use_path(node_text(path_node, src));
+            let full = if ptxt == "self" {
+                prefix.to_string()
+            } else {
+                join_rust_use_path(prefix, &ptxt)
+            };
+            if !full.is_empty() {
+                out.push(RustUseItem {
+                    local_name: alias.to_string(),
+                    target_path: full,
+                    is_pub,
+                    is_test,
+                });
+            }
+        }
+        "use_wildcard" => {
+            let mut c = node.walk();
+            let mut sub = String::new();
+            for ch in node.children(&mut c) {
+                if ch.is_named() {
+                    sub = clean_rust_use_path(node_text(ch, src));
+                    break;
+                }
+            }
+            let full = join_rust_use_path(prefix, &sub);
+            if !full.is_empty() {
+                out.push(RustUseItem {
+                    local_name: "*".to_string(),
+                    target_path: full,
+                    is_pub,
+                    is_test,
+                });
+            }
+        }
+        "scoped_use_list" => {
+            let sub = node
+                .child_by_field_name("path")
+                .map(|p| clean_rust_use_path(node_text(p, src)))
+                .unwrap_or_default();
+            let next_prefix = join_rust_use_path(prefix, &sub);
+            if let Some(list) = node.child_by_field_name("list") {
+                extract_rust_use_items(list, src, &next_prefix, is_pub, is_test, out);
+            }
+        }
+        "use_list" => {
+            let mut c = node.walk();
+            for ch in node.children(&mut c) {
+                if ch.is_named() {
+                    extract_rust_use_items(ch, src, prefix, is_pub, is_test, out);
+                }
+            }
+        }
+        _ => {}
+    }
+}
+
+fn infer_closure_param_hint(
+    recv_chain: &[ReceiverStep],
+    method: &str,
+) -> Option<Vec<ReceiverStep>> {
+    if matches!(
+        method,
+        "any"
+            | "all"
+            | "find"
+            | "find_map"
+            | "for_each"
+            | "filter"
+            | "filter_map"
+            | "flat_map"
+            | "position"
+            | "rposition"
+            | "retain"
+            | "try_for_each"
+            | "take_while"
+            | "skip_while"
+            | "partition"
+            | "sort_by_key"
+            | "max_by_key"
+            | "min_by_key"
+    ) {
+        let mut ch = recv_chain.to_vec();
+        ch.push(ReceiverStep::Elem);
+        return Some(ch);
+    }
+    if matches!(method, "map" | "inspect") {
+        let looks_like_iter = recv_chain.last().is_some_and(|step| {
+            matches!(
+                step,
+                ReceiverStep::MethodCall { name, .. }
+                    if matches!(
+                        name.as_str(),
+                        "iter"
+                            | "iter_mut"
+                            | "into_iter"
+                            | "values"
+                            | "values_mut"
+                            | "drain"
+                            | "rev"
+                            | "take"
+                            | "skip"
+                            | "filter"
+                            | "cloned"
+                            | "copied"
+                    )
+            )
+        }) || (recv_chain.len() == 1
+            && matches!(&recv_chain[0], ReceiverStep::Type(t) if t.starts_with("[]")));
+        let mut ch = recv_chain.to_vec();
+        if looks_like_iter {
+            ch.push(ReceiverStep::Elem);
+        }
+        return Some(ch);
+    }
+    if matches!(
+        method,
+        "and_then" | "is_some_and" | "is_ok_and" | "map_or" | "map_or_else"
+    ) {
+        return Some(recv_chain.to_vec());
+    }
+    None
+}
+
+#[allow(clippy::too_many_arguments)]
+fn walk_rust_closure(
+    node: Node<'_>,
+    src: &str,
+    from_id: &str,
+    impl_type: Option<&str>,
+    env: &mut RustLocalEnv,
+    refs: &mut Vec<RawRef>,
+    bridges: &mut Vec<BridgeHint>,
+    first_param_hint: Option<Vec<ReceiverStep>>,
+) {
+    env.push_scope();
+    if let Some(plist) = node.child_by_field_name("parameters") {
+        let mut hint = first_param_hint;
+        let mut c = plist.walk();
+        for ch in plist.children(&mut c) {
+            if ch.kind() == "parameter" {
+                let pty = ch
+                    .child_by_field_name("type")
+                    .and_then(|t| {
+                        collect_type_refs(t, src, from_id, impl_type, refs, bridges);
+                        let norm = normalize_rust_type_text(node_text(t, src), impl_type);
+                        if norm.is_empty() {
+                            None
+                        } else {
+                            Some(vec![ReceiverStep::Type(norm)])
+                        }
+                    })
+                    .or_else(|| hint.take());
+                if let Some(pat) = ch.child_by_field_name("pattern") {
+                    bind_rust_pattern(pat, src, pty, env);
+                }
+            } else if ch.is_named() {
+                let pty = hint.take();
+                bind_rust_pattern(ch, src, pty, env);
+            }
+        }
+    }
+    if let Some(body) = node.child_by_field_name("body") {
+        walk_rust_expr(body, src, from_id, impl_type, env, refs, bridges);
+    }
+    env.pop_scope();
 }
 
 fn collect_pattern_type_refs(pat: Node<'_>, src: &str, from_id: &str, refs: &mut Vec<RawRef>) {
