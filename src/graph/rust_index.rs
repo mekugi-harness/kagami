@@ -1300,30 +1300,6 @@ impl<'a> RustTypeIndex<'a> {
                 }
             }
         }
-        // Fall back to an inline module defined in the same file (e.g. mod api { pub fn foo() }).
-        if out.is_empty()
-            && let Some(ids) = self.file_non_method_syms.get(&(caller_file, target_name))
-        {
-            let target_scope = if caller_scope.is_empty() {
-                raw_segs.join("::")
-            } else {
-                format!("{}::{}", caller_scope, raw_segs.join("::"))
-            };
-            for id in ids {
-                let sym_scope = self
-                    .symbol_mod_scopes
-                    .get(id.as_str())
-                    .map(String::as_str)
-                    .unwrap_or("");
-                if sym_scope == target_scope
-                    && symbols
-                        .get(id)
-                        .is_some_and(|s| !s.is_test || caller_is_test)
-                {
-                    push_unique(&mut out, id.clone());
-                }
-            }
-        }
 
         out.into_iter()
             .map(|id| (id, Confidence::Resolved))
@@ -1511,24 +1487,46 @@ impl<'a> RustTypeIndex<'a> {
         }
         // Tuple struct constructor call: e.g. SlotPair(a, b) or mod_a::SlotPair(a, b).
         if name.chars().next().is_some_and(|c| c.is_ascii_uppercase()) {
-            let type_name = match qualifier {
-                Some(q) => format!("{q}::{name}"),
-                None => name.to_string(),
-            };
             let caller_scope = self
                 .symbol_mod_scopes
                 .get(caller_id)
                 .map(String::as_str)
                 .unwrap_or("");
-            if let Some(res) = self.resolve_type_with_slices_in_scope(
-                &ext.file,
-                &ext.package_or_module,
-                &ext.imports,
-                &type_name,
-                caller_scope,
-                symbols,
-            ) {
-                return Some(res);
+            if qualifier.is_none()
+                && let Some(ids) = self.file_non_method_syms.get(&(ext.file.as_str(), name))
+            {
+                let scoped: Vec<&String> = ids
+                    .iter()
+                    .filter(|id| {
+                        self.symbol_mod_scopes
+                            .get(id.as_str())
+                            .map(String::as_str)
+                            .unwrap_or("")
+                            == caller_scope
+                            && symbols
+                                .get(*id)
+                                .is_some_and(|s| !s.is_test && s.kind == SymbolKind::Struct)
+                    })
+                    .collect();
+                if scoped.len() == 1 {
+                    return Some((scoped[0].clone(), 0));
+                }
+            }
+            if qualifier.is_some() || caller_scope.is_empty() {
+                let type_name = match qualifier {
+                    Some(q) => format!("{q}::{name}"),
+                    None => name.to_string(),
+                };
+                if let Some(res) = self.resolve_type_with_slices_in_scope(
+                    &ext.file,
+                    &ext.package_or_module,
+                    &ext.imports,
+                    &type_name,
+                    caller_scope,
+                    symbols,
+                ) {
+                    return Some(res);
+                }
             }
         }
         None
@@ -1559,6 +1557,33 @@ impl<'a> RustTypeIndex<'a> {
                     self.resolve_qualified_path(&ext.file, caller_id, q, name, false, symbols);
                 if let Some((fn_id, _)) = hits.first() {
                     return Some(fn_id.clone());
+                }
+                // Resolve inline module function calls (e.g. api::with_aliased_worker)
+                // from file root scope without intercepting dot-calls or crate::-prefixed paths.
+                let caller_scope = self
+                    .symbol_mod_scopes
+                    .get(caller_id)
+                    .map(String::as_str)
+                    .unwrap_or("");
+                if caller_scope.is_empty()
+                    && let Some(ids) = self.file_non_method_syms.get(&(ext.file.as_str(), name))
+                {
+                    let inline_hits: Vec<&String> = ids
+                        .iter()
+                        .filter(|id| {
+                            self.symbol_mod_scopes
+                                .get(id.as_str())
+                                .map(String::as_str)
+                                .unwrap_or("")
+                                == q
+                                && symbols
+                                    .get(*id)
+                                    .is_some_and(|s| !s.is_test && s.kind == SymbolKind::Function)
+                        })
+                        .collect();
+                    if inline_hits.len() == 1 {
+                        return Some(inline_hits[0].clone());
+                    }
                 }
             }
             return None;

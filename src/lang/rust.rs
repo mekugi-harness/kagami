@@ -1155,11 +1155,7 @@ fn extract_rust_callback_params(
         // Skip explicit typed receivers like self: Arc<Self> or mut self: Pin<&mut Self>.
         if arg_idx == 0
             && ch.child_by_field_name("pattern").is_some_and(|p| {
-                node_text(p, src)
-                    .trim()
-                    .trim_start_matches("mut ")
-                    .trim()
-                    == "self"
+                node_text(p, src).trim().trim_start_matches("mut ").trim() == "self"
             })
         {
             continue;

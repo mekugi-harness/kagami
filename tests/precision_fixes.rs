@@ -2690,17 +2690,20 @@ impl Decoy {
     fn upsert_thread(&mut self) {}
     fn work(&self) {}
     fn refresh(&self) {}
-    fn slot_finish(&self) {}
+    fn slot_tuple_finish(&self) {}
+    fn slot_closure_finish(&self) {}
 }
 
 struct FirstSlot;
 impl FirstSlot {
-    fn slot_finish(&self) {}
+    fn slot_tuple_finish(&self) {}
+    fn slot_closure_finish(&self) {}
 }
 
 struct SecondSlot;
 impl SecondSlot {
-    fn slot_finish(&self) {}
+    fn slot_tuple_finish(&self) {}
+    fn slot_closure_finish(&self) {}
 }
 
 struct SlotPair(FirstSlot, SecondSlot);
@@ -2863,8 +2866,8 @@ fn main() {
     inner.tuple_ping();
 
     let SlotPair(_, second) = SlotPair(FirstSlot, SecondSlot);
-    second.slot_finish();
-    with_slot_pair(|/* skip */ _, s| s.slot_finish());
+    second.slot_tuple_finish();
+    with_slot_pair(|/* skip */ _, s| s.slot_closure_finish());
     api::with_aliased_worker(|w| w.work());
     let local_weak: helpers::Weak = helpers::Weak;
     local_weak.refresh();
@@ -2931,7 +2934,8 @@ mod tests {
         ("src/main.rs", "WatchState::remove_thread"),
         ("src/main.rs", "WatchState::explicit_self_call"),
         ("src/main.rs", "WatchState::ufcs_call"),
-        ("src/main.rs", "SecondSlot::slot_finish"),
+        ("src/main.rs", "SecondSlot::slot_tuple_finish"),
+        ("src/main.rs", "SecondSlot::slot_closure_finish"),
         ("src/main.rs", "AliasWorker::work"),
         ("src/helpers.rs", "RemoteState::touch_generic"),
         ("src/helpers.rs", "RemoteState::touch_impl_fn"),
@@ -2952,13 +2956,15 @@ mod tests {
         ("src/main.rs", "WatchState::dead_watch_method"),
         ("src/main.rs", "WatchState::test_only_prod_method"),
         ("src/main.rs", "test_only_free_fn"),
-        ("src/main.rs", "FirstSlot::slot_finish"),
+        ("src/main.rs", "FirstSlot::slot_tuple_finish"),
+        ("src/main.rs", "FirstSlot::slot_closure_finish"),
         ("src/main.rs", "Decoy::push"),
         ("src/main.rs", "Decoy::terminate"),
         ("src/main.rs", "Decoy::upsert_thread"),
         ("src/main.rs", "Decoy::work"),
         ("src/main.rs", "Decoy::refresh"),
-        ("src/main.rs", "Decoy::slot_finish"),
+        ("src/main.rs", "Decoy::slot_tuple_finish"),
+        ("src/main.rs", "Decoy::slot_closure_finish"),
         ("src/helpers.rs", "RemoteState::unused_remote"),
     ] {
         assert!(
