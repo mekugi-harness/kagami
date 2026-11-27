@@ -1,0 +1,13 @@
+# Copy this file to `.kagami.toml` at your repository root.
+
+# Additional glob patterns to exclude from indexing (on top of .gitignore and built-in skips).
+ignore = [
+  "vendor/**",
+  "dist/**",
+  "**/generated/**",
+]
+
+[dead]
+# Optional path to a dead-code allowlist file (relative to repo root or absolute).
+# If omitted, kagami automatically loads `.deadcode-allowlist` at the repo root when present.
+allowlist = ".deadcode-allowlist"

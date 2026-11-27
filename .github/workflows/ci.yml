@@ -1,0 +1,54 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  check:
+    name: Check & Build (Ubuntu)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - uses: Swatinem/rust-cache@v2
+
+      # Advisory until pre-existing formatting drift in src/ is formatted in a dedicated cleanup PR.
+      - name: Check formatting (advisory)
+        continue-on-error: true
+        run: cargo fmt --all -- --check
+
+      # Note: `-D warnings` can be added once pre-existing Clippy warnings in src/ are cleaned up.
+      - name: Run Clippy
+        run: cargo clippy --all-targets
+
+      - name: Run tests
+        run: cargo test
+
+      - name: Build release binary
+        run: cargo build --release
+
+  test-macos:
+    name: Test (macOS)
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Run tests
+        run: cargo test
