@@ -1,0 +1,141 @@
+use crate::lang::{make_symbol_id, ts_js};
+use crate::model::{
+    EdgeKind, FileExtract, Language, RawRef, Span, Symbol, SymbolKind, Visibility,
+};
+use anyhow::Result;
+use std::path::Path;
+
+pub fn extract(rel_path: &str, src: &str, blake3_hex: String) -> Result<FileExtract> {
+    let comp_name = Path::new(rel_path)
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .unwrap_or("Component")
+        .to_string();
+
+    let is_route = rel_path.contains("/routes/")
+        && (comp_name.starts_with("+page")
+            || comp_name.starts_with("+layout")
+            || comp_name.starts_with("+error"));
+
+    let total_lines = src.lines().count().max(1);
+    let comp_id = make_symbol_id(rel_path, &comp_name, 1);
+
+    let mut symbols = vec![Symbol {
+        id: comp_id.clone(),
+        name: comp_name.clone(),
+        qualified_name: comp_name,
+        kind: SymbolKind::Component,
+        lang: Language::Svelte,
+        file: rel_path.to_string(),
+        span: Span {
+            start_line: 1,
+            end_line: total_lines,
+        },
+        visibility: Visibility::Public,
+        is_test: false,
+        is_entrypoint: is_route,
+        is_dynamic_candidate: false,
+        package_or_module: rel_path.to_string(),
+    }];
+    let mut imports = Vec::new();
+    let mut refs = Vec::new();
+    let mut bridges = Vec::new();
+    let mut ir_funcs = Vec::new();
+
+    // Extract all <script ...>...</script> blocks
+    let mut search_pos = 0;
+    let mut script_ranges = Vec::new();
+    while let Some(open_idx) = src[search_pos..].find("<script") {
+        let abs_open = search_pos + open_idx;
+        let Some(tag_end_rel) = src[abs_open..].find('>') else { break };
+        let body_start = abs_open + tag_end_rel + 1;
+        let Some(close_rel) = src[body_start..].find("</script>") else { break };
+        let body_end = body_start + close_rel;
+        let line_offset = src[..body_start].bytes().filter(|&b| b == b'\n').count();
+        let script_src = &src[body_start..body_end];
+        script_ranges.push((abs_open, body_end + "</script>".len()));
+
+        if let Ok(sub) = ts_js::extract(rel_path, script_src, String::new(), Language::Svelte, line_offset) {
+            imports.extend(sub.imports);
+            symbols.extend(sub.symbols);
+            refs.extend(sub.refs);
+            bridges.extend(sub.bridges);
+            ir_funcs.extend(sub.ir_funcs);
+        }
+        search_pos = body_end + "</script>".len();
+    }
+
+    // Scan template markup outside <script> blocks for <PascalCaseComponent> and handler refs
+    let mut line_num = 1usize;
+    let bytes = src.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        if script_ranges.iter().any(|&(s, e)| i >= s && i < e) {
+            if bytes[i] == b'\n' {
+                line_num += 1;
+            }
+            i += 1;
+            continue;
+        }
+        if bytes[i] == b'\n' {
+            line_num += 1;
+            i += 1;
+            continue;
+        }
+        // Component tag: <MyComponent
+        if bytes[i] == b'<' && i + 1 < bytes.len() && bytes[i + 1].is_ascii_uppercase() {
+            let start = i + 1;
+            let mut end = start;
+            while end < bytes.len()
+                && (bytes[end].is_ascii_alphanumeric() || bytes[end] == b'_' || bytes[end] == b'.')
+            {
+                end += 1;
+            }
+            let tag = &src[start..end];
+            if !tag.is_empty() {
+                refs.push(RawRef {
+                    from_symbol_id: comp_id.clone(),
+                    target_name: tag.to_string(),
+                    qualifier: None,
+                    kind: EdgeKind::TemplateRef,
+                    line: line_num,
+                });
+            }
+            i = end;
+            continue;
+        }
+        // Event handler or expression: ={handler} or {handler(
+        if bytes[i] == b'{' {
+            let start = i + 1;
+            let mut end = start;
+            while end < bytes.len() && (bytes[end].is_ascii_alphanumeric() || bytes[end] == b'_') {
+                end += 1;
+            }
+            if end > start && end < bytes.len() && (bytes[end] == b'}' || bytes[end] == b'(') {
+                let ident = &src[start..end];
+                if !matches!(ident, "if" | "each" | "await" | "key" | "snippet" | "html" | "const" | "debug" | "true" | "false") {
+                    refs.push(RawRef {
+                        from_symbol_id: comp_id.clone(),
+                        target_name: ident.to_string(),
+                        qualifier: None,
+                        kind: EdgeKind::TemplateRef,
+                        line: line_num,
+                    });
+                }
+            }
+        }
+        i += 1;
+    }
+
+    Ok(FileExtract {
+        file: rel_path.to_string(),
+        lang: Language::Svelte,
+        blake3: blake3_hex,
+        package_or_module: rel_path.to_string(),
+        imports,
+        symbols,
+        refs,
+        bridges,
+        ir_funcs,
+    })
+}
