@@ -131,6 +131,7 @@ pub struct RustTypeIndex<'a> {
     /// Wrapper type ID -> already-resolved Deref target type IDs (resolved in impl Deref scope).
     deref_target_ids: HashMap<String, Vec<String>>,
     func_return_types: HashMap<String, Vec<String>>,
+    func_callback_params: HashMap<String, Vec<(usize, usize, String)>>,
     pub trait_methods: HashMap<String, HashSet<String>>,
     cfg_sibling_groups: HashMap<String, Vec<String>>,
 }
@@ -158,6 +159,7 @@ impl<'a> RustTypeIndex<'a> {
         let mut raw_deref_by_name: HashMap<(&'a str, &'a str, String), Vec<String>> =
             HashMap::new();
         let mut func_return_types: HashMap<String, Vec<String>> = HashMap::new();
+        let mut func_callback_params: HashMap<String, Vec<(usize, usize, String)>> = HashMap::new();
         let mut trait_methods: HashMap<String, HashSet<String>> = HashMap::new();
         let mut trait_method_ids: HashSet<&str> = HashSet::new();
         let mut cfg_gated_scopes: HashMap<&str, &str> = HashMap::new();
@@ -191,6 +193,9 @@ impl<'a> RustTypeIndex<'a> {
             }
             for (k, v) in &ext.func_return_types {
                 func_return_types.insert(k.clone(), v.clone());
+            }
+            for (k, v) in &ext.func_callback_params {
+                func_callback_params.insert(k.clone(), v.clone());
             }
             for (k, v) in &ext.interface_methods {
                 trait_methods.insert(k.clone(), v.iter().cloned().collect());
@@ -293,6 +298,7 @@ impl<'a> RustTypeIndex<'a> {
             raw_struct_fields,
             deref_target_ids: HashMap::new(),
             func_return_types,
+            func_callback_params,
             trait_methods,
             cfg_sibling_groups: HashMap::new(),
         };
@@ -1321,11 +1327,17 @@ impl<'a> RustTypeIndex<'a> {
                 .get(owner.file.as_str())
                 .copied()
                 .unwrap_or(&[]);
-            if let Some(raw_fty) = self
-                .raw_struct_fields
-                .get(&curr_id)
-                .and_then(|f| f.get(field_name))
-                && !raw_fty.is_empty()
+            if let Some(raw_fty) = self.raw_struct_fields.get(&curr_id).and_then(|f| {
+                f.get(field_name).or_else(|| {
+                    if owner.kind == SymbolKind::Struct {
+                        field_name
+                            .rsplit_once("::")
+                            .and_then(|(_, fname)| f.get(fname))
+                    } else {
+                        None
+                    }
+                })
+            }) && !raw_fty.is_empty()
             {
                 return self.resolve_type_with_slices(
                     &owner.file,
@@ -1424,76 +1436,89 @@ impl<'a> RustTypeIndex<'a> {
         by_pkg_name: &HashMap<(Language, &str, &str), Vec<String>>,
         symbols: &HashMap<String, Symbol>,
     ) -> Option<(String, usize)> {
+        if let Some(fn_id) = self.resolve_callee_func_id(
+            ext,
+            caller_id,
+            qualifier,
+            name,
+            by_file_name,
+            by_pkg_name,
+            symbols,
+        ) {
+            let fn_sym = symbols.get(&fn_id)?;
+            if let Some(ret_ty) = self
+                .func_return_types
+                .get(&fn_id)
+                .and_then(|v| v.get(result_index))
+                .filter(|s| !s.is_empty())
+            {
+                let imps = self
+                    .file_imports
+                    .get(fn_sym.file.as_str())
+                    .copied()
+                    .unwrap_or(&[]);
+                if let Some(res) = self.resolve_type_with_slices(
+                    &fn_sym.file,
+                    &fn_sym.package_or_module,
+                    imps,
+                    ret_ty,
+                    symbols,
+                ) {
+                    return Some(res);
+                }
+            }
+        }
+        if let Some(q) = qualifier
+            && let Some(tid) =
+                self.resolve_type(&ext.file, &ext.package_or_module, &ext.imports, q, symbols)
+        {
+            let methods = self.lookup_methods_on_type(&tid, name, false);
+            if methods.is_empty()
+                && (name == "new"
+                    || name == "default"
+                    || name == "from"
+                    || name.starts_with("new_")
+                    || name.starts_with("with_")
+                    || name.starts_with("from_")
+                    || matches!(name, "open" | "connect" | "build" | "init"))
+            {
+                return Some((tid, 0));
+            }
+        }
+        None
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn resolve_callee_func_id(
+        &self,
+        ext: &FileExtract,
+        caller_id: &str,
+        qualifier: Option<&str>,
+        name: &str,
+        by_file_name: &HashMap<(&str, &str), String>,
+        by_pkg_name: &HashMap<(Language, &str, &str), Vec<String>>,
+        symbols: &HashMap<String, Symbol>,
+    ) -> Option<String> {
         if let Some(q) = qualifier {
             if let Some(tid) =
                 self.resolve_type(&ext.file, &ext.package_or_module, &ext.imports, q, symbols)
             {
                 let methods = self.lookup_methods_on_type(&tid, name, false);
-                if let Some(mid) = methods.first()
-                    && let Some(msym) = symbols.get(mid)
-                    && let Some(ret_ty) = self
-                        .func_return_types
-                        .get(mid)
-                        .and_then(|v| v.get(result_index))
-                        .filter(|s| !s.is_empty())
-                {
-                    let imps = self
-                        .file_imports
-                        .get(msym.file.as_str())
-                        .copied()
-                        .unwrap_or(&[]);
-                    if let Some(res) = self.resolve_type_with_slices(
-                        &msym.file,
-                        &msym.package_or_module,
-                        imps,
-                        ret_ty,
-                        symbols,
-                    ) {
-                        return Some(res);
-                    }
-                }
-                if methods.is_empty()
-                    && (name == "new"
-                        || name == "default"
-                        || name == "from"
-                        || name.starts_with("new_")
-                        || name.starts_with("with_")
-                        || name.starts_with("from_")
-                        || matches!(name, "open" | "connect" | "build" | "init"))
-                {
-                    return Some((tid, 0));
+                if let Some(mid) = methods.first() {
+                    return Some(mid.clone());
                 }
             }
             if q.chars().next().is_some_and(|c| c.is_ascii_lowercase()) {
                 let hits =
                     self.resolve_qualified_path(&ext.file, caller_id, q, name, false, symbols);
-                if let Some((fn_id, _)) = hits.first()
-                    && let Some(fn_sym) = symbols.get(fn_id)
-                    && let Some(ret_ty) = self
-                        .func_return_types
-                        .get(fn_id)
-                        .and_then(|v| v.get(result_index))
-                        .filter(|s| !s.is_empty())
-                {
-                    let imps = self
-                        .file_imports
-                        .get(fn_sym.file.as_str())
-                        .copied()
-                        .unwrap_or(&[]);
-                    return self.resolve_type_with_slices(
-                        &fn_sym.file,
-                        &fn_sym.package_or_module,
-                        imps,
-                        ret_ty,
-                        symbols,
-                    );
+                if let Some((fn_id, _)) = hits.first() {
+                    return Some(fn_id.clone());
                 }
             }
             return None;
         }
 
-        let fn_id = self
-            .resolve_bare_call(&ext.file, caller_id, name, false, symbols)
+        self.resolve_bare_call(&ext.file, caller_id, name, false, symbols)
             .into_iter()
             .map(|(id, _)| id)
             .find(|id| {
@@ -1525,12 +1550,23 @@ impl<'a> RustTypeIndex<'a> {
                         })
                     })
                     .cloned()
-            })?;
-        let fn_sym = symbols.get(&fn_id)?;
-        let ret_ty = self
-            .func_return_types
-            .get(&fn_id)
-            .and_then(|v| v.get(result_index))
+            })
+    }
+
+    fn resolve_callback_param_on_func(
+        &self,
+        fn_id: &str,
+        arg_index: usize,
+        param_index: usize,
+        symbols: &HashMap<String, Symbol>,
+    ) -> Option<(String, usize)> {
+        let fn_sym = symbols.get(fn_id)?;
+        let param_ty = self
+            .func_callback_params
+            .get(fn_id)?
+            .iter()
+            .find(|(ai, pi, _)| *ai == arg_index && *pi == param_index)
+            .map(|(_, _, ty)| ty.as_str())
             .filter(|s| !s.is_empty())?;
         let imps = self
             .file_imports
@@ -1541,7 +1577,7 @@ impl<'a> RustTypeIndex<'a> {
             &fn_sym.file,
             &fn_sym.package_or_module,
             imps,
-            ret_ty,
+            param_ty,
             symbols,
         )
     }
@@ -1585,6 +1621,23 @@ impl<'a> RustTypeIndex<'a> {
                 by_pkg_name,
                 symbols,
             )?,
+            ReceiverStep::ClosureParam {
+                qualifier,
+                name,
+                arg_index,
+                param_index,
+            } => {
+                let fn_id = self.resolve_callee_func_id(
+                    ext,
+                    caller_id,
+                    qualifier.as_deref(),
+                    name,
+                    by_file_name,
+                    by_pkg_name,
+                    symbols,
+                )?;
+                self.resolve_callback_param_on_func(&fn_id, *arg_index, *param_index, symbols)?
+            }
             _ => return None,
         };
 
@@ -1631,9 +1684,6 @@ impl<'a> RustTypeIndex<'a> {
                     }
                     // Fallback for stdlib/smart-pointer/collection wrapper methods when no local
                     // method of that name exists on the receiver type.
-                    if is_transparent_wrapper_method(name) {
-                        continue;
-                    }
                     if state.1 > 0 {
                         if matches!(
                             name.as_str(),
@@ -1664,9 +1714,38 @@ impl<'a> RustTypeIndex<'a> {
                             continue;
                         }
                     }
+                    if is_transparent_wrapper_method(name) || (state.1 == 0 && name == "get_mut") {
+                        continue;
+                    }
                     return None;
                 }
-                ReceiverStep::Type(_) | ReceiverStep::Call { .. } => return None,
+                ReceiverStep::ClosureParam {
+                    qualifier: None,
+                    name,
+                    arg_index,
+                    param_index,
+                } => {
+                    if state.1 != 0 {
+                        return None;
+                    }
+                    let methods = self.lookup_methods_on_type(&state.0, name, false);
+                    let mut resolved = None;
+                    for mid in &methods {
+                        if let Some(res) = self.resolve_callback_param_on_func(
+                            mid,
+                            *arg_index,
+                            *param_index,
+                            symbols,
+                        ) {
+                            resolved = Some(res);
+                            break;
+                        }
+                    }
+                    state = resolved?;
+                }
+                ReceiverStep::Type(_)
+                | ReceiverStep::Call { .. }
+                | ReceiverStep::ClosureParam { .. } => return None,
             }
         }
         Some(state)
@@ -1704,10 +1783,23 @@ fn is_transparent_wrapper_method(name: &str) -> bool {
             | "as_deref_mut"
             | "unwrap"
             | "expect"
+            | "unwrap_or"
+            | "unwrap_or_else"
+            | "unwrap_or_default"
             | "ok"
+            | "ok_or"
+            | "ok_or_else"
+            | "upgrade"
+            | "inspect"
+            | "inspect_err"
+            | "map_err"
+            | "context"
+            | "with_context"
             | "into_inner"
             | "deref"
             | "deref_mut"
+            | "get_ref"
+            | "take"
             | "pin"
             | "load"
             | "load_full"

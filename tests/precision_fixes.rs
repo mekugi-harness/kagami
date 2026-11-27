@@ -2612,3 +2612,286 @@ fn main() {
         );
     }
 }
+
+#[test]
+fn test_rust_batch3_enum_patterns_transparent_wrappers_and_closure_params() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path();
+    fs::create_dir_all(root.join("src")).unwrap();
+
+    fs::write(
+        root.join("Cargo.toml"),
+        r#"[package]
+name = "batch3-demo"
+version = "0.1.0"
+edition = "2021"
+"#,
+    )
+    .unwrap();
+
+    fs::write(
+        root.join("src/helpers.rs"),
+        r#"use std::collections::HashMap;
+
+pub struct RemoteState;
+impl RemoteState {
+    pub fn touch(&mut self) {}
+    pub fn unused_remote(&mut self) {}
+}
+
+pub struct RemoteItem;
+impl RemoteItem {
+    pub fn mark(&self) {}
+}
+
+pub fn with_remote_pair<F: FnMut(&mut HashMap<String, RemoteState>, &RemoteItem)>(mut f: F) {
+    let mut map = HashMap::new();
+    let item = RemoteItem;
+    f(&mut map, &item);
+}
+
+pub fn with_impl_fn(f: impl Fn(&mut RemoteState)) {
+    let mut s = RemoteState;
+    f(&mut s);
+}
+"#,
+    )
+    .unwrap();
+
+    fs::write(
+        root.join("src/main.rs"),
+        r#"mod helpers;
+use std::collections::HashMap;
+use std::sync::{Arc, Mutex, Weak};
+use helpers::{RemoteState, with_impl_fn, with_remote_pair};
+
+// --- Category 1: Enum variant fields & pattern bindings ---
+struct Projector;
+impl Projector {
+    fn push(&mut self) {}
+    fn finish(&mut self) {}
+    fn reset(&mut self) {}
+    fn dead_projector_method(&mut self) {}
+}
+
+struct Decoy;
+impl Decoy {
+    fn push(&mut self) {}
+    fn terminate(&self) {}
+    fn upsert_thread(&mut self) {}
+}
+
+enum Mode {
+    Heredoc { py: Projector },
+    Inline { py: Projector },
+    Wrapped { inner: Option<Projector> },
+}
+
+struct Runner {
+    mode: Mode,
+}
+impl Runner {
+    fn step(&mut self) {
+        match &mut self.mode {
+            Mode::Heredoc { py } => {
+                py.push();
+                py.finish();
+            }
+            Mode::Inline { py, .. } => py.finish(),
+            Mode::Wrapped { inner: Some(p) } => p.reset(),
+            Mode::Wrapped { inner: None } => {}
+        }
+    }
+}
+
+struct Terminator;
+impl Terminator {
+    #[cfg(unix)]
+    fn terminate(&self) {}
+    #[cfg(windows)]
+    fn terminate(&self) {}
+    #[cfg(not(any(unix, windows)))]
+    fn terminate(&self) {}
+
+    fn terminate_discovery(&self) -> Result<(), ()> {
+        Ok(())
+    }
+    fn dead_terminator_method(&self) {}
+}
+
+enum ProcessKind {
+    Local(Option<Terminator>),
+    Empty,
+}
+
+struct ProcessHandle {
+    kind: ProcessKind,
+}
+impl ProcessHandle {
+    fn terminate_discovery(&self) -> Result<(), ()> {
+        let ProcessKind::Local(Some(terminator)) = &self.kind else {
+            return Err(());
+        };
+        terminator
+            .terminate_discovery()
+            .inspect_err(|_| terminator.terminate())
+    }
+    fn terminate(&self) {
+        if let ProcessKind::Local(Some(terminator)) = &self.kind {
+            terminator.terminate();
+        }
+    }
+    fn dead_handle_method(&self) {}
+}
+
+struct TupleWrap(Projector);
+
+// --- Category 2: Transparent Option/Result/Weak/Mutex unwrapping ---
+struct Cleanup {
+    process: Weak<ProcessHandle>,
+    cache: Mutex<Projector>,
+    map: HashMap<String, Projector>,
+}
+impl Cleanup {
+    fn run(&mut self) -> Result<(), ()> {
+        let process = self.process.upgrade();
+        process.ok_or_else(|| ())?.terminate_discovery()?;
+        if let Some(p) = self.process.upgrade() {
+            p.terminate();
+        }
+        if let Ok(p) = self.cache.get_mut() {
+            p.push();
+        }
+        if let Some(p) = self.map.get_mut("k") {
+            p.finish();
+        }
+        Ok(())
+    }
+}
+
+// --- Category 3: Closure parameter type inference from callee Fn* signatures ---
+struct WatchState;
+impl WatchState {
+    fn upsert_thread(&mut self) {}
+    fn remove_thread(&mut self) {}
+    fn dead_watch_method(&mut self) {}
+    fn test_only_prod_method(&mut self) {}
+}
+
+struct Watcher {
+    state: WatchState,
+}
+impl Watcher {
+    fn mutate_and_publish<F>(&mut self, mutate: F)
+    where
+        F: FnOnce(&mut WatchState) -> Option<()>,
+    {
+        let _ = mutate(&mut self.state);
+    }
+    fn upsert(&mut self) {
+        self.mutate_and_publish(move |state| {
+            state.upsert_thread();
+            None
+        });
+    }
+    fn remove(&mut self) {
+        self.mutate_and_publish(|state| {
+            state.remove_thread();
+            None
+        });
+    }
+}
+
+fn test_only_free_fn() {}
+
+fn main() {
+    let mut r = Runner {
+        mode: Mode::Heredoc { py: Projector },
+    };
+    r.step();
+    let TupleWrap(mut inner) = TupleWrap(Projector);
+    inner.push();
+
+    let h = Arc::new(ProcessHandle {
+        kind: ProcessKind::Local(Some(Terminator)),
+    });
+    let mut c = Cleanup {
+        process: Arc::downgrade(&h),
+        cache: Mutex::new(Projector),
+        map: HashMap::new(),
+    };
+    let _ = c.run();
+
+    let mut w = Watcher { state: WatchState };
+    w.upsert();
+    w.remove();
+
+    with_remote_pair(|map, item| {
+        if let Some(st) = map.get_mut("a") {
+            st.touch();
+        }
+        item.mark();
+    });
+    with_impl_fn(|st| st.touch());
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn only_tests_call_these() {
+        let mut ws = WatchState;
+        ws.test_only_prod_method();
+        test_only_free_fn();
+    }
+}
+"#,
+    )
+    .unwrap();
+
+    let dead = analyze_rust_dead(root);
+    let is_dead_in = |file_suffix: &str, sym: &str| {
+        dead.symbols
+            .iter()
+            .any(|s| s.file.ends_with(file_suffix) && s.symbol == sym)
+    };
+
+    for (file, sym) in [
+        ("src/main.rs", "Projector::push"),
+        ("src/main.rs", "Projector::finish"),
+        ("src/main.rs", "Projector::reset"),
+        ("src/main.rs", "Terminator::terminate"),
+        ("src/main.rs", "Terminator::terminate_discovery"),
+        ("src/main.rs", "ProcessHandle::terminate_discovery"),
+        ("src/main.rs", "ProcessHandle::terminate"),
+        ("src/main.rs", "WatchState::upsert_thread"),
+        ("src/main.rs", "WatchState::remove_thread"),
+        ("src/helpers.rs", "RemoteState::touch"),
+        ("src/helpers.rs", "RemoteItem::mark"),
+    ] {
+        assert!(
+            !is_dead_in(file, sym),
+            "Expected {file}::{sym} to be live; dead={:?}",
+            dead.symbols
+        );
+    }
+
+    for (file, sym) in [
+        ("src/main.rs", "Projector::dead_projector_method"),
+        ("src/main.rs", "Terminator::dead_terminator_method"),
+        ("src/main.rs", "ProcessHandle::dead_handle_method"),
+        ("src/main.rs", "WatchState::dead_watch_method"),
+        ("src/main.rs", "WatchState::test_only_prod_method"),
+        ("src/main.rs", "test_only_free_fn"),
+        ("src/main.rs", "Decoy::push"),
+        ("src/main.rs", "Decoy::terminate"),
+        ("src/main.rs", "Decoy::upsert_thread"),
+        ("src/helpers.rs", "RemoteState::unused_remote"),
+    ] {
+        assert!(
+            is_dead_in(file, sym),
+            "Expected {file}::{sym} to remain dead; dead={:?}",
+            dead.symbols
+        );
+    }
+}
