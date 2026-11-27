@@ -198,6 +198,9 @@ pub fn extract(
         embedded_types: std::collections::HashMap::new(),
         struct_fields: std::collections::HashMap::new(),
         func_return_types: std::collections::HashMap::new(),
+        trait_impls: Vec::new(),
+        impl_macros: Vec::new(),
+        cfg_gated_symbols: Vec::new(),
     })
 }
 

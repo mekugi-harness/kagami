@@ -174,6 +174,17 @@ pub enum BridgeRole {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TraitImplInfo {
+    pub type_name: String,
+    pub trait_name: String,
+    pub trait_path: String,
+    #[serde(default)]
+    pub trait_type_args: Vec<String>,
+    pub method_ids: Vec<String>,
+    pub is_test: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct FileExtract {
     pub file: String,
     pub lang: Language,
@@ -197,6 +208,15 @@ pub struct FileExtract {
     /// Function or method symbol ID -> return type names by result position (empty string if unknown/builtin).
     #[serde(default)]
     pub func_return_types: HashMap<String, Vec<String>>,
+    /// Explicit trait implementations (e.g. Rust impl Trait for Type).
+    #[serde(default)]
+    pub trait_impls: Vec<TraitImplInfo>,
+    /// Macro invocations inside impl Type blocks: (impl_type_name, macro_name, line).
+    #[serde(default)]
+    pub impl_macros: Vec<(String, String, usize)>,
+    /// Symbol IDs of non-test #[cfg(...)]-gated definitions for sibling propagation.
+    #[serde(default)]
+    pub cfg_gated_symbols: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

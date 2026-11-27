@@ -1163,3 +1163,505 @@ func main() {
         );
     }
 }
+
+fn analyze_rust_dead(root: &std::path::Path) -> kagami::graph::dead::DeadReport {
+    let cfg = KagamiConfig::default();
+    let ignore = cfg.build_ignore_globset().unwrap();
+    let files = kagami::walker::discover_files(root, &ignore, None).unwrap();
+    let graph = CodeGraph::build(root, &files, false).unwrap();
+    analyze_dead(
+        &graph,
+        &DeadOptions {
+            scope: DeadScope::Prod,
+            langs: Some(std::collections::HashSet::from([Language::Rust])),
+            allowlist: std::collections::HashSet::new(),
+            include_clusters: true,
+            path_filter: None,
+            min_confidence: Confidence::Heuristic,
+        },
+    )
+}
+
+#[test]
+fn test_rust_function_value_refs_and_shadowing() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    let src_dir = root.join("crate-a/src");
+    fs::create_dir_all(&src_dir).unwrap();
+
+    fs::write(
+        src_dir.join("main.rs"),
+        r#"
+fn internal_error(e: String) -> String { e }
+fn is_retryable(x: &i32) -> bool { *x > 0 }
+fn serialize_enum(v: i32) -> Option<String> { Some(v.to_string()) }
+fn valid_row(r: &i32) -> bool { *r != 0 }
+fn helper_val(x: i32) -> i32 { x + 1 }
+fn arr_cb() {}
+fn tup_cb() {}
+fn field_cb() {}
+fn parse_item<T>(x: T) -> T { x }
+fn default_port() -> u16 { 8080 }
+fn init_global() -> i32 { 42 }
+fn inner_shadow() {}
+
+fn shadowed_fn() {}
+fn never_used() {}
+fn only_used_in_test() {}
+fn only_used_in_tokio_test() {}
+fn only_used_in_cfg_test_mod() {}
+
+#[derive(serde::Deserialize)]
+struct Config {
+    #[serde(default = "default_port")]
+    port: u16,
+}
+
+struct Handler {
+    cb: fn(),
+}
+
+static GLOBAL: LazyLock<i32> = LazyLock::new(init_global);
+
+fn use_cb(f: fn()) { f(); }
+
+fn main() {
+    let _ = Err::<i32, String>("e".into()).map_err(internal_error);
+    let nums = vec![1, 2, 3];
+    let _ = nums.iter().any(is_retryable);
+    let _ = Some(1).and_then(serialize_enum);
+    let mut rows = vec![1, 0, 2];
+    rows.retain(valid_row);
+    let _ = rows.into_iter().filter(valid_row).map(parse_item::<i32>).count();
+    let f = helper_val;
+    let _ = f(1);
+    let _arr: [fn(); 1] = [arr_cb];
+    let _tup = (tup_cb,);
+    let _h = Handler { cb: field_cb };
+    let _c = Config { port: 0 };
+    let _g = *GLOBAL;
+
+    let shadowed_fn = 123;
+    let _ = shadowed_fn;
+
+    {
+        let inner_shadow = 99;
+        let _ = inner_shadow;
+    }
+    use_cb(inner_shadow);
+}
+
+#[test]
+fn unit_test_only() {
+    let _ = Some(1).map(|_| only_used_in_test);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn async_test_only() {
+    only_used_in_tokio_test();
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    fn helper() {
+        only_used_in_cfg_test_mod();
+    }
+}
+"#,
+    )
+    .unwrap();
+
+    let dead = analyze_rust_dead(root);
+
+    let is_dead = |sym: &str| dead.symbols.iter().any(|s| s.symbol == sym);
+    for live_sym in [
+        "internal_error",
+        "is_retryable",
+        "serialize_enum",
+        "valid_row",
+        "helper_val",
+        "arr_cb",
+        "tup_cb",
+        "field_cb",
+        "parse_item",
+        "default_port",
+        "init_global",
+        "inner_shadow",
+    ] {
+        assert!(
+            !is_dead(live_sym),
+            "Expected {live_sym} to be live; dead={:?}",
+            dead.symbols
+        );
+    }
+    for dead_sym in [
+        "shadowed_fn",
+        "never_used",
+        "only_used_in_test",
+        "only_used_in_tokio_test",
+        "only_used_in_cfg_test_mod",
+    ] {
+        assert!(
+            is_dead(dead_sym),
+            "Expected {dead_sym} to remain dead; dead={:?}",
+            dead.symbols
+        );
+    }
+}
+
+#[test]
+fn test_rust_macro_invocations_and_macro_rules_token_trees() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    let src_dir = root.join("crate-m/src");
+    fs::create_dir_all(&src_dir).unwrap();
+
+    fs::write(
+        src_dir.join("main.rs"),
+        r#"
+struct Inner;
+impl Inner {
+    fn poll_step(&self) {}
+}
+
+struct Stats {
+    inner: Inner,
+}
+impl Stats {
+    fn new() -> Self { Self { inner: Inner } }
+    fn saved_percent(&self) -> f64 { 50.0 }
+    fn report(&self) {
+        tracing::debug!(saved = self.saved_percent(), "stats");
+        tokio::select! {
+            _ = self.inner.poll_step() => handle_select(cb_in_macro),
+        }
+    }
+}
+
+fn handle_select(cb: fn()) { cb(); }
+fn cb_in_macro() {}
+fn dead_in_test_macro() {}
+fn dead_macro_target() {}
+
+struct RemoteBoard;
+impl RemoteBoard {
+    fn new() -> Self { Self }
+    fn call(&self) {}
+}
+
+macro_rules! operation {
+    ($m:ident) => {
+        fn $m(&self) {
+            self.call();
+        }
+    };
+}
+
+trait Board {
+    fn create(&self);
+}
+
+impl Board for RemoteBoard {
+    operation!(create);
+}
+
+macro_rules! test_only_macro {
+    () => {
+        dead_macro_target();
+    };
+}
+
+fn main() {
+    let s = Stats::new();
+    s.report();
+    let _b = RemoteBoard::new();
+}
+
+#[test]
+fn macro_test_only() {
+    tracing::info!(val = dead_in_test_macro());
+    test_only_macro!();
+}
+"#,
+    )
+    .unwrap();
+
+    let dead = analyze_rust_dead(root);
+
+    let is_dead = |sym: &str| dead.symbols.iter().any(|s| s.symbol == sym);
+    for live_sym in [
+        "Stats::saved_percent",
+        "Inner::poll_step",
+        "handle_select",
+        "cb_in_macro",
+        "RemoteBoard::call",
+    ] {
+        assert!(
+            !is_dead(live_sym),
+            "Expected {live_sym} to be live; dead={:?}",
+            dead.symbols
+        );
+    }
+    for dead_sym in ["dead_in_test_macro", "dead_macro_target"] {
+        assert!(
+            is_dead(dead_sym),
+            "Expected {dead_sym} to remain dead; dead={:?}",
+            dead.symbols
+        );
+    }
+}
+
+#[test]
+fn test_rust_cfg_sibling_definitions() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    let src_dir = root.join("crate-cfg/src");
+    fs::create_dir_all(&src_dir).unwrap();
+
+    fs::write(
+        src_dir.join("main.rs"),
+        r#"
+struct Daemon;
+impl Daemon {
+    fn new() -> Self { Self }
+
+    #[cfg(any(unix, windows))]
+    fn managed_version(&self) -> Option<String> { Some("1.0".into()) }
+
+    #[cfg(not(any(unix, windows)))]
+    fn managed_version(&self) -> Option<String> { None }
+}
+
+#[cfg(unix)]
+fn platform_open() {}
+
+#[cfg(windows)]
+fn platform_open() {}
+
+#[cfg(unix)]
+fn unused_cfg() {}
+
+#[cfg(not(unix))]
+fn unused_cfg() {}
+
+#[cfg(unix)]
+fn test_only_cfg() {}
+
+#[cfg(not(unix))]
+fn test_only_cfg() {}
+
+fn main() {
+    let d = Daemon::new();
+    let _ = d.managed_version();
+    platform_open();
+}
+
+#[test]
+fn call_cfg_in_test() {
+    test_only_cfg();
+}
+"#,
+    )
+    .unwrap();
+
+    let dead = analyze_rust_dead(root);
+
+    let dead_count = |sym: &str| dead.symbols.iter().filter(|s| s.symbol == sym).count();
+    assert_eq!(dead_count("Daemon::managed_version"), 0, "dead={:?}", dead.symbols);
+    assert_eq!(dead_count("platform_open"), 0, "dead={:?}", dead.symbols);
+    assert_eq!(dead_count("unused_cfg"), 2, "both unused cfg siblings should be dead");
+    assert_eq!(dead_count("test_only_cfg"), 2, "both test-only cfg siblings should be dead");
+}
+
+#[test]
+fn test_rust_receiver_chains_traits_and_smart_pointers() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    let src_dir = root.join("crate-r/src");
+    fs::create_dir_all(&src_dir).unwrap();
+
+    fs::write(
+        src_dir.join("auth.rs"),
+        r#"
+pub fn connect() {}
+pub fn unused_auth() {}
+"#,
+    )
+    .unwrap();
+
+    fs::write(
+        src_dir.join("widget_ext.rs"),
+        r#"
+impl super::SplitWidget {
+    pub fn part_b(&self) {
+        self.part_a();
+    }
+}
+"#,
+    )
+    .unwrap();
+
+    fs::write(
+        src_dir.join("main.rs"),
+        r#"
+mod auth;
+mod widget_ext;
+
+struct UnloadingState;
+impl UnloadingState {
+    fn new() -> Self { Self }
+    fn should_unload_now(&mut self) -> bool { true }
+}
+
+struct ProcessExecManager;
+impl ProcessExecManager {
+    fn connection_closed(&self) {}
+}
+
+struct ProcessExecProcessor {
+    mgr: Arc<ProcessExecManager>,
+}
+impl ProcessExecProcessor {
+    fn connection_closed(&self) {
+        self.mgr.connection_closed();
+    }
+}
+
+struct MessageProcessor {
+    exec: Arc<ProcessExecProcessor>,
+}
+impl MessageProcessor {
+    fn new() -> Self { Self { exec: Arc::new(ProcessExecProcessor { mgr: Arc::new(ProcessExecManager) }) } }
+    fn connection_closed(&self) {
+        self.exec.connection_closed();
+    }
+}
+
+struct UnrelatedProcessor;
+impl UnrelatedProcessor {
+    fn connection_closed(&self) {}
+}
+
+struct LiveStruct;
+impl LiveStruct {
+    fn new() -> Self { Self }
+    fn helper() {}
+}
+impl Drop for LiveStruct {
+    fn drop(&mut self) {
+        Self::helper();
+    }
+}
+impl std::fmt::Display for LiveStruct {
+    fn fmt(&self, _f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result { Ok(()) }
+}
+
+struct DeadStruct;
+impl Drop for DeadStruct {
+    fn drop(&mut self) {}
+}
+
+trait LiveTrait {
+    fn execute(&self);
+}
+trait DeadTrait {
+    fn never_called(&self);
+}
+impl LiveTrait for LiveStruct {
+    fn execute(&self) {}
+}
+impl LiveTrait for DeadStruct {
+    fn execute(&self) {}
+}
+impl DeadTrait for LiveStruct {
+    fn never_called(&self) {}
+}
+
+struct InnerTarget;
+impl InnerTarget {
+    fn deref_method(&self) {}
+}
+struct Wrapper(InnerTarget);
+impl Wrapper {
+    fn new() -> Self { Self(InnerTarget) }
+}
+impl std::ops::Deref for Wrapper {
+    type Target = InnerTarget;
+    fn deref(&self) -> &Self::Target { &self.0 }
+}
+
+pub struct SplitWidget;
+impl SplitWidget {
+    fn new() -> Self { Self }
+    pub fn part_a(&self) {}
+}
+
+fn use_trait(t: &dyn LiveTrait) {
+    t.execute();
+}
+
+async fn run() {
+    let state = Arc::new(Mutex::new(UnloadingState::new()));
+    let mut guard = state.lock().await;
+    let _ = guard.should_unload_now();
+
+    let processor = Arc::new(MessageProcessor::new());
+    processor.connection_closed();
+
+    let live = LiveStruct::new();
+    use_trait(&live);
+
+    let w = Wrapper::new();
+    w.deref_method();
+
+    let sw = SplitWidget::new();
+    sw.part_b();
+
+    auth::connect();
+}
+
+fn main() {
+    let _ = run();
+}
+"#,
+    )
+    .unwrap();
+
+    let dead = analyze_rust_dead(root);
+
+    let is_dead = |sym: &str| dead.symbols.iter().any(|s| s.symbol == sym);
+    for live_sym in [
+        "UnloadingState::should_unload_now",
+        "MessageProcessor::connection_closed",
+        "ProcessExecProcessor::connection_closed",
+        "ProcessExecManager::connection_closed",
+        "LiveStruct::drop",
+        "LiveStruct::helper",
+        "LiveStruct::fmt",
+        "LiveStruct::execute",
+        "InnerTarget::deref_method",
+        "SplitWidget::part_a",
+        "SplitWidget::part_b",
+        "connect",
+    ] {
+        assert!(
+            !is_dead(live_sym),
+            "Expected {live_sym} to be live; dead={:?}",
+            dead.symbols
+        );
+    }
+    for dead_sym in [
+        "UnrelatedProcessor::connection_closed",
+        "DeadStruct::drop",
+        "DeadStruct::execute",
+        "LiveStruct::never_called",
+        "unused_auth",
+    ] {
+        assert!(
+            is_dead(dead_sym),
+            "Expected {dead_sym} to remain dead; dead={:?}",
+            dead.symbols
+        );
+    }
+}

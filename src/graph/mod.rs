@@ -1,9 +1,14 @@
 pub mod blast;
 pub mod bridges;
 pub mod dead;
+mod rust_index;
 pub mod scip;
 
 use crate::cache::{CacheData, CacheStore, PARSER_VERSION};
+use crate::graph::rust_index::{
+    RustTypeIndex, materialize_rust_trait_and_macro_edges, resolve_rust_module_qualified,
+    rust_imports_match_symbol,
+};
 use crate::lang;
 use crate::model::{
     Confidence, Edge, EdgeKind, FileExtract, Language, ReceiverStep, Symbol, SymbolKind, Visibility,
@@ -137,6 +142,7 @@ impl CodeGraph {
         let mut edges: Vec<Edge> = Vec::new();
         let mut seen: HashSet<(String, String, EdgeKind)> = HashSet::new();
         let go_index = GoTypeIndex::build(&extracts, &symbols, &by_pkg_name);
+        let rust_index = RustTypeIndex::build(&extracts, &symbols);
 
         for ext in &extracts {
             let alias_map = build_import_alias_map(&ext.imports);
@@ -170,7 +176,13 @@ impl CodeGraph {
                     &by_lang_name,
                     &by_lang_qname,
                     &go_index,
+                    &rust_index,
                 );
+                let resolved = if ext.lang == Language::Rust && r.kind == EdgeKind::Calls {
+                    rust_index.expand_cfg_siblings(resolved)
+                } else {
+                    resolved
+                };
                 for (target_id, conf) in resolved {
                     if target_id == r.from_symbol_id {
                         continue;
@@ -196,13 +208,23 @@ impl CodeGraph {
         }
 
         bridges::materialize_bridges(&extracts, &symbols, &mut edges);
-        let interface_impls = materialize_go_interface_edges(
+        let mut interface_impls = materialize_go_interface_edges(
             &go_index,
             &symbols,
             &by_pkg_name,
             &mut edges,
             &mut seen,
         );
+        interface_impls.extend(materialize_rust_trait_and_macro_edges(
+            &extracts,
+            &rust_index,
+            &symbols,
+            &by_file_name,
+            &by_pkg_name,
+            &by_lang_name,
+            &mut edges,
+            &mut seen,
+        ));
 
         let mut outgoing: HashMap<String, Vec<usize>> = HashMap::new();
         let mut incoming: HashMap<String, Vec<usize>> = HashMap::new();
@@ -1075,6 +1097,7 @@ fn resolve_ref(
     by_lang_name: &HashMap<(Language, &str), Vec<String>>,
     by_lang_qname: &HashMap<(Language, &str), Vec<String>>,
     go_index: &GoTypeIndex<'_>,
+    rust_index: &RustTypeIndex<'_>,
 ) -> Vec<(String, Confidence)> {
     // 0. Direct symbol ID match (e.g. Svelte component -> <module> script block)
     if r.qualifier.is_none() && symbols.contains_key(&r.target_name) {
@@ -1133,6 +1156,46 @@ fn resolve_ref(
         // Known concrete local type without a matching method (e.g. struct field access or external embed):
         // return without falling through to noisy heuristic method matching.
         return results;
+    }
+
+    // 0c. Precise Rust receiver/field/method-return chain resolution
+    if ext.lang == Language::Rust
+        && let Some(ref chain) = r.receiver_chain
+        && let Some((target_type_id, 0)) =
+            rust_index.resolve_receiver_chain(ext, chain, by_file_name, by_pkg_name, symbols)
+    {
+        let caller_is_test = symbols
+            .get(&r.from_symbol_id)
+            .map(|s| s.is_test)
+            .unwrap_or(false);
+        let methods = rust_index.lookup_methods_on_type(
+            &target_type_id,
+            &r.target_name,
+            caller_is_test,
+            symbols,
+        );
+        if !methods.is_empty() {
+            return methods
+                .into_iter()
+                .map(|id| (id, Confidence::Resolved))
+                .collect();
+        }
+        if symbols
+            .get(&target_type_id)
+            .map(|s| s.kind == SymbolKind::Trait)
+            .unwrap_or(false)
+        {
+            if rust_index
+                .trait_methods
+                .get(&target_type_id)
+                .map(|ms| ms.contains(&r.target_name))
+                .unwrap_or(false)
+            {
+                return vec![(target_type_id, Confidence::Resolved)];
+            }
+            return Vec::new();
+        }
+        return Vec::new();
     }
 
     // 1. O(1) same-file match
@@ -1204,6 +1267,26 @@ fn resolve_ref(
                 if ids.len() <= 3 {
                     return ids.iter().map(|id| (id.clone(), Confidence::Resolved)).collect();
                 }
+            }
+        }
+
+        // Rust module-qualified function/const calls (e.g. auth::connect, reducer::helper)
+        if ext.lang == Language::Rust
+            && qual
+                .chars()
+                .next()
+                .is_some_and(|c| c.is_ascii_lowercase())
+        {
+            let mod_matches = resolve_rust_module_qualified(
+                ext,
+                qual,
+                &r.target_name,
+                by_pkg_name,
+                by_lang_name,
+                symbols,
+            );
+            if !mod_matches.is_empty() {
+                return mod_matches;
             }
         }
 
@@ -1332,10 +1415,14 @@ fn resolve_ref(
                     symbols
                         .get(*id)
                         .map(|s| {
-                            ext.imports.iter().any(|imp| {
-                                let clean = imp.trim_start_matches("./").trim_start_matches("../");
-                                !clean.is_empty() && (s.file.contains(clean) || s.package_or_module.contains(clean))
-                            })
+                            if ext.lang == Language::Rust {
+                                rust_imports_match_symbol(&ext.imports, s)
+                            } else {
+                                ext.imports.iter().any(|imp| {
+                                    let clean = imp.trim_start_matches("./").trim_start_matches("../");
+                                    !clean.is_empty() && (s.file.contains(clean) || s.package_or_module.contains(clean))
+                                })
+                            }
                         })
                         .unwrap_or(false)
                 })
