@@ -286,21 +286,9 @@ impl<'a> RustTypeIndex<'a> {
                 return Some(same_pkg[0].clone());
             }
             // Support reexported types (e.g. api::Worker reexporting impl_mod::Worker)
-            // when there is a unique matching definition in the crate or repository.
+            // only when there is a single unique definition in the entire repository.
             if cands.len() == 1 {
                 return Some(cands[0].clone());
-            }
-            let pkg_cands: Vec<&String> = cands
-                .iter()
-                .filter(|id| {
-                    symbols
-                        .get(*id)
-                        .map(|s| s.package_or_module == owner_pkg)
-                        .unwrap_or(false)
-                })
-                .collect();
-            if pkg_cands.len() == 1 {
-                return Some(pkg_cands[0].clone());
             }
             return None;
         }

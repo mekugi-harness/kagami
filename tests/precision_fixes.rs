@@ -1913,6 +1913,9 @@ fn run_test_feature_entry() {
     test_named_feature_fn();
 }
 
+#[cfg(test,)]
+fn trailing_comma_test_only() {}
+
 mod mod_a {
     #[cfg(unix)]
     pub fn scoped_cfg() {}
@@ -1965,6 +1968,7 @@ fn main() {
         "cli_feature_fn",
         "test_named_feature_fn",
         "Worker::remote_run",
+        "trailing_comma_test_only",
     ] {
         assert!(
             !is_dead(live_sym),
