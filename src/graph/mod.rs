@@ -6,8 +6,8 @@ pub mod scip;
 
 use crate::cache::{CacheData, CacheStore, PARSER_VERSION};
 use crate::graph::rust_index::{
-    RustTypeIndex, materialize_rust_trait_and_macro_edges, resolve_rust_module_qualified,
-    rust_imports_match_symbol,
+    CargoCrateInfo, RustTypeIndex, discover_cargo_crates, materialize_rust_trait_and_macro_edges,
+    resolve_rust_module_qualified,
 };
 use crate::lang;
 use crate::model::{
@@ -75,7 +75,8 @@ impl CodeGraph {
             store.save(&next_cache);
         }
 
-        Ok(Self::from_extracts(extracts))
+        let crate_roots = discover_cargo_crates(root, &extracts);
+        Ok(Self::from_extracts_with_crates(extracts, crate_roots))
     }
 
     pub fn apply_test_paths(&mut self, test_paths: &globset::GlobSet) {
@@ -87,6 +88,13 @@ impl CodeGraph {
     }
 
     pub fn from_extracts(extracts: Vec<FileExtract>) -> Self {
+        Self::from_extracts_with_crates(extracts, HashMap::new())
+    }
+
+    pub fn from_extracts_with_crates(
+        extracts: Vec<FileExtract>,
+        crate_roots: HashMap<String, CargoCrateInfo>,
+    ) -> Self {
         let mut symbols: HashMap<String, Symbol> = HashMap::new();
         let mut known_files: HashSet<&str> = HashSet::new();
         let mut by_file_name: HashMap<(&str, &str), String> = HashMap::new();
@@ -142,7 +150,7 @@ impl CodeGraph {
         let mut edges: Vec<Edge> = Vec::new();
         let mut seen: HashSet<(String, String, EdgeKind)> = HashSet::new();
         let go_index = GoTypeIndex::build(&extracts, &symbols, &by_pkg_name);
-        let rust_index = RustTypeIndex::build(&extracts, &symbols);
+        let rust_index = RustTypeIndex::build(&extracts, &symbols, crate_roots);
 
         for ext in &extracts {
             let alias_map = build_import_alias_map(&ext.imports);
@@ -1161,8 +1169,14 @@ fn resolve_ref(
     // 0c. Precise Rust receiver/field/method-return chain resolution
     if ext.lang == Language::Rust
         && let Some(ref chain) = r.receiver_chain
-        && let Some((target_type_id, 0)) =
-            rust_index.resolve_receiver_chain(ext, chain, by_file_name, by_pkg_name, symbols)
+        && let Some((target_type_id, 0)) = rust_index.resolve_receiver_chain(
+            ext,
+            &r.from_symbol_id,
+            chain,
+            by_file_name,
+            by_pkg_name,
+            symbols,
+        )
     {
         let caller_is_test = symbols
             .get(&r.from_symbol_id)
@@ -1199,8 +1213,32 @@ fn resolve_ref(
 
     // 1. O(1) same-file match
     if r.qualifier.is_none() {
+        if ext.lang == Language::Rust && r.kind == EdgeKind::Calls {
+            let caller_is_test = symbols
+                .get(&r.from_symbol_id)
+                .map(|s| s.is_test)
+                .unwrap_or(false);
+            let bare = rust_index.resolve_bare_call(
+                &ext.file,
+                &r.from_symbol_id,
+                &r.target_name,
+                caller_is_test,
+                symbols,
+            );
+            if !bare.is_empty() {
+                return bare;
+            }
+        }
         if let Some(id) = by_file_name.get(&(ext.file.as_str(), r.target_name.as_str())) {
-            return vec![(id.clone(), Confidence::Resolved)];
+            let is_rust_bare_method = ext.lang == Language::Rust
+                && r.kind == EdgeKind::Calls
+                && symbols
+                    .get(id)
+                    .map(|s| s.kind == SymbolKind::Method)
+                    .unwrap_or(false);
+            if !is_rust_bare_method {
+                return vec![(id.clone(), Confidence::Resolved)];
+            }
         }
     }
 
@@ -1269,13 +1307,48 @@ fn resolve_ref(
             }
         }
 
-        // Rust module-qualified function/const calls (e.g. auth::connect, reducer::helper)
+        // Rust associated call through a type alias (e.g. TypeAlias::new())
         if ext.lang == Language::Rust
-            && qual
-                .chars()
-                .next()
-                .is_some_and(|c| c.is_ascii_lowercase())
+            && r.kind == EdgeKind::Calls
+            && qual.chars().next().is_some_and(|c| c.is_ascii_uppercase())
+            && let Some(tid) = rust_index.resolve_direct_type(
+                &ext.file,
+                &ext.package_or_module,
+                &ext.imports,
+                qual,
+                symbols,
+            )
         {
+            let caller_is_test = symbols
+                .get(&r.from_symbol_id)
+                .map(|s| s.is_test)
+                .unwrap_or(false);
+            let methods =
+                rust_index.lookup_direct_methods_on_type(&tid, &r.target_name, caller_is_test);
+            return methods
+                .into_iter()
+                .map(|id| (id, Confidence::Resolved))
+                .collect();
+        }
+
+        // Rust module-qualified function/const calls (e.g. auth::connect, reducer::helper)
+        if ext.lang == Language::Rust && qual.chars().next().is_some_and(|c| c.is_ascii_lowercase())
+        {
+            let caller_is_test = symbols
+                .get(&r.from_symbol_id)
+                .map(|s| s.is_test)
+                .unwrap_or(false);
+            let path_matches = rust_index.resolve_qualified_path(
+                &ext.file,
+                &r.from_symbol_id,
+                qual,
+                &r.target_name,
+                caller_is_test,
+                symbols,
+            );
+            if !path_matches.is_empty() {
+                return path_matches;
+            }
             let mod_matches = resolve_rust_module_qualified(
                 ext,
                 qual,
@@ -1393,8 +1466,26 @@ fn resolve_ref(
     // 3. O(1) same-package/module match
     if !ext.package_or_module.is_empty() {
         if let Some(ids) = by_pkg_name.get(&(ext.lang, ext.package_or_module.as_str(), r.target_name.as_str())) {
-            if ids.len() <= 4 {
-                return ids.iter().map(|id| (id.clone(), Confidence::Resolved)).collect();
+            let filtered: Vec<&String> = if ext.lang == Language::Rust
+                && r.qualifier.is_none()
+                && r.kind == EdgeKind::Calls
+            {
+                ids.iter()
+                    .filter(|id| {
+                        symbols
+                            .get(*id)
+                            .map(|s| s.kind != SymbolKind::Method)
+                            .unwrap_or(false)
+                    })
+                    .collect()
+            } else {
+                ids.iter().collect()
+            };
+            if !filtered.is_empty() && filtered.len() <= 4 {
+                return filtered
+                    .into_iter()
+                    .map(|id| (id.clone(), Confidence::Resolved))
+                    .collect();
             }
         }
     }
@@ -1404,6 +1495,22 @@ fn resolve_ref(
         return Vec::new();
     }
     if let Some(cands) = by_lang_name.get(&(ext.lang, r.target_name.as_str())) {
+        let cands: Vec<&String> = if ext.lang == Language::Rust
+            && r.qualifier.is_none()
+            && r.kind == EdgeKind::Calls
+        {
+            cands
+                .iter()
+                .filter(|id| {
+                    symbols
+                        .get(*id)
+                        .map(|s| s.kind != SymbolKind::Method)
+                        .unwrap_or(false)
+                })
+                .collect()
+        } else {
+            cands.iter().collect()
+        };
         if cands.len() == 1 {
             return vec![(cands[0].clone(), Confidence::Heuristic)];
         }
@@ -1412,10 +1519,10 @@ fn resolve_ref(
                 .iter()
                 .filter(|id| {
                     symbols
-                        .get(*id)
+                        .get(**id)
                         .map(|s| {
                             if ext.lang == Language::Rust {
-                                rust_imports_match_symbol(&ext.imports, s)
+                                rust_index.imports_match_symbol(&ext.imports, s)
                             } else {
                                 ext.imports.iter().any(|imp| {
                                     let clean = imp.trim_start_matches("./").trim_start_matches("../");
@@ -1425,7 +1532,7 @@ fn resolve_ref(
                         })
                         .unwrap_or(false)
                 })
-                .cloned()
+                .map(|id| (*id).clone())
                 .collect();
             if !imported.is_empty() && imported.len() <= 4 {
                 return imported
@@ -1437,7 +1544,7 @@ fn resolve_ref(
         if cands.len() <= 3 && r.target_name.len() >= 5 {
             return cands
                 .iter()
-                .map(|id| (id.clone(), Confidence::Heuristic))
+                .map(|id| ((*id).clone(), Confidence::Heuristic))
                 .collect();
         }
     }
