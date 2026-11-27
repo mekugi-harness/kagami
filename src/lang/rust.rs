@@ -229,7 +229,7 @@ fn split_top_level_cfg_args(s: &str) -> Vec<&str> {
 /// Three-valued evaluation of a Rust `cfg(...)` predicate with `test = false`:
 /// returns `(may_be_true, may_be_false)` when `test` is false and all other flags are unknown.
 fn eval_cfg_without_test(pred: &str) -> (bool, bool) {
-    let p = pred.trim();
+    let p = pred.trim().trim_end_matches(',').trim();
     if p == "test" {
         return (false, true);
     }

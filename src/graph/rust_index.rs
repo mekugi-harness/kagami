@@ -285,6 +285,23 @@ impl<'a> RustTypeIndex<'a> {
             if same_pkg.len() == 1 {
                 return Some(same_pkg[0].clone());
             }
+            // Support reexported types (e.g. api::Worker reexporting impl_mod::Worker)
+            // when there is a unique matching definition in the crate or repository.
+            if cands.len() == 1 {
+                return Some(cands[0].clone());
+            }
+            let pkg_cands: Vec<&String> = cands
+                .iter()
+                .filter(|id| {
+                    symbols
+                        .get(*id)
+                        .map(|s| s.package_or_module == owner_pkg)
+                        .unwrap_or(false)
+                })
+                .collect();
+            if pkg_cands.len() == 1 {
+                return Some(pkg_cands[0].clone());
+            }
             return None;
         }
         if let Some(id) = self.types_by_file_name.get(&(owner_file, type_name)) {
@@ -346,6 +363,9 @@ impl<'a> RustTypeIndex<'a> {
                     .collect();
                 return if matched.len() == 1 {
                     Some(matched[0].clone())
+                } else if let Some(id) = self.traits_by_file_name.get(&(owner_file, short_name)) {
+                    // Inline module trait (e.g. mod tasks { pub trait Task }) in the same file
+                    Some(id.clone())
                 } else {
                     None
                 };
@@ -822,27 +842,6 @@ pub fn resolve_rust_module_qualified(
     by_lang_name: &HashMap<(Language, &str), Vec<String>>,
     symbols: &HashMap<String, Symbol>,
 ) -> Vec<(String, Confidence)> {
-    // 0. Same-file inline module match (e.g. mod_a::scoped_cfg)
-    if !ext.cfg_gated_symbols.is_empty() {
-        let inline_hits: Vec<String> = ext
-            .symbols
-            .iter()
-            .filter(|s| {
-                s.name == target_name
-                    && matches!(s.kind, SymbolKind::Function | SymbolKind::Const)
-                    && ext.cfg_gated_symbols.get(&s.id).is_some_and(|scope| {
-                        scope == qual || scope.ends_with(&format!("::{}", qual))
-                    })
-            })
-            .map(|s| s.id.clone())
-            .collect();
-        if !inline_hits.is_empty() {
-            return inline_hits
-                .into_iter()
-                .map(|id| (id, Confidence::Resolved))
-                .collect();
-        }
-    }
     if !ext.package_or_module.is_empty()
         && let Some(ids) =
             by_pkg_name.get(&(Language::Rust, ext.package_or_module.as_str(), target_name))
@@ -884,6 +883,30 @@ pub fn resolve_rust_module_qualified(
             .collect();
         if !narrowed.is_empty() && narrowed.len() <= 4 {
             return narrowed
+                .into_iter()
+                .map(|id| (id, Confidence::Resolved))
+                .collect();
+        }
+    }
+
+    // Same-file exact inline module match (e.g. mod_a::scoped_cfg), checked after file modules
+    // so nested inline modules cannot intercept top-level file modules like worker.rs.
+    if !ext.cfg_gated_symbols.is_empty() {
+        let inline_hits: Vec<String> = ext
+            .symbols
+            .iter()
+            .filter(|s| {
+                s.name == target_name
+                    && matches!(s.kind, SymbolKind::Function | SymbolKind::Const)
+                    && ext
+                        .cfg_gated_symbols
+                        .get(&s.id)
+                        .is_some_and(|scope| scope == qual)
+            })
+            .map(|s| s.id.clone())
+            .collect();
+        if !inline_hits.is_empty() {
+            return inline_hits
                 .into_iter()
                 .map(|id| (id, Confidence::Resolved))
                 .collect();
