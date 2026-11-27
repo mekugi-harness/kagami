@@ -48,6 +48,7 @@ fn test_go_package_qualified_cobra_and_shadowing() {
             allowlist: Default::default(),
             include_clusters: true,
             path_filter: None,
+            min_confidence: Confidence::Heuristic,
         },
     );
     let dead_names: Vec<&str> = dead.symbols.iter().map(|s| s.symbol.as_str()).collect();
@@ -243,6 +244,7 @@ fn run_prod_dead(root: &std::path::Path) -> Vec<(String, String)> {
             allowlist: Default::default(),
             include_clusters: true,
             path_filter: None,
+            min_confidence: Confidence::Heuristic,
         },
     );
     dead.symbols
@@ -342,6 +344,7 @@ fn test_scip_unicode_disambiguators_and_competing_edge_pruning() {
             allowlist: Default::default(),
             include_clusters: true,
             path_filter: None,
+            min_confidence: Confidence::Heuristic,
         },
     );
     let dead_pairs: Vec<(&str, &str)> = dead

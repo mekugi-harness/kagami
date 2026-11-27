@@ -18,6 +18,7 @@ pub struct DeadOptions {
     pub allowlist: HashSet<String>,
     pub include_clusters: bool,
     pub path_filter: Option<GlobSet>,
+    pub min_confidence: Confidence,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -139,6 +140,15 @@ pub fn analyze_dead(graph: &CodeGraph, opts: &DeadOptions) -> DeadReport {
             })
             .unwrap_or(0);
 
+        let confidence = if sym.is_dynamic_candidate {
+            Confidence::Heuristic
+        } else {
+            Confidence::Resolved
+        };
+        if confidence < opts.min_confidence {
+            continue;
+        }
+
         let reason = if caller_count == 0 {
             unreferenced += 1;
             "unreferenced".to_string()
@@ -148,12 +158,6 @@ pub fn analyze_dead(graph: &CodeGraph, opts: &DeadOptions) -> DeadReport {
             }
             unreachable_clusters += 1;
             "unreachable_cluster".to_string()
-        };
-
-        let confidence = if sym.is_dynamic_candidate {
-            Confidence::Heuristic
-        } else {
-            Confidence::Resolved
         };
 
         dead_list.push(DeadSymbol {
