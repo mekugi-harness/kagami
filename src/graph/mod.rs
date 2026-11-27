@@ -212,12 +212,14 @@ fn resolve_ref(
 
     // 2. O(1) qualified match (Type.Method or Type::method)
     if let Some(ref qual) = r.qualifier {
-        // Exact file-path qualifier (e.g. relative Svelte default component import)
-        if let Some(id) = by_file_name.get(&(qual.as_str(), r.target_name.as_str())) {
-            return vec![(id.clone(), Confidence::Resolved)];
-        }
-        if qual.ends_with(".svelte") {
-            return Vec::new();
+        // Exact file-path qualifier (relative Svelte component or <script module> import)
+        if r.kind == EdgeKind::TemplateRef || r.target_name == "<script:module>" {
+            if let Some(id) = by_file_name.get(&(qual.as_str(), r.target_name.as_str())) {
+                return vec![(id.clone(), Confidence::Resolved)];
+            }
+            if qual.ends_with(".svelte") {
+                return Vec::new();
+            }
         }
 
         for sep in [".", "::"] {
@@ -285,10 +287,29 @@ fn resolve_ref(
         }
 
         // Non-package qualifier (receiver variable like c.Close()): prefer same-file method match first
+        let mut results = Vec::new();
+        // If qualifier is a same-file or same-package var/const (e.g. Go hooks.Run()),
+        // link the var itself so callbacks registered in its initializer remain reachable.
+        if let Some(id) = by_file_name.get(&(ext.file.as_str(), qual.as_str())) {
+            if symbols.get(id).map(|s| s.kind == SymbolKind::Const).unwrap_or(false) {
+                results.push((id.clone(), Confidence::Resolved));
+            }
+        } else if !ext.package_or_module.is_empty() {
+            if let Some(ids) = by_pkg_name.get(&(ext.lang, ext.package_or_module.as_str(), qual.as_str())) {
+                for id in ids {
+                    if symbols.get(id).map(|s| s.kind == SymbolKind::Const).unwrap_or(false) {
+                        results.push((id.clone(), Confidence::Resolved));
+                    }
+                }
+            }
+        }
         if let Some(id) = by_file_name.get(&(ext.file.as_str(), r.target_name.as_str())) {
             if symbols.get(id).map(|s| s.kind == SymbolKind::Method).unwrap_or(false) {
-                return vec![(id.clone(), Confidence::Resolved)];
+                results.push((id.clone(), Confidence::Resolved));
             }
+        }
+        if !results.is_empty() {
+            return results;
         }
     }
 

@@ -258,7 +258,7 @@ fn test_scip_unicode_disambiguators_and_competing_edge_pruning() {
 
     fs::write(
         root.join("main.rs"),
-        "fn main() {\n    café();\n    dispatch_work();\n}\nfn café() {}\n",
+        "fn main() {\n    café(); keep_sibling();\n    dispatch_work();\n}\nfn café() {}\nfn keep_sibling() {}\n",
     )
     .unwrap();
     fs::write(root.join("real.rs"), "pub fn dispatch_work() {}\n").unwrap();
@@ -362,6 +362,11 @@ fn test_scip_unicode_disambiguators_and_competing_edge_pruning() {
         !dead_pairs.contains(&("main.rs", "café")),
         "main.rs::café should be live"
     );
+    // Sibling call on the same line as SCIP-resolved café() must NOT be pruned
+    assert!(
+        !dead_pairs.contains(&("main.rs", "keep_sibling")),
+        "sibling call keep_sibling() on the same line must not be erased by SCIP pruning"
+    );
 }
 
 #[test]
@@ -377,12 +382,23 @@ fn test_svelte_live_vs_unused_setup_and_relative_import_alias() {
         root.join("src/routes/+page.svelte"),
         r#"<script lang="ts">
 import PrimaryButton from './ui/Button.svelte';
+import './ui/Shared.svelte';
 const ready = liveSetup();
 function liveSetup() { return true; }
 const unusedArrow = () => deadArrowHelper();
 function deadArrowHelper() {}
 </script>
 <PrimaryButton />
+"#,
+    )
+    .unwrap();
+    fs::write(
+        root.join("src/routes/ui/Shared.svelte"),
+        r#"<script module lang="ts">
+sharedModuleInit();
+function sharedModuleInit() {}
+</script>
+<div>Shared</div>
 "#,
     )
     .unwrap();
@@ -423,6 +439,7 @@ function orphanSetup() {}
     assert!(!has("src/routes/+page.svelte", "liveSetup"), "live route setup helper must stay alive");
     assert!(!has("src/routes/ui/Button.svelte", "Button"), "imported relative Button.svelte must stay alive");
     assert!(!has("src/routes/ui/Button.svelte", "buttonInit"), "imported Button setup helper must stay alive");
+    assert!(!has("src/routes/ui/Shared.svelte", "sharedModuleInit"), "statically imported <script module> setup helper must stay alive");
 
     assert!(has("src/routes/+page.svelte", "unusedArrow"), "uncalled arrow fn in live component should be dead");
     assert!(has("src/routes/+page.svelte", "deadArrowHelper"), "helper only called by dead arrow fn should be dead");
@@ -441,10 +458,21 @@ fn test_ts_js_exported_and_non_function_module_initializers() {
         root.join("app.ts"),
         r#"export const app = initApp();
 const cfg = loadCfg();
+const { port = pickPort() } = {};
+const runParen = (() => parenHelper());
+runParen();
+const withDef = (x = defaultArgHelper()) => x;
+withDef();
+class Widget { render() {} }
+const widgets = { svelte: new Widget() };
+widgets.svelte.render();
 const unusedFn = () => deadFromClosure();
 export const unusedExported = () => deadFromExportedClosure();
 function initApp() { return 1; }
 function loadCfg() { return 2; }
+function pickPort() { return 8080; }
+function parenHelper() {}
+function defaultArgHelper() { return 1; }
 function deadFromClosure() {}
 function deadFromExportedClosure() {}
 "#,
@@ -456,6 +484,10 @@ function deadFromExportedClosure() {}
 
     assert!(!has("initApp"), "exported non-function initializer must keep initApp alive");
     assert!(!has("loadCfg"), "top-level non-function initializer must keep loadCfg alive");
+    assert!(!has("pickPort"), "destructuring default call must keep pickPort alive");
+    assert!(!has("parenHelper"), "called parenthesized arrow fn must keep parenHelper alive");
+    assert!(!has("defaultArgHelper"), "default parameter call must keep defaultArgHelper alive");
+    assert!(!has("Widget.render"), "widgets.svelte.render() must resolve to Widget.render");
     assert!(has("unusedFn"), "uncalled arrow function should be dead");
     assert!(has("unusedExported"), "uncalled exported arrow function should be dead");
     assert!(has("deadFromClosure"), "helper inside uncalled arrow function must be dead");
@@ -471,14 +503,22 @@ fn test_go_package_var_closure_vs_init_call() {
         root.join("main.go"),
         r#"package main
 
+type Hooks struct {
+    Run func()
+}
+
 var boot = initFoo()
+var hooks = Hooks{Run: serveHook}
 var lazyHandler = func() {
     deadInClosure()
 }
 
 func initFoo() int { return 1 }
+func serveHook() {}
 func deadInClosure() {}
-func main() {}
+func main() {
+    hooks.Run()
+}
 "#,
     )
     .unwrap();
@@ -487,6 +527,7 @@ func main() {}
     let has = |sym: &str| dead.iter().any(|(_, s)| s == sym);
 
     assert!(!has("initFoo"), "package var with init call must keep initFoo alive");
+    assert!(!has("serveHook"), "callback in referenced package var hooks.Run() must stay alive");
     assert!(has("deadInClosure"), "uncalled package var closure must not keep deadInClosure alive");
 }
 
@@ -553,5 +594,15 @@ func fallbackErr(fallback int) int {
         score >= 0.9,
         "expected high similarity between Go bare error return and explicit error return, got {}",
         score
+    );
+
+    // TS/JS early exit (if (err != null) return;) must NOT be treated as Go named-return PropagateErr
+    let ts_src = "function earlyExit(err: any) { if (err != null) { return; } work(); }\n";
+    let ts_ext = lang::extract_file("exit.ts", Language::TypeScript, ts_src, "t1".into()).unwrap();
+    let norm_ts = normalize_func(&ts_ext.ir_funcs[0], NormalizeOptions::default());
+    assert!(
+        !has_propagate_err(&norm_ts),
+        "TS bare return must NOT normalize to PropagateErr, got {:?}",
+        norm_ts
     );
 }

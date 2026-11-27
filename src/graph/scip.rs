@@ -228,7 +228,7 @@ pub fn apply_scip_overlay(graph: &mut CodeGraph, index: &ScipIndex, analysis_roo
 
     let mut added_or_upgraded = 0usize;
     let mut seen_new: HashSet<(String, String, EdgeKind)> = HashSet::new();
-    let mut exact_sites: HashSet<(String, String, usize)> = HashSet::new();
+    let mut exact_sites: HashSet<(String, String, usize, String)> = HashSet::new();
 
     // 2. Process non-local reference occurrences
     for doc in &index.documents {
@@ -259,7 +259,9 @@ pub fn apply_scip_overlay(graph: &mut CodeGraph, index: &ScipIndex, analysis_roo
             if from_id == target_id {
                 continue;
             }
-            exact_sites.insert((from_id.clone(), rel.clone(), line));
+            if let Some(tname) = graph.symbols.get(target_id).map(|s| s.name.clone()) {
+                exact_sites.insert((from_id.clone(), rel.clone(), line, tname));
+            }
             if let Some(&eidx) = existing.get(&(from_id.clone(), target_id.clone())) {
                 if graph.edges[eidx].confidence < Confidence::Exact {
                     graph.edges[eidx].confidence = Confidence::Exact;
@@ -352,9 +354,13 @@ pub fn apply_scip_overlay(graph: &mut CodeGraph, index: &ScipIndex, analysis_roo
     if !exact_sites.is_empty() {
         let before = graph.edges.len();
         graph.edges.retain(|e| {
-            e.confidence == Confidence::Exact
-                || e.via_bridge.is_some()
-                || !exact_sites.contains(&(e.from.clone(), e.file.clone(), e.line))
+            if e.confidence == Confidence::Exact || e.via_bridge.is_some() {
+                return true;
+            }
+            let Some(tname) = graph.symbols.get(&e.to).map(|s| s.name.as_str()) else {
+                return true;
+            };
+            !exact_sites.contains(&(e.from.clone(), e.file.clone(), e.line, tname.to_string()))
         });
         if graph.edges.len() != before {
             graph.outgoing.clear();

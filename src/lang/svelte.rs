@@ -55,6 +55,7 @@ pub fn extract(rel_path: &str, src: &str, blake3_hex: String) -> Result<FileExtr
         let body_end = body_start + close_rel;
         let line_offset = src[..body_start].bytes().filter(|&b| b == b'\n').count();
         let script_src = &src[body_start..body_end];
+        let is_module_script = src[abs_open..body_start].contains("module");
         script_ranges.push((abs_open, body_end + "</script>".len()));
         // Parse default Svelte component imports: import PrimaryButton from './Button.svelte'
         for sline in script_src.lines() {
@@ -70,7 +71,7 @@ pub fn extract(rel_path: &str, src: &str, blake3_hex: String) -> Result<FileExtr
                         && path.ends_with(".svelte")
                     {
                         if let Some(stem) = Path::new(path).file_stem().and_then(|s| s.to_str()) {
-                            let resolved_file = resolve_relative_path(rel_path, path);
+                            let resolved_file = ts_js::resolve_relative_path(rel_path, path);
                             comp_aliases.insert(alias.to_string(), (stem.to_string(), resolved_file));
                         }
                     }
@@ -78,9 +79,13 @@ pub fn extract(rel_path: &str, src: &str, blake3_hex: String) -> Result<FileExtr
             }
         }
 
-        if let Ok(sub) = ts_js::extract(rel_path, script_src, String::new(), Language::Svelte, line_offset) {
-            for sym in &sub.symbols {
+        if let Ok(mut sub) = ts_js::extract(rel_path, script_src, String::new(), Language::Svelte, line_offset) {
+            for sym in &mut sub.symbols {
                 if sym.kind == SymbolKind::Script && sym.name == "<module>" {
+                    if is_module_script {
+                        sym.name = "<script:module>".to_string();
+                        sym.qualified_name = "<script:module>".to_string();
+                    }
                     refs.push(RawRef {
                         from_symbol_id: comp_id.clone(),
                         target_name: sym.id.clone(),
@@ -176,28 +181,4 @@ pub fn extract(rel_path: &str, src: &str, blake3_hex: String) -> Result<FileExtr
         bridges,
         ir_funcs,
     })
-}
-
-fn resolve_relative_path(current_file: &str, import_path: &str) -> Option<String> {
-    if !import_path.starts_with("./") && !import_path.starts_with("../") {
-        return None;
-    }
-    let mut parts: Vec<&str> = match current_file.rsplit_once('/') {
-        Some((dir, _)) if !dir.is_empty() => dir.split('/').collect(),
-        _ => Vec::new(),
-    };
-    for seg in import_path.split('/') {
-        match seg {
-            "" | "." => {}
-            ".." => {
-                parts.pop()?;
-            }
-            other => parts.push(other),
-        }
-    }
-    if parts.is_empty() {
-        None
-    } else {
-        Some(parts.join("/"))
-    }
 }

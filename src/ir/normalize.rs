@@ -1,4 +1,5 @@
 use crate::ir::{IrFunc, IrNode, LitClass, LoopKind, OpClass, UnOpClass};
+use crate::model::Language;
 use std::collections::HashMap;
 
 #[derive(Debug, Clone, Copy, Default)]
@@ -7,7 +8,8 @@ pub struct NormalizeOptions {
 }
 
 pub fn normalize_func(func: &IrFunc, opts: NormalizeOptions) -> IrNode {
-    let mut node = desugar_node(func.body.clone());
+    let allow_bare_err_return = func.lang == Language::Go;
+    let mut node = desugar_node(func.body.clone(), allow_bare_err_return);
     let mut env = AlphaEnv::new();
     for p in &func.params {
         env.bind(p);
@@ -31,32 +33,35 @@ fn flatten_seq(items: Vec<IrNode>) -> IrNode {
     }
 }
 
-fn desugar_node(node: IrNode) -> IrNode {
+fn desugar_node(node: IrNode, allow_bare_err_return: bool) -> IrNode {
     match node {
         IrNode::Seq(items) => {
-            let mut processed: Vec<IrNode> = items.into_iter().map(desugar_node).collect();
+            let mut processed: Vec<IrNode> = items
+                .into_iter()
+                .map(|n| desugar_node(n, allow_bare_err_return))
+                .collect();
             processed = desugar_seq_patterns(processed);
             flatten_seq(processed)
         }
         IrNode::Loop { kind, var, body } => {
             let kind = match kind {
                 LoopKind::IterRange { start, end, step } => LoopKind::IterRange {
-                    start: Box::new(desugar_node(*start)),
-                    end: Box::new(desugar_node(*end)),
-                    step: Box::new(desugar_node(*step)),
+                    start: Box::new(desugar_node(*start, allow_bare_err_return)),
+                    end: Box::new(desugar_node(*end, allow_bare_err_return)),
+                    step: Box::new(desugar_node(*step, allow_bare_err_return)),
                 },
                 LoopKind::IterSeq { seq } => LoopKind::IterSeq {
-                    seq: Box::new(desugar_node(*seq)),
+                    seq: Box::new(desugar_node(*seq, allow_bare_err_return)),
                 },
                 LoopKind::While { cond } => LoopKind::While {
-                    cond: Box::new(desugar_node(*cond)),
+                    cond: Box::new(desugar_node(*cond, allow_bare_err_return)),
                 },
                 LoopKind::Infinite => LoopKind::Infinite,
             };
             IrNode::Loop {
                 kind,
                 var,
-                body: Box::new(desugar_node(*body)),
+                body: Box::new(desugar_node(*body, allow_bare_err_return)),
             }
         }
         IrNode::Branch {
@@ -64,13 +69,13 @@ fn desugar_node(node: IrNode) -> IrNode {
             then_br,
             else_br,
         } => {
-            let cond = desugar_node(*cond);
-            let then_br = desugar_node(*then_br);
-            let else_br = else_br.map(|e| desugar_node(*e));
+            let cond = desugar_node(*cond, allow_bare_err_return);
+            let then_br = desugar_node(*then_br, allow_bare_err_return);
+            let else_br = else_br.map(|e| desugar_node(*e, allow_bare_err_return));
             if let Some(mb) = try_lift_if_chain_to_multibranch(&cond, &then_br, else_br.as_ref()) {
                 return mb;
             }
-            if is_err_check(&cond) && else_br.is_none() && is_err_return(&then_br) {
+            if is_err_check(&cond) && else_br.is_none() && is_err_return(&then_br, allow_bare_err_return) {
                 return IrNode::PropagateErr(Box::new(IrNode::Var("err".into())));
             }
             IrNode::Branch {
@@ -84,44 +89,47 @@ fn desugar_node(node: IrNode) -> IrNode {
             arms,
             default,
         } => {
-            let scrutinee = scrutinee.map(|s| Box::new(desugar_node(*s)));
+            let scrutinee = scrutinee.map(|s| Box::new(desugar_node(*s, allow_bare_err_return)));
             let arms = arms
                 .into_iter()
-                .map(|(k, v)| (desugar_node(k), desugar_node(v)))
+                .map(|(k, v)| (desugar_node(k, allow_bare_err_return), desugar_node(v, allow_bare_err_return)))
                 .collect();
-            let default = default.map(|d| Box::new(desugar_node(*d)));
+            let default = default.map(|d| Box::new(desugar_node(*d, allow_bare_err_return)));
             IrNode::MultiBranch {
                 scrutinee,
                 arms,
                 default,
             }
         }
-        IrNode::Return(v) => IrNode::Return(v.map(|x| Box::new(desugar_node(*x)))),
-        IrNode::PropagateErr(e) => IrNode::PropagateErr(Box::new(desugar_node(*e))),
+        IrNode::Return(v) => IrNode::Return(v.map(|x| Box::new(desugar_node(*x, allow_bare_err_return)))),
+        IrNode::PropagateErr(e) => IrNode::PropagateErr(Box::new(desugar_node(*e, allow_bare_err_return))),
         IrNode::Assign { dst, val } => IrNode::Assign {
             dst,
-            val: Box::new(desugar_node(*val)),
+            val: Box::new(desugar_node(*val, allow_bare_err_return)),
         },
         IrNode::Call { callee, args } => IrNode::Call {
             callee,
-            args: args.into_iter().map(desugar_node).collect(),
+            args: args
+                .into_iter()
+                .map(|a| desugar_node(a, allow_bare_err_return))
+                .collect(),
         },
         IrNode::BinOp { op, lhs, rhs } => IrNode::BinOp {
             op,
-            lhs: Box::new(desugar_node(*lhs)),
-            rhs: Box::new(desugar_node(*rhs)),
+            lhs: Box::new(desugar_node(*lhs, allow_bare_err_return)),
+            rhs: Box::new(desugar_node(*rhs, allow_bare_err_return)),
         },
         IrNode::UnOp { op, expr } => IrNode::UnOp {
             op,
-            expr: Box::new(desugar_node(*expr)),
+            expr: Box::new(desugar_node(*expr, allow_bare_err_return)),
         },
         IrNode::Member { obj, field } => IrNode::Member {
-            obj: Box::new(desugar_node(*obj)),
+            obj: Box::new(desugar_node(*obj, allow_bare_err_return)),
             field,
         },
         IrNode::Index { obj, idx } => IrNode::Index {
-            obj: Box::new(desugar_node(*obj)),
-            idx: Box::new(desugar_node(*idx)),
+            obj: Box::new(desugar_node(*obj, allow_bare_err_return)),
+            idx: Box::new(desugar_node(*idx, allow_bare_err_return)),
         },
         other => other,
     }
@@ -201,7 +209,7 @@ fn is_return_only(node: &IrNode) -> bool {
     }
 }
 
-fn is_err_return(node: &IrNode) -> bool {
+fn is_err_return(node: &IrNode, allow_bare: bool) -> bool {
     fn contains_err(n: &IrNode) -> bool {
         match n {
             IrNode::Var(v) => v == "err",
@@ -219,7 +227,7 @@ fn is_err_return(node: &IrNode) -> bool {
         _ => None,
     };
     match ret {
-        Some(None) => true,
+        Some(None) => allow_bare,
         Some(Some(inner)) => contains_err(inner),
         None => false,
     }
