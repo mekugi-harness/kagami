@@ -395,10 +395,7 @@ function deadArrowHelper() {}
     .unwrap();
     fs::write(
         root.join("src/routes/ui/Shared.svelte"),
-        r#"<script module lang="ts">
-sharedModuleInit();
-function sharedModuleInit() {}
-</script>
+        r#"<script module lang="ts">sharedModuleInit(); function sharedModuleInit() {}</script><script lang="ts">sharedInstanceDead(); function sharedInstanceDead() {}</script>
 <div>Shared</div>
 "#,
     )
@@ -452,6 +449,7 @@ function orphanSetup() {}
     assert!(!has("src/routes/ui/Button.svelte", "Button"), "imported relative Button.svelte must stay alive");
     assert!(!has("src/routes/ui/Button.svelte", "buttonInit"), "imported Button setup helper must stay alive");
     assert!(!has("src/routes/ui/Shared.svelte", "sharedModuleInit"), "statically imported <script module> setup helper must stay alive");
+    assert!(has("src/routes/ui/Shared.svelte", "sharedInstanceDead"), "unrendered same-line instance script helper must remain dead");
     assert!(has("src/routes/ui/TypeOnly.svelte", "typeOnlyInit"), "type-only import must not keep <script module> helper alive");
 
     assert!(has("src/routes/+page.svelte", "unusedArrow"), "uncalled arrow fn in live component should be dead");
