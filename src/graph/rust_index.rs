@@ -590,7 +590,8 @@ impl<'a> RustTypeIndex<'a> {
         let mut root_resolved: Vec<String> = Vec::new();
         for u in uses {
             let is_exact = u.mod_scope == caller_scope;
-            let is_root_fallback = include_root_uses && !caller_scope.is_empty() && u.mod_scope.is_empty();
+            let is_root_fallback =
+                include_root_uses && !caller_scope.is_empty() && u.mod_scope.is_empty();
             if u.local_name == type_name
                 && !u.is_test
                 && (is_exact || is_root_fallback)

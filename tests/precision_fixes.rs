@@ -2670,6 +2670,7 @@ impl Weak {
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex, Weak};
 use helpers::{RemoteState, with_impl_fn, with_remote_pair};
+use crate::Decoy as CallbackWorker;
 
 // --- Category 1: Enum variant fields & pattern bindings ---
 struct Projector;
