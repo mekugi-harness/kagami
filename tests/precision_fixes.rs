@@ -991,29 +991,23 @@ func (s *Second) Run() {}
 func pair() (*First, *Second) { return &First{}, &Second{} }
 
 // 2. Shadowed factory parameter must not resolve to package build()
-type OldTarget struct{}
-func (o *OldTarget) Exec() {}
-
 func build() *OldTarget { return &OldTarget{} }
 
-func useShadowedFactory(build func() any) {
-	_ = build()
+func useShadowedFactory(build func() interface{ Exec() }) {
+	build().Exec()
 }
 
 // 3. Shadowing local with unsupported type must mask outer receiver type
-type OuterWorker struct{}
-func (w *OuterWorker) Work() {}
-
 type OuterCfg struct {
 	Worker *OuterWorker
 }
 
 func useShadowedCfg(cfg *OuterCfg) {
 	_ = cfg
-	fn := func(cfg struct{ Worker int }) {
-		_ = cfg.Worker
+	fn := func(cfg struct{ Worker interface{ Work() } }) {
+		cfg.Worker.Work()
 	}
-	fn(struct{ Worker int }{})
+	fn(struct{ Worker interface{ Work() } }{})
 }
 
 // 4. Explicit anonymous interface var must not lock to initializer's concrete type
@@ -1038,15 +1032,31 @@ type WrapperFactory struct {
 	Make func() *Second
 }
 
+// 7. Range assignment (=) and same-block reused local (:=) preserve existing receiver types
+type Job struct{}
+func (j *Job) Process() {}
+
+func useRangeAndChan(jobs chan *Job) {
+	var job *Job
+	for job = range jobs {
+		job.Process()
+	}
+	job, ok := <-jobs
+	if ok {
+		job.Process()
+	}
+}
+
 func RunAll() {
 	var _, worker = pair()
 	worker.Run()
-	useShadowedFactory(func() any { return nil })
+	useShadowedFactory(func() interface{ Exec() } { return nil })
 	useShadowedCfg(&OuterCfg{})
 	useAnonIface()
 	_ = &BlankHolder{}
 	w := &WrapperFactory{}
 	_ = w.Make()
+	useRangeAndChan(nil)
 }
 "#,
     )
@@ -1061,6 +1071,18 @@ func (a ImplA) Ping() {}
 
 type ImplB struct{}
 func (b ImplB) Ping() {}
+
+type OldTarget struct{}
+func (o *OldTarget) Exec() {}
+
+type NewTarget struct{}
+func (n *NewTarget) Exec() {}
+
+type OuterWorker struct{}
+func (w *OuterWorker) Work() {}
+
+type InnerWorker struct{}
+func (w *InnerWorker) Work() {}
 "#,
     )
     .unwrap();
@@ -1123,13 +1145,14 @@ func main() {
     assert!(has_resolved_call("RunAll", "Second.Run"));
     assert!(!has_resolved_call("RunAll", "First.Run"));
     assert!(!has_resolved_call("RunAll", "BaseFactory.Make"));
+    assert!(!has_resolved_call("useShadowedFactory", "OldTarget.Exec"));
+    assert!(!has_resolved_call("useShadowedCfg", "OuterWorker.Work"));
     assert!(!has_resolved_call("useAnonIface", "ImplA.Ping"));
+    assert!(has_resolved_call("useRangeAndChan", "Job.Process"));
     assert!(has_resolved_call("TestCallsHelper", "Second.TestHelperMethod"));
 
     for dead_sym in [
         "First.Run",
-        "OldTarget.Exec",
-        "OuterWorker.Work",
         "BlankHolder.UnusedReload",
         "BaseFactory.Make",
     ] {

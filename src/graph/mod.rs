@@ -535,6 +535,10 @@ impl<'a> GoTypeIndex<'a> {
             .map(|s| s.id.clone())
             .collect();
         for type_id in &concrete_type_ids {
+            let root_pkg = symbols
+                .get(type_id)
+                .map(|s| s.package_or_module.as_str())
+                .unwrap_or("");
             let mut eff: HashMap<String, (usize, PromotedMethod)> = HashMap::new();
             let mut visit_state: HashMap<String, (usize, usize)> = HashMap::new();
             let mut queue: std::collections::VecDeque<(String, usize)> =
@@ -557,9 +561,20 @@ impl<'a> GoTypeIndex<'a> {
                 }
                 // Struct fields share Go's selector namespace with methods, so a field at
                 // shallower or equal embedding depth shadows any deeper promoted method.
+                // Unexported fields from a foreign package are in a distinct namespace.
                 if let Some(fields) = raw_struct_fields.get(&curr_id) {
+                    let curr_pkg = symbols
+                        .get(&curr_id)
+                        .map(|s| s.package_or_module.as_str())
+                        .unwrap_or("");
                     for f_name in fields.keys() {
-                        merge_promoted(&mut eff, f_name, depth, PromotedMethod::Ambiguous);
+                        let is_exported = f_name
+                            .chars()
+                            .next()
+                            .is_some_and(|c| c.is_ascii_uppercase());
+                        if is_exported || curr_pkg == root_pkg {
+                            merge_promoted(&mut eff, f_name, depth, PromotedMethod::Ambiguous);
+                        }
                     }
                 }
                 if let (Some(owner), Some(embeds)) =
@@ -1088,10 +1103,14 @@ fn resolve_ref(
             }
             return results;
         }
-        if let Some(test_method_id) = go_index
-            .go_test_methods_by_type
-            .get(&target_type_id)
-            .and_then(|m| m.get(&r.target_name))
+        if symbols
+            .get(&r.from_symbol_id)
+            .map(|s| s.is_test)
+            .unwrap_or(false)
+            && let Some(test_method_id) = go_index
+                .go_test_methods_by_type
+                .get(&target_type_id)
+                .and_then(|m| m.get(&r.target_name))
         {
             results.push((test_method_id.clone(), Confidence::Resolved));
             return results;

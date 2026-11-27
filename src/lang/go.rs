@@ -1039,10 +1039,12 @@ impl<'a> GoLocalEnv<'a> {
                 }
             }
             "range_clause" => {
-                if let (Some(lhs), Some(rhs)) = (
-                    node.child_by_field_name("left"),
-                    node.child_by_field_name("right"),
-                ) {
+                if node_text(node, src).contains(":=")
+                    && let (Some(lhs), Some(rhs)) = (
+                        node.child_by_field_name("left"),
+                        node.child_by_field_name("right"),
+                    )
+                {
                     let lhs_names = collect_lhs_identifiers(lhs, src);
                     let start = node.end_byte();
                     let end = enclosing_scope_end(node, body_end);
@@ -1074,6 +1076,13 @@ impl<'a> GoLocalEnv<'a> {
         }
     }
 
+    fn has_same_scope_binding(&self, name: &str, start: usize, end: usize) -> bool {
+        self.locals
+            .get(name)
+            .map(|entries| entries.iter().any(|(s, e, _)| *e == end && *s <= start))
+            .unwrap_or(false)
+    }
+
     fn bind_paired(
         &mut self,
         lhs_names: &[String],
@@ -1085,17 +1094,23 @@ impl<'a> GoLocalEnv<'a> {
         if rhs_exprs.len() == lhs_names.len() {
             for (name, &expr) in lhs_names.iter().zip(rhs_exprs.iter()) {
                 let chain = resolve_expr_chain(expr, 0, src, self);
-                self.bind_opt(name.clone(), start, end, chain);
+                if chain.is_some() || !self.has_same_scope_binding(name, start, end) {
+                    self.bind_opt(name.clone(), start, end, chain);
+                }
             }
         } else if rhs_exprs.len() == 1 {
             let expr = rhs_exprs[0];
             for (idx, name) in lhs_names.iter().enumerate() {
                 let chain = resolve_expr_chain(expr, idx, src, self);
-                self.bind_opt(name.clone(), start, end, chain);
+                if chain.is_some() || !self.has_same_scope_binding(name, start, end) {
+                    self.bind_opt(name.clone(), start, end, chain);
+                }
             }
         } else {
             for name in lhs_names {
-                self.bind_opt(name.clone(), start, end, None);
+                if !self.has_same_scope_binding(name, start, end) {
+                    self.bind_opt(name.clone(), start, end, None);
+                }
             }
         }
     }
