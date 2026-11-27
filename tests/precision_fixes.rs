@@ -3407,6 +3407,27 @@ export class Worker {
 export class BaseWorker {
   inheritedRun(): void {}
 }
+
+export class NsBase {
+  nsRun(): void {}
+}
+"#,
+    )
+    .unwrap();
+
+    std::fs::write(
+        root.join("src/js_inherit.js"),
+        r#"
+class JsBase {
+  jsRun() {}
+}
+class JsChild extends JsBase {
+  constructor() {
+    super();
+    this.jsRun();
+  }
+}
+new JsChild();
 "#,
     )
     .unwrap();
@@ -3424,11 +3445,13 @@ import {
   unusedMethodVarHoistImport,
 } from "./imported";
 import { BaseWorker } from "./b";
+import * as bNs from "./b";
 
 function sameFileFormat() {}
 function makeId() { return "id"; }
 function getIndex() { return 0; }
 function fallbackMessage() { return "err"; }
+function makeMethodKey() { return "dyn"; }
 
 class Worker {
   start(): void {
@@ -3444,6 +3467,12 @@ class UnrelatedLocal {
 class ChildWorker extends BaseWorker {
   go(): void {
     this.inheritedRun();
+  }
+}
+
+class NsChild extends bNs.NsBase {
+  runNs(): void {
+    this.nsRun();
   }
 }
 
@@ -3463,6 +3492,7 @@ function boot(config: { sameFileFormat: string }, rows: Array<{ id?: string }>, 
       var liveAfterObjMethodVar = 1;
       return liveAfterObjMethodVar;
     },
+    [makeMethodKey()]() {},
     nestedHoist() {
       const invoke = () => unusedMethodVarHoistImport();
       var unusedMethodVarHoistImport = () => {};
@@ -3491,6 +3521,7 @@ function boot(config: { sameFileFormat: string }, rows: Array<{ id?: string }>, 
   try {
     new Worker().start();
     new ChildWorker().go();
+    new NsChild().runNs();
   } catch ({ message = fallbackMessage() }: any) {
     console.log(message);
   }
@@ -3578,8 +3609,11 @@ boot({ sameFileFormat: "x" }, [], []);
         ("src/a.ts", "makeId"),
         ("src/a.ts", "getIndex"),
         ("src/a.ts", "fallbackMessage"),
+        ("src/a.ts", "makeMethodKey"),
         ("src/a.ts", "Worker.run"),
         ("src/b.ts", "BaseWorker.inheritedRun"),
+        ("src/b.ts", "NsBase.nsRun"),
+        ("src/js_inherit.js", "JsBase.jsRun"),
         ("src/imported.ts", "liveAfterBlockFn"),
         ("src/imported.ts", "liveAfterObjMethodVar"),
         ("src/ui/CustomBtn.svelte", "CustomBtn"),

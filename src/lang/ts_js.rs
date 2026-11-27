@@ -39,6 +39,33 @@ fn extract_ts_extends_base(
     src: &str,
     ctx: &TsRefContext,
 ) -> Option<(String, Option<String>)> {
+    fn resolve_super_expr(
+        node: Node<'_>,
+        src: &str,
+        ctx: &TsRefContext,
+    ) -> Option<(String, Option<String>)> {
+        match node.kind() {
+            "identifier" => {
+                let base_ident = node_text(node, src);
+                if let Some(binding) = ctx.imported_bindings.get(base_ident) {
+                    return Some((binding.target_name.clone(), binding.resolved_file.clone()));
+                }
+                Some((base_ident.to_string(), Some(ctx.file.clone())))
+            }
+            "member_expression" => {
+                let obj = node.child_by_field_name("object")?;
+                let prop = node.child_by_field_name("property")?;
+                if obj.kind() == "identifier" {
+                    let ns = node_text(obj, src);
+                    if let Some(ns_file) = ctx.namespace_imports.get(ns) {
+                        return Some((node_text(prop, src).to_string(), Some(ns_file.clone())));
+                    }
+                }
+                None
+            }
+            _ => None,
+        }
+    }
     let mut c = class_node.walk();
     for ch in class_node.children(&mut c) {
         if ch.kind() == "class_heritage" {
@@ -47,17 +74,12 @@ fn extract_ts_extends_base(
                 if hch.kind() == "extends_clause" {
                     let mut ec = hch.walk();
                     for ech in hch.children(&mut ec) {
-                        if ech.kind() == "identifier" {
-                            let base_ident = node_text(ech, src);
-                            if let Some(binding) = ctx.imported_bindings.get(base_ident) {
-                                return Some((
-                                    binding.target_name.clone(),
-                                    binding.resolved_file.clone(),
-                                ));
-                            }
-                            return Some((base_ident.to_string(), Some(ctx.file.clone())));
+                        if let Some(res) = resolve_super_expr(ech, src, ctx) {
+                            return Some(res);
                         }
                     }
+                } else if let Some(res) = resolve_super_expr(hch, src, ctx) {
+                    return Some(res);
                 }
             }
         }
@@ -1506,16 +1528,28 @@ fn walk_ts_expr_refs(
         | "generator_function_declaration"
         | "method_definition" => {
             let mut fn_scope = HashSet::new();
-            if let Some(name_node) = n.child_by_field_name("name")
-                && name_node.kind() == "identifier"
-            {
-                let name = node_text(name_node, src).to_string();
-                if n.kind() == "function_declaration"
-                    && let Some(parent_scope) = scopes.last_mut()
-                {
-                    parent_scope.insert(name.clone());
+            if let Some(name_node) = n.child_by_field_name("name") {
+                if name_node.kind() == "computed_property_name" {
+                    walk_ts_expr_refs(
+                        name_node,
+                        src,
+                        line_offset,
+                        from_id,
+                        ctx,
+                        scopes,
+                        enclosing_class,
+                        refs,
+                        bridges,
+                    );
+                } else if name_node.kind() == "identifier" {
+                    let name = node_text(name_node, src).to_string();
+                    if n.kind() == "function_declaration"
+                        && let Some(parent_scope) = scopes.last_mut()
+                    {
+                        parent_scope.insert(name.clone());
+                    }
+                    fn_scope.insert(name);
                 }
-                fn_scope.insert(name);
             }
             if let Some(p) = n.child_by_field_name("parameter") {
                 collect_pattern_bindings(p, src, &mut fn_scope);
