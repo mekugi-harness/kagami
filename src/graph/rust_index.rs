@@ -568,13 +568,14 @@ impl<'a> RustTypeIndex<'a> {
                                         .unwrap_or("")
                                         == parent_scope
                                         && symbols.get(*id).is_some_and(|s| {
-                                            matches!(
-                                                s.kind,
-                                                SymbolKind::Struct
-                                                    | SymbolKind::Enum
-                                                    | SymbolKind::Type
-                                                    | SymbolKind::Trait
-                                            )
+                                            !s.is_test
+                                                && matches!(
+                                                    s.kind,
+                                                    SymbolKind::Struct
+                                                        | SymbolKind::Enum
+                                                        | SymbolKind::Type
+                                                        | SymbolKind::Trait
+                                                )
                                         })
                                 })
                                 .collect();
@@ -1142,12 +1143,17 @@ impl<'a> RustTypeIndex<'a> {
                                                 }
                                             }
                                         }
-                                    } else {
+                                    } else if mp2 != "self" {
+                                        let ts2_full = if macro_suffix.is_empty() {
+                                            ts2.to_string()
+                                        } else {
+                                            format!("{}{}", ts2, macro_suffix)
+                                        };
                                         let mut visited = HashSet::new();
                                         self.resolve_mod_path_into(
                                             caller_file,
                                             mp2,
-                                            ts2,
+                                            &ts2_full,
                                             false,
                                             symbols,
                                             0,
