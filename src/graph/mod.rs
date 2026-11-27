@@ -194,8 +194,13 @@ impl CodeGraph {
         }
 
         bridges::materialize_bridges(&extracts, &symbols, &mut edges);
-        let interface_impls =
-            materialize_go_interface_edges(&extracts, &symbols, &by_pkg_name, &mut edges, &mut seen);
+        let interface_impls = materialize_go_interface_edges(
+            &extracts,
+            &symbols,
+            &by_pkg_name,
+            &mut edges,
+            &mut seen,
+        );
 
         let mut outgoing: HashMap<String, Vec<usize>> = HashMap::new();
         let mut incoming: HashMap<String, Vec<usize>> = HashMap::new();
@@ -268,9 +273,18 @@ fn is_go_stdlib_interface_method(name: &str) -> bool {
     )
 }
 
-fn is_go_concrete_utility_embed(embed: &str) -> bool {
+fn is_go_concrete_utility_embed(embed: &str, alias_map: Option<&HashMap<&str, &str>>) -> bool {
+    let canonical = if let Some((pkg_alias, type_name)) = embed.split_once('.') {
+        if let Some(imp_path) = alias_map.and_then(|m| m.get(pkg_alias).copied()) {
+            format!("{}.{}", imp_path, type_name)
+        } else {
+            embed.to_string()
+        }
+    } else {
+        embed.to_string()
+    };
     matches!(
-        embed,
+        canonical.as_str(),
         "sync.Mutex"
             | "sync.RWMutex"
             | "sync.WaitGroup"
@@ -280,6 +294,12 @@ fn is_go_concrete_utility_embed(embed: &str) -> bool {
             | "sync.Map"
             | "bytes.Buffer"
             | "strings.Builder"
+            | "sync/atomic.Int32"
+            | "sync/atomic.Int64"
+            | "sync/atomic.Uint32"
+            | "sync/atomic.Uint64"
+            | "sync/atomic.Bool"
+            | "sync/atomic.Value"
             | "atomic.Int32"
             | "atomic.Int64"
             | "atomic.Uint32"
@@ -391,6 +411,10 @@ fn materialize_go_interface_edges(
             && let Some(type_id) =
                 go_types_by_pkg_name.get(&(sym.package_or_module.as_str(), recv_type))
         {
+            let type_is_test = symbols.get(type_id).map(|s| s.is_test).unwrap_or(false);
+            if sym.is_test && !type_is_test {
+                continue;
+            }
             go_methods_by_type
                 .entry(type_id.clone())
                 .or_default()
@@ -426,9 +450,9 @@ fn materialize_go_interface_edges(
                         by_pkg_name,
                         symbols,
                     ) && symbols
-                            .get(&target_id)
-                            .map(|s| s.kind == SymbolKind::Interface)
-                            .unwrap_or(false)
+                        .get(&target_id)
+                        .map(|s| s.kind == SymbolKind::Interface)
+                        .unwrap_or(false)
                     {
                         stack.push(target_id);
                     }
@@ -489,6 +513,7 @@ fn materialize_go_interface_edges(
         if let (Some(owner), Some(embeds)) = (symbols.get(type_id), raw_embeds.get(type_id))
             && owner.kind == SymbolKind::Struct
         {
+            let owner_aliases = file_aliases.get(owner.file.as_str());
             let mut has_external_embed = false;
             let mut embedded_local_iface_methods: HashSet<String> = HashSet::new();
             for emb in embeds {
@@ -503,7 +528,7 @@ fn materialize_go_interface_edges(
                     if let Some(ms) = iface_method_sets.get(&target_id) {
                         embedded_local_iface_methods.extend(ms.iter().cloned());
                     }
-                } else if !is_go_concrete_utility_embed(emb) {
+                } else if !is_go_concrete_utility_embed(emb, owner_aliases) {
                     has_external_embed = true;
                 }
             }
@@ -523,18 +548,52 @@ fn materialize_go_interface_edges(
     }
 
     // 2. Local repo interface structural satisfaction (conditional RTA in dead.rs)
-    // Compute effective method set per concrete Go type (own methods + promoted from local embedded structs).
-    let mut effective_methods_by_type: HashMap<String, HashSet<String>> = HashMap::new();
-    for (type_id, own_methods) in &go_methods_by_type {
-        let mut eff: HashSet<String> = own_methods.keys().cloned().collect();
+    // Compute effective method map per concrete Go type by BFS embedding depth:
+    // shallower declarations win, same-depth conflicts are ambiguous and omitted,
+    // and unambiguous promoted methods retain their declaring method symbol ID.
+    #[derive(Clone, PartialEq, Eq)]
+    enum PromotedMethod {
+        Concrete(String),
+        InterfaceOnly,
+        Ambiguous,
+    }
+    let mut effective_methods_by_type: HashMap<String, HashMap<String, Option<String>>> =
+        HashMap::new();
+    let concrete_type_ids: Vec<String> = symbols
+        .values()
+        .filter(|s| {
+            s.lang == Language::Go
+                && matches!(s.kind, SymbolKind::Struct | SymbolKind::Type)
+                && (go_methods_by_type.contains_key(&s.id) || raw_embeds.contains_key(&s.id))
+        })
+        .map(|s| s.id.clone())
+        .collect();
+    for type_id in &concrete_type_ids {
+        let mut eff: HashMap<String, (usize, PromotedMethod)> = HashMap::new();
         let mut visited: HashSet<String> = HashSet::new();
-        let mut stack = vec![type_id.clone()];
-        while let Some(curr_id) = stack.pop() {
+        let mut queue: std::collections::VecDeque<(String, usize)> =
+            std::collections::VecDeque::from([(type_id.clone(), 0usize)]);
+        while let Some((curr_id, depth)) = queue.pop_front() {
             if !visited.insert(curr_id.clone()) {
                 continue;
             }
             if let Some(ms) = go_methods_by_type.get(&curr_id) {
-                eff.extend(ms.keys().cloned());
+                for (m_name, m_id) in ms {
+                    match eff.get_mut(m_name) {
+                        None => {
+                            eff.insert(
+                                m_name.clone(),
+                                (depth, PromotedMethod::Concrete(m_id.clone())),
+                            );
+                        }
+                        Some((prev_depth, prev_state)) if *prev_depth == depth => {
+                            if *prev_state != PromotedMethod::Concrete(m_id.clone()) {
+                                *prev_state = PromotedMethod::Ambiguous;
+                            }
+                        }
+                        Some(_) => {}
+                    }
+                }
             }
             if let (Some(owner), Some(embeds)) = (symbols.get(&curr_id), raw_embeds.get(&curr_id)) {
                 for emb in embeds {
@@ -547,20 +606,43 @@ fn materialize_go_interface_edges(
                         symbols,
                     ) {
                         if let Some(ms) = iface_method_sets.get(&target_id) {
-                            eff.extend(ms.iter().cloned());
+                            for m_name in ms {
+                                match eff.get_mut(m_name) {
+                                    None => {
+                                        eff.insert(
+                                            m_name.clone(),
+                                            (depth + 1, PromotedMethod::InterfaceOnly),
+                                        );
+                                    }
+                                    Some((prev_depth, prev_state)) if *prev_depth == depth + 1 => {
+                                        *prev_state = PromotedMethod::Ambiguous;
+                                    }
+                                    Some(_) => {}
+                                }
+                            }
                         } else {
-                            stack.push(target_id);
+                            queue.push_back((target_id, depth + 1));
                         }
                     }
                 }
             }
         }
-        effective_methods_by_type.insert(type_id.clone(), eff);
+        let resolved: HashMap<String, Option<String>> = eff
+            .into_iter()
+            .filter_map(|(k, (_, state))| match state {
+                PromotedMethod::Concrete(id) => Some((k, Some(id))),
+                PromotedMethod::InterfaceOnly => Some((k, None)),
+                PromotedMethod::Ambiguous => None,
+            })
+            .collect();
+        if !resolved.is_empty() {
+            effective_methods_by_type.insert(type_id.clone(), resolved);
+        }
     }
 
     let mut types_by_method: HashMap<&str, Vec<&str>> = HashMap::new();
     for (type_id, eff) in &effective_methods_by_type {
-        for m in eff {
+        for m in eff.keys() {
             types_by_method
                 .entry(m.as_str())
                 .or_default()
@@ -599,21 +681,19 @@ fn materialize_go_interface_edges(
             let Some(eff) = effective_methods_by_type.get(type_id) else {
                 continue;
             };
-            if !iface_methods.iter().all(|m| eff.contains(m)) {
+            if !iface_methods.iter().all(|m| eff.contains_key(m)) {
                 continue;
             }
-            if let Some(own_methods) = go_methods_by_type.get(type_id) {
-                let method_ids: Vec<String> = iface_methods
-                    .iter()
-                    .filter_map(|m| own_methods.get(m).cloned())
-                    .collect();
-                if !method_ids.is_empty() {
-                    interface_impls.push(InterfaceImpl {
-                        receiver_type_id: type_id.to_string(),
-                        interface_id: iface_id.clone(),
-                        method_ids,
-                    });
-                }
+            let method_ids: Vec<String> = iface_methods
+                .iter()
+                .filter_map(|m| eff.get(m).and_then(|id| id.clone()))
+                .collect();
+            if !method_ids.is_empty() {
+                interface_impls.push(InterfaceImpl {
+                    receiver_type_id: type_id.to_string(),
+                    interface_id: iface_id.clone(),
+                    method_ids,
+                });
             }
         }
     }

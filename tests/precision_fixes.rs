@@ -570,3 +570,146 @@ func main() {
         );
     }
 }
+
+#[test]
+fn test_go_review_edge_cases_scoping_generics_promoted_and_grouped_vars() {
+    let dir = TempDir::new().unwrap();
+    let root = dir.path();
+    fs::create_dir_all(root.join("cmd/app")).unwrap();
+    fs::create_dir_all(root.join("internal/edge")).unwrap();
+
+    fs::write(
+        root.join("internal/edge/edge.go"),
+        r#"package edge
+
+import (
+	locks "sync"
+)
+
+func v() {}
+func callback() {}
+func selfShadowed() {}
+func groupedCb() {}
+
+var (
+	groupedHandler = groupedCb
+)
+
+type Box[T any] struct{ Val T }
+func (b Box[T]) MarshalJSON() ([]byte, error) { return boxHelper(), nil }
+func boxHelper() []byte { return nil }
+
+type AliasedLock struct {
+	locks.Mutex
+}
+func (a *AliasedLock) DeadAfterAliasedMutex() {}
+
+type Service interface {
+	Start()
+	Stop()
+}
+
+type Base struct{}
+func (b *Base) Start() { baseStartHelper() }
+func baseStartHelper() {}
+
+type Worker struct {
+	Base
+}
+func (w *Worker) Stop() {}
+
+type ProdPartial struct{}
+func (p *ProdPartial) PartialA() {}
+
+type PartialIface interface {
+	PartialA()
+	PartialB()
+}
+
+func useService(s Service) { _ = s }
+func usePartial(p PartialIface) { _ = p }
+
+func Run(items []int) {
+	callbacks := map[string]func(){"run": v}
+	callbacks["run"]()
+	for callback := range items {
+		_ = callback
+	}
+	fn := callback
+	fn()
+	selfShadowed := selfShadowed
+	selfShadowed()
+	groupedHandler()
+	_ = Box[int]{Val: 1}
+	_ = &AliasedLock{}
+	useService(&Worker{})
+	usePartial(nil)
+	_ = &ProdPartial{}
+}
+"#,
+    )
+    .unwrap();
+
+    fs::write(
+        root.join("internal/edge/edge_test.go"),
+        r#"package edge
+
+func (p *ProdPartial) PartialB() {}
+"#,
+    )
+    .unwrap();
+
+    fs::write(
+        root.join("cmd/app/main.go"),
+        r#"package main
+
+import "demo/internal/edge"
+
+func main() {
+	edge.Run([]int{1})
+}
+"#,
+    )
+    .unwrap();
+
+    let ignores = KagamiConfig::default().build_ignore_globset().unwrap();
+    let files = discover_files(root, &ignores, None).unwrap();
+    let graph = CodeGraph::build(root, &files, false).unwrap();
+    let dead = analyze_dead(
+        &graph,
+        &DeadOptions {
+            scope: DeadScope::Prod,
+            langs: None,
+            allowlist: Default::default(),
+            include_clusters: true,
+            path_filter: None,
+            min_confidence: Confidence::Heuristic,
+        },
+    );
+    let is_dead = |sym: &str| dead.symbols.iter().any(|s| s.symbol == sym);
+
+    for live_sym in [
+        "v",
+        "callback",
+        "selfShadowed",
+        "groupedCb",
+        "Box.MarshalJSON",
+        "boxHelper",
+        "Base.Start",
+        "baseStartHelper",
+        "Worker.Stop",
+    ] {
+        assert!(
+            !is_dead(live_sym),
+            "Expected {live_sym} to be live; dead={:?}",
+            dead.symbols
+        );
+    }
+    for dead_sym in ["AliasedLock.DeadAfterAliasedMutex", "ProdPartial.PartialA"] {
+        assert!(
+            is_dead(dead_sym),
+            "Expected {dead_sym} to remain dead; dead={:?}",
+            dead.symbols
+        );
+    }
+}
