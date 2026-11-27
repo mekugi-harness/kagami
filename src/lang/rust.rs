@@ -58,6 +58,8 @@ pub fn extract(rel_path: &str, src: &str, blake3_hex: String) -> Result<FileExtr
         ir_funcs,
         interface_methods: std::collections::HashMap::new(),
         embedded_types: std::collections::HashMap::new(),
+        struct_fields: std::collections::HashMap::new(),
+        func_return_types: std::collections::HashMap::new(),
     })
 }
 
@@ -327,6 +329,7 @@ fn collect_rust_refs_and_bridges(
                                 qualifier: None,
                                 kind: EdgeKind::Calls,
                                 line,
+                                receiver_chain: None,
                             });
                         }
                         "field_expression" => {
@@ -338,6 +341,7 @@ fn collect_rust_refs_and_bridges(
                                     qualifier: qual,
                                     kind: EdgeKind::Calls,
                                     line,
+                                    receiver_chain: None,
                                 });
                             }
                         }
@@ -355,6 +359,7 @@ fn collect_rust_refs_and_bridges(
                                     qualifier: qual,
                                     kind: EdgeKind::Calls,
                                     line,
+                                    receiver_chain: None,
                                 });
                             }
                         }
@@ -388,6 +393,7 @@ fn collect_rust_refs_and_bridges(
                                     qualifier: None,
                                     kind: EdgeKind::Calls,
                                     line,
+                                    receiver_chain: None,
                                 });
                             }
                         }
@@ -406,6 +412,7 @@ fn collect_rust_refs_and_bridges(
                                     qualifier: qual,
                                     kind: EdgeKind::Calls,
                                     line,
+                                    receiver_chain: None,
                                 });
                             }
                         }
@@ -425,6 +432,7 @@ fn collect_rust_refs_and_bridges(
                         qualifier: None,
                         kind: EdgeKind::TypeRef,
                         line,
+                        receiver_chain: None,
                     });
                 }
             }

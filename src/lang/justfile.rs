@@ -96,6 +96,7 @@ pub fn extract(rel_path: &str, src: &str, blake3_hex: String) -> Result<FileExtr
                     qualifier: None,
                     kind: EdgeKind::RecipeDep,
                     line: line_num,
+                    receiver_chain: None,
                 });
             }
             pending_private = false;
@@ -157,6 +158,7 @@ pub fn extract(rel_path: &str, src: &str, blake3_hex: String) -> Result<FileExtr
                                     qualifier: None,
                                     kind: EdgeKind::RecipeDep,
                                     line: start_line,
+                                    receiver_chain: None,
                                 });
                             }
                         }
@@ -208,6 +210,8 @@ pub fn extract(rel_path: &str, src: &str, blake3_hex: String) -> Result<FileExtr
         ir_funcs,
         interface_methods: std::collections::HashMap::new(),
         embedded_types: std::collections::HashMap::new(),
+        struct_fields: std::collections::HashMap::new(),
+        func_return_types: std::collections::HashMap::new(),
     })
 }
 

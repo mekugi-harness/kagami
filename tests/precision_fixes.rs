@@ -713,3 +713,453 @@ func main() {
         );
     }
 }
+
+#[test]
+fn test_go_chained_struct_embedded_and_cross_pkg_field_method_calls() {
+    let dir = TempDir::new().unwrap();
+    let root = dir.path();
+    fs::create_dir_all(root.join("internal/ui")).unwrap();
+    fs::create_dir_all(root.join("internal/launch")).unwrap();
+    fs::create_dir_all(root.join("cmd/app")).unwrap();
+
+    fs::write(root.join("go.mod"), "module demo\n\ngo 1.24\n").unwrap();
+
+    // Structs with overloaded method names (Update, Key, Render, Mouse)
+    // across single-hop, multi-hop, embedded field, slice/map, and return-value chains.
+    fs::write(
+        root.join("internal/ui/components.go"),
+        r#"package ui
+
+type BTWDock struct{}
+func (b *BTWDock) Update() { btwUpdateHelper() }
+func (b *BTWDock) Key()    { btwKeyHelper() }
+func (b *BTWDock) Render() { btwRenderHelper() }
+func btwUpdateHelper() {}
+func btwKeyHelper()    {}
+func btwRenderHelper() {}
+
+type Menu struct{}
+func (m *Menu) Update() { menuUpdateHelper() }
+func menuUpdateHelper() {}
+
+type Dialog struct{}
+func (d *Dialog) Key()   { dialogKeyHelper() }
+func (d *Dialog) Mouse() { dialogMouseHelper() }
+func dialogKeyHelper()   {}
+func dialogMouseHelper() {}
+
+type ContentDialog struct {
+	Dialog
+}
+func (d *ContentDialog) Key()   { d.Dialog.Key() }
+func (d *ContentDialog) Mouse() { d.Dialog.Mouse() }
+
+type Item struct{}
+func (i *Item) RenderIndexed() { itemIndexedHelper() }
+func (i *Item) RenderRanged()  { itemRangedHelper() }
+func itemIndexedHelper() {}
+func itemRangedHelper()  {}
+
+type Transcript struct{}
+func (t *Transcript) Render() { transcriptRenderHelper() }
+func transcriptRenderHelper() {}
+
+type Main struct {
+	BTW   *BTWDock
+	Menu  *Menu
+	Items []*Item
+}
+func (m *Main) Update() {
+	m.Menu.Update()
+	m.BTW.Update()
+}
+func (m *Main) Render() {
+	m.BTW.Render()
+	m.Items[0].RenderIndexed()
+	for _, it := range m.Items {
+		it.RenderRanged()
+	}
+}
+
+type Attachment struct {
+	Main *Main
+}
+
+type FrameInput struct {
+	Main   *Main
+	Dialog *ContentDialog
+}
+func (in FrameInput) displayedTranscript() *Transcript {
+	return &Transcript{}
+}
+func (in FrameInput) Handle(anyVal any) {
+	// Single-hop field calls
+	in.Dialog.Key()
+	in.Dialog.Mouse()
+	// Local var initialized from struct field, then chained field call
+	main, dlg := in.Main, in.Dialog
+	main.BTW.Key()
+	_ = dlg
+	// Direct field call on receiver
+	in.Main.Render()
+	// Method-return chain
+	in.displayedTranscript().Render()
+	// Type assertion chain
+	if cd, ok := anyVal.(*ContentDialog); ok {
+		cd.Dialog.Key()
+	}
+}
+
+func NewAttachment() *Attachment {
+	return &Attachment{Main: &Main{BTW: &BTWDock{}, Menu: &Menu{}}}
+}
+
+// Truly unused structs/methods (including overloaded names) MUST remain dead.
+type UnusedDock struct{}
+func (u *UnusedDock) Update() {}
+func (u *UnusedDock) Key()    {}
+func (u *UnusedDock) Render() {}
+
+type ComposerOperation struct{}
+func (c *ComposerOperation) ClientLocal() {}
+
+type NativeAnswers struct{}
+func (n *NativeAnswers) PublicAnswer() {}
+"#,
+    )
+    .unwrap();
+
+    // Cross-package struct field chain: r.terminal (type *ui.Attachment) -> u.Main.Update()
+    fs::write(
+        root.join("internal/launch/renderer.go"),
+        r#"package launch
+
+import "demo/internal/ui"
+
+type Renderer struct {
+	terminal *ui.Attachment
+}
+
+func (r *Renderer) Step() {
+	u := r.terminal
+	u.Main.Update()
+	// Function-return chain across packages
+	ui.NewAttachment().Main.Render()
+	in := ui.FrameInput{Main: u.Main, Dialog: &ui.ContentDialog{}}
+	in.Handle(nil)
+}
+
+func Run() {
+	r := &Renderer{terminal: ui.NewAttachment()}
+	r.Step()
+}
+"#,
+    )
+    .unwrap();
+
+    fs::write(
+        root.join("cmd/app/main.go"),
+        r#"package main
+
+import "demo/internal/launch"
+
+func main() {
+	launch.Run()
+}
+"#,
+    )
+    .unwrap();
+
+    let ignores = KagamiConfig::default().build_ignore_globset().unwrap();
+    let files = discover_files(root, &ignores, None).unwrap();
+    let graph = CodeGraph::build(root, &files, false).unwrap();
+    let dead = analyze_dead(
+        &graph,
+        &DeadOptions {
+            scope: DeadScope::Prod,
+            langs: None,
+            allowlist: Default::default(),
+            include_clusters: true,
+            path_filter: None,
+            min_confidence: Confidence::Heuristic,
+        },
+    );
+    let is_dead = |sym: &str| dead.symbols.iter().any(|s| s.symbol == sym);
+    let has_resolved_call = |from_qname: &str, to_qname: &str| {
+        graph.edges.iter().any(|e| {
+            e.kind == kagami::model::EdgeKind::Calls
+                && e.confidence == Confidence::Resolved
+                && graph
+                    .symbols
+                    .get(&e.from)
+                    .map(|s| s.qualified_name.as_str())
+                    == Some(from_qname)
+                && graph.symbols.get(&e.to).map(|s| s.qualified_name.as_str()) == Some(to_qname)
+        })
+    };
+
+    for (caller, callee) in [
+        ("Main.Update", "BTWDock.Update"),
+        ("Main.Update", "Menu.Update"),
+        ("Main.Render", "BTWDock.Render"),
+        ("Main.Render", "Item.RenderIndexed"),
+        ("Main.Render", "Item.RenderRanged"),
+        ("FrameInput.Handle", "ContentDialog.Key"),
+        ("FrameInput.Handle", "ContentDialog.Mouse"),
+        ("FrameInput.Handle", "BTWDock.Key"),
+        ("FrameInput.Handle", "Main.Render"),
+        ("FrameInput.Handle", "Transcript.Render"),
+        ("ContentDialog.Key", "Dialog.Key"),
+        ("ContentDialog.Mouse", "Dialog.Mouse"),
+        ("Renderer.Step", "Main.Update"),
+        ("Renderer.Step", "Main.Render"),
+    ] {
+        assert!(
+            has_resolved_call(caller, callee),
+            "Expected Resolved call edge {caller} -> {callee}"
+        );
+    }
+
+    for live_sym in [
+        "BTWDock.Update",
+        "BTWDock.Key",
+        "BTWDock.Render",
+        "btwUpdateHelper",
+        "btwKeyHelper",
+        "btwRenderHelper",
+        "Menu.Update",
+        "menuUpdateHelper",
+        "ContentDialog.Key",
+        "ContentDialog.Mouse",
+        "Dialog.Key",
+        "Dialog.Mouse",
+        "dialogKeyHelper",
+        "dialogMouseHelper",
+        "Main.Update",
+        "Main.Render",
+        "Item.RenderIndexed",
+        "Item.RenderRanged",
+        "itemIndexedHelper",
+        "itemRangedHelper",
+        "Transcript.Render",
+        "transcriptRenderHelper",
+    ] {
+        assert!(
+            !is_dead(live_sym),
+            "Expected {live_sym} to be resolved and live; dead={:?}",
+            dead.symbols
+        );
+    }
+
+    for dead_sym in [
+        "UnusedDock.Update",
+        "UnusedDock.Key",
+        "UnusedDock.Render",
+        "ComposerOperation.ClientLocal",
+        "NativeAnswers.PublicAnswer",
+    ] {
+        assert!(
+            is_dead(dead_sym),
+            "Expected truly unused {dead_sym} to remain dead; dead={:?}",
+            dead.symbols
+        );
+    }
+}
+
+#[test]
+fn test_go_receiver_chain_review_edge_cases() {
+    let dir = TempDir::new().unwrap();
+    let root = dir.path();
+    fs::create_dir_all(root.join("internal/cases")).unwrap();
+    fs::create_dir_all(root.join("cmd/app")).unwrap();
+
+    fs::write(root.join("go.mod"), "module demo\n\ngo 1.24\n").unwrap();
+
+    fs::write(
+        root.join("internal/cases/cases.go"),
+        r#"package cases
+
+import "time"
+
+// 1. var _, worker = pair() must preserve result index 1 for worker
+type First struct{}
+func (f *First) Run() {}
+
+type Second struct{}
+func (s *Second) Run() {}
+
+func pair() (*First, *Second) { return &First{}, &Second{} }
+
+// 2. Shadowed factory parameter must not resolve to package build()
+func build() *OldTarget { return &OldTarget{} }
+
+func useShadowedFactory(build func() interface{ Exec() }) {
+	build().Exec()
+}
+
+// 3. Shadowing local with unsupported type must mask outer receiver type
+type OuterCfg struct {
+	Worker *OuterWorker
+}
+
+func useShadowedCfg(cfg *OuterCfg) {
+	_ = cfg
+	fn := func(cfg struct{ Worker interface{ Work() } }) {
+		cfg.Worker.Work()
+	}
+	fn(struct{ Worker interface{ Work() } }{})
+}
+
+// 4. Explicit anonymous interface var must not lock to initializer's concrete type
+func useAnonIface() {
+	var runner interface{ Ping() } = ImplA{}
+	runner = ImplB{}
+	runner.Ping()
+}
+
+// 5. Blank field _ time.Time must not act as an external embed
+type BlankHolder struct {
+	_ time.Time
+}
+func (b *BlankHolder) UnusedReload() {}
+
+// 6. Callable field shadowing promoted method must block Base.Make
+type BaseFactory struct{}
+func (b *BaseFactory) Make() *First { return &First{} }
+
+type WrapperFactory struct {
+	BaseFactory
+	Make func() *Second
+}
+
+// 7. Range assignment (=) and same-block reused local (:=) preserve existing receiver types
+type Job struct{}
+func (j *Job) Process() {}
+
+func useRangeAndChan(jobs chan *Job) {
+	var job *Job
+	for job = range jobs {
+		job.Process()
+	}
+	job, ok := <-jobs
+	if ok {
+		job.Process()
+	}
+}
+
+func RunAll() {
+	var _, worker = pair()
+	worker.Run()
+	useShadowedFactory(func() interface{ Exec() } { return nil })
+	useShadowedCfg(&OuterCfg{})
+	useAnonIface()
+	_ = &BlankHolder{}
+	w := &WrapperFactory{}
+	_ = w.Make()
+	useRangeAndChan(nil)
+}
+"#,
+    )
+    .unwrap();
+
+    fs::write(
+        root.join("internal/cases/impls.go"),
+        r#"package cases
+
+type ImplA struct{}
+func (a ImplA) Ping() {}
+
+type ImplB struct{}
+func (b ImplB) Ping() {}
+
+type OldTarget struct{}
+func (o *OldTarget) Exec() {}
+
+type NewTarget struct{}
+func (n *NewTarget) Exec() {}
+
+type OuterWorker struct{}
+func (w *OuterWorker) Work() {}
+
+type InnerWorker struct{}
+func (w *InnerWorker) Work() {}
+"#,
+    )
+    .unwrap();
+
+    fs::write(
+        root.join("internal/cases/cases_test.go"),
+        r#"package cases
+
+func (s *Second) TestHelperMethod() {}
+
+func TestCallsHelper() {
+	s := &Second{}
+	s.TestHelperMethod()
+}
+"#,
+    )
+    .unwrap();
+
+    fs::write(
+        root.join("cmd/app/main.go"),
+        r#"package main
+
+import "demo/internal/cases"
+
+func main() {
+	cases.RunAll()
+}
+"#,
+    )
+    .unwrap();
+
+    let ignores = KagamiConfig::default().build_ignore_globset().unwrap();
+    let files = discover_files(root, &ignores, None).unwrap();
+    let graph = CodeGraph::build(root, &files, false).unwrap();
+    let dead = analyze_dead(
+        &graph,
+        &DeadOptions {
+            scope: DeadScope::Prod,
+            langs: None,
+            allowlist: Default::default(),
+            include_clusters: true,
+            path_filter: None,
+            min_confidence: Confidence::Heuristic,
+        },
+    );
+    let is_dead = |sym: &str| dead.symbols.iter().any(|s| s.symbol == sym);
+    let has_resolved_call = |from_qname: &str, to_qname: &str| {
+        graph.edges.iter().any(|e| {
+            e.kind == kagami::model::EdgeKind::Calls
+                && e.confidence == Confidence::Resolved
+                && graph
+                    .symbols
+                    .get(&e.from)
+                    .map(|s| s.qualified_name.as_str())
+                    == Some(from_qname)
+                && graph.symbols.get(&e.to).map(|s| s.qualified_name.as_str()) == Some(to_qname)
+        })
+    };
+
+    assert!(has_resolved_call("RunAll", "Second.Run"));
+    assert!(!has_resolved_call("RunAll", "First.Run"));
+    assert!(!has_resolved_call("RunAll", "BaseFactory.Make"));
+    assert!(!has_resolved_call("useShadowedFactory", "OldTarget.Exec"));
+    assert!(!has_resolved_call("useShadowedCfg", "OuterWorker.Work"));
+    assert!(!has_resolved_call("useAnonIface", "ImplA.Ping"));
+    assert!(has_resolved_call("useRangeAndChan", "Job.Process"));
+    assert!(has_resolved_call("TestCallsHelper", "Second.TestHelperMethod"));
+
+    for dead_sym in [
+        "First.Run",
+        "BlankHolder.UnusedReload",
+        "BaseFactory.Make",
+    ] {
+        assert!(
+            is_dead(dead_sym),
+            "Expected {dead_sym} to remain dead; dead={:?}",
+            dead.symbols
+        );
+    }
+}
