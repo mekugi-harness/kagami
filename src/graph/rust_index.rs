@@ -586,6 +586,7 @@ impl<'a> RustTypeIndex<'a> {
         symbols: &HashMap<String, Symbol>,
     ) -> Option<String> {
         let uses = self.file_all_uses.get(owner_file)?;
+        let mut resolved: Vec<String> = Vec::new();
         for u in uses {
             let scope_ok =
                 u.mod_scope == caller_scope || (include_root_uses && u.mod_scope.is_empty());
@@ -595,8 +596,7 @@ impl<'a> RustTypeIndex<'a> {
                 && let Some((mod_path, target_sym)) = u.target_path.rsplit_once("::")
             {
                 if mod_path == "super" && !u.mod_scope.is_empty() {
-                    let parent_scope =
-                        u.mod_scope.rsplit_once("::").map(|(p, _)| p).unwrap_or("");
+                    let parent_scope = u.mod_scope.rsplit_once("::").map(|(p, _)| p).unwrap_or("");
                     if let Some(ids) = self.file_non_method_syms.get(&(owner_file, target_sym)) {
                         let hits: Vec<&String> = ids
                             .iter()
@@ -619,7 +619,8 @@ impl<'a> RustTypeIndex<'a> {
                             })
                             .collect();
                         if hits.len() == 1 {
-                            return Some(hits[0].clone());
+                            push_unique(&mut resolved, hits[0].clone());
+                            continue;
                         }
                     }
                 }
@@ -636,11 +637,15 @@ impl<'a> RustTypeIndex<'a> {
                     &mut hits,
                 );
                 if hits.len() == 1 {
-                    return Some(hits.remove(0));
+                    push_unique(&mut resolved, hits.remove(0));
                 }
             }
         }
-        None
+        if resolved.len() == 1 {
+            resolved.pop()
+        } else {
+            None
+        }
     }
 
     fn unwrap_type_alias(
