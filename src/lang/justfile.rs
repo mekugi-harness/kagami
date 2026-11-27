@@ -206,6 +206,8 @@ pub fn extract(rel_path: &str, src: &str, blake3_hex: String) -> Result<FileExtr
         refs,
         bridges,
         ir_funcs,
+        interface_methods: std::collections::HashMap::new(),
+        embedded_types: std::collections::HashMap::new(),
     })
 }
 

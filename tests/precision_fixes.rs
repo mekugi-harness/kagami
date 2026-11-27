@@ -312,3 +312,261 @@ fn test_review_fixes_js_specifier_default_list_and_external_default() {
     assert!(!has("src/wrapped.ts", "wrappedRun"), "export default (wrappedRun) must keep wrappedRun alive");
     assert!(has("src/unused_def.ts", "unusedLegacy"), "external default import must not keep unrelated local default export alive");
 }
+
+#[test]
+fn test_go_function_values_not_flagged_dead() {
+    let dir = TempDir::new().unwrap();
+    let root = dir.path();
+    fs::create_dir_all(root.join("cmd/app")).unwrap();
+    fs::create_dir_all(root.join("internal/execscope")).unwrap();
+
+    fs::write(
+        root.join("internal/execscope/handlers.go"),
+        r#"package execscope
+
+type Painter struct {
+	ActionLink func(string) string
+}
+
+func commandRunLink(s string) string { return s }
+func readInterpreterFile(p string) string { return p }
+func gnuSedArguments(a string) string { return a }
+func bsdSedArguments(a string) string { return a }
+func varDefaultHandler(a string) string { return a }
+func retHandler(a string) string { return a }
+func sliceHandlerA(a string) string { return a }
+func sliceHandlerB(a string) string { return a }
+func neverUsedFn(a string) string { return a }
+func shadowedDeadFn(a string) string { return a }
+
+var defaultHandler = varDefaultHandler
+
+func pickReturned() func(string) string {
+	return retHandler
+}
+
+func Run(useBSD bool) string {
+	var p Painter
+	p.ActionLink = commandRunLink
+	read := readInterpreterFile
+	parse := gnuSedArguments
+	if useBSD {
+		parse = bsdSedArguments
+	}
+	fns := []func(string) string{sliceHandlerA, sliceHandlerB}
+	shadowedDeadFn := "local string, not the function"
+	_ = shadowedDeadFn
+	r := pickReturned()
+	return p.ActionLink(read(parse(defaultHandler(r(fns[0]("x"))))))
+}
+"#,
+    )
+    .unwrap();
+
+    fs::write(
+        root.join("cmd/app/main.go"),
+        r#"package main
+
+import "demo/internal/execscope"
+
+func main() {
+	_ = execscope.Run(true)
+}
+"#,
+    )
+    .unwrap();
+
+    let ignores = KagamiConfig::default().build_ignore_globset().unwrap();
+    let files = discover_files(root, &ignores, None).unwrap();
+    let graph = CodeGraph::build(root, &files, false).unwrap();
+    let dead = analyze_dead(
+        &graph,
+        &DeadOptions {
+            scope: DeadScope::Prod,
+            langs: None,
+            allowlist: Default::default(),
+            include_clusters: true,
+            path_filter: None,
+            min_confidence: Confidence::Heuristic,
+        },
+    );
+    let is_dead = |sym: &str| dead.symbols.iter().any(|s| s.symbol == sym);
+
+    for live_fn in [
+        "commandRunLink",
+        "readInterpreterFile",
+        "gnuSedArguments",
+        "bsdSedArguments",
+        "varDefaultHandler",
+        "retHandler",
+        "sliceHandlerA",
+        "sliceHandlerB",
+    ] {
+        assert!(
+            !is_dead(live_fn),
+            "Go function value {live_fn} must not be flagged dead; dead={:?}",
+            dead.symbols
+        );
+    }
+    assert!(
+        is_dead("neverUsedFn"),
+        "truly unused Go function must still be flagged dead"
+    );
+    assert!(
+        is_dead("shadowedDeadFn"),
+        "shadowed local variable must not keep dead function with same name alive"
+    );
+}
+
+#[test]
+fn test_go_interface_and_embedded_overrides_reachability() {
+    let dir = TempDir::new().unwrap();
+    let root = dir.path();
+    fs::create_dir_all(root.join("cmd/app")).unwrap();
+    fs::create_dir_all(root.join("internal/srv")).unwrap();
+
+    fs::write(
+        root.join("internal/srv/srv.go"),
+        r#"package srv
+
+import (
+	"net/http"
+	"sync"
+	"extparser/parser"
+)
+
+type Connector struct{}
+
+func (c *Connector) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	c.resource()
+	refuse(w)
+}
+
+func (c *Connector) resource() {}
+func refuse(w http.ResponseWriter) {}
+
+type InputError struct{ msg string }
+func (e *InputError) Error() string { return formatErr(e.msg) }
+func (e *InputError) Unwrap() error { return nil }
+func formatErr(s string) string { return s }
+
+type DeadError struct{}
+func (e *DeadError) Error() string { return deadErrHelper() }
+func deadErrHelper() string { return "" }
+
+type copyQuoteParser struct {
+	parser.BlockParser
+}
+
+func (p *copyQuoteParser) Continue() int { return quoteHelper() }
+func quoteHelper() int { return 1 }
+
+type LockedCache struct {
+	sync.Mutex
+}
+
+func (c *LockedCache) UnusedCacheMethod() {}
+
+type Source interface {
+	ActivityFacts() int
+}
+
+type UnusedIface interface {
+	Ghost() int
+}
+
+type Entry struct{}
+
+func (e Entry) ActivityFacts() int { return entryHelper() }
+func (e Entry) Ghost() int { return 0 }
+func entryHelper() int { return 42 }
+
+type NativeAnswers struct{}
+
+func (a NativeAnswers) PublicAnswer() string { return "unused" }
+
+type SortItems []int
+func (s SortItems) Len() int { return len(s) }
+func (s SortItems) Less(i, j int) bool { return s[i] < s[j] }
+func (s SortItems) Swap(i, j int) { s[i], s[j] = s[j], s[i] }
+
+func Render(s Source) int { return s.ActivityFacts() }
+
+func Start() {
+	var _ http.Handler = &Connector{}
+	_ = &InputError{msg: "bad"}
+	_ = &copyQuoteParser{}
+	_ = &LockedCache{}
+	_ = NativeAnswers{}
+	_ = SortItems{1, 2}
+	_ = Render(Entry{})
+}
+"#,
+    )
+    .unwrap();
+
+    fs::write(
+        root.join("cmd/app/main.go"),
+        r#"package main
+
+import "demo/internal/srv"
+
+func main() {
+	srv.Start()
+}
+"#,
+    )
+    .unwrap();
+
+    let ignores = KagamiConfig::default().build_ignore_globset().unwrap();
+    let files = discover_files(root, &ignores, None).unwrap();
+    let graph = CodeGraph::build(root, &files, false).unwrap();
+    let dead = analyze_dead(
+        &graph,
+        &DeadOptions {
+            scope: DeadScope::Prod,
+            langs: None,
+            allowlist: Default::default(),
+            include_clusters: true,
+            path_filter: None,
+            min_confidence: Confidence::Heuristic,
+        },
+    );
+    let is_dead = |sym: &str| dead.symbols.iter().any(|s| s.symbol == sym);
+
+    for live_sym in [
+        "Connector.ServeHTTP",
+        "Connector.resource",
+        "refuse",
+        "InputError.Error",
+        "InputError.Unwrap",
+        "formatErr",
+        "copyQuoteParser.Continue",
+        "quoteHelper",
+        "Entry.ActivityFacts",
+        "entryHelper",
+        "SortItems.Len",
+        "SortItems.Less",
+        "SortItems.Swap",
+    ] {
+        assert!(
+            !is_dead(live_sym),
+            "Expected {live_sym} to be live via interface/embedded reachability; dead={:?}",
+            dead.symbols
+        );
+    }
+
+    for dead_sym in [
+        "DeadError.Error",
+        "deadErrHelper",
+        "LockedCache.UnusedCacheMethod",
+        "Entry.Ghost",
+        "NativeAnswers.PublicAnswer",
+    ] {
+        assert!(
+            is_dead(dead_sym),
+            "Expected {dead_sym} to remain dead; dead={:?}",
+            dead.symbols
+        );
+    }
+}

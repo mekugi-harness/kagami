@@ -5,7 +5,9 @@ pub mod scip;
 
 use crate::cache::{CacheData, CacheStore, PARSER_VERSION};
 use crate::lang;
-use crate::model::{Confidence, Edge, EdgeKind, FileExtract, Language, Symbol, SymbolKind};
+use crate::model::{
+    Confidence, Edge, EdgeKind, FileExtract, Language, Symbol, SymbolKind, Visibility,
+};
 use crate::walker::DiscoveredFile;
 use anyhow::Result;
 use rayon::prelude::*;
@@ -13,12 +15,22 @@ use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::path::Path;
 
+/// Conditional interface dispatch link: when both `receiver_type_id` and `interface_id`
+/// are reachable, the implementing methods in `method_ids` become reachable.
+#[derive(Debug, Clone)]
+pub struct InterfaceImpl {
+    pub receiver_type_id: String,
+    pub interface_id: String,
+    pub method_ids: Vec<String>,
+}
+
 pub struct CodeGraph {
     pub extracts: Vec<FileExtract>,
     pub symbols: HashMap<String, Symbol>,
     pub edges: Vec<Edge>,
     pub outgoing: HashMap<String, Vec<usize>>,
     pub incoming: HashMap<String, Vec<usize>>,
+    pub interface_impls: Vec<InterfaceImpl>,
 }
 
 impl CodeGraph {
@@ -126,19 +138,9 @@ impl CodeGraph {
         let mut seen: HashSet<(String, String, EdgeKind)> = HashSet::new();
 
         for ext in &extracts {
-            let mut alias_map: HashMap<&str, &str> = HashMap::new();
+            let alias_map = build_import_alias_map(&ext.imports);
             let mut rel_import_paths: HashSet<String> = HashSet::new();
             for imp in &ext.imports {
-                if let Some((alias, path)) = imp.split_once('=') {
-                    alias_map.insert(alias, path);
-                } else if let Some(last) = imp.rsplit('/').next() {
-                    alias_map.insert(last, imp.as_str());
-                    if last.starts_with('v') && last[1..].chars().all(|c| c.is_ascii_digit()) {
-                        if let Some(prev) = imp.rsplit('/').nth(1) {
-                            alias_map.insert(prev, imp.as_str());
-                        }
-                    }
-                }
                 if matches!(
                     ext.lang,
                     Language::TypeScript | Language::JavaScript | Language::Svelte
@@ -192,6 +194,8 @@ impl CodeGraph {
         }
 
         bridges::materialize_bridges(&extracts, &symbols, &mut edges);
+        let interface_impls =
+            materialize_go_interface_edges(&extracts, &symbols, &by_pkg_name, &mut edges, &mut seen);
 
         let mut outgoing: HashMap<String, Vec<usize>> = HashMap::new();
         let mut incoming: HashMap<String, Vec<usize>> = HashMap::new();
@@ -206,8 +210,415 @@ impl CodeGraph {
             edges,
             outgoing,
             incoming,
+            interface_impls,
         }
     }
+}
+
+fn is_go_stdlib_interface_method(name: &str) -> bool {
+    matches!(
+        name,
+        // error / errors
+        "Error"
+            | "Unwrap"
+            | "Is"
+            | "As"
+            // fmt
+            | "String"
+            | "GoString"
+            | "Format"
+            | "Scan"
+            // encoding / json / text / binary / xml / gob / yaml
+            | "MarshalJSON"
+            | "UnmarshalJSON"
+            | "MarshalText"
+            | "UnmarshalText"
+            | "MarshalBinary"
+            | "UnmarshalBinary"
+            | "MarshalXML"
+            | "UnmarshalXML"
+            | "MarshalXMLAttr"
+            | "UnmarshalXMLAttr"
+            | "GobEncode"
+            | "GobDecode"
+            | "MarshalYAML"
+            | "UnmarshalYAML"
+            // io
+            | "Read"
+            | "Write"
+            | "Close"
+            | "ReadFrom"
+            | "WriteTo"
+            | "ReadAt"
+            | "WriteAt"
+            | "Seek"
+            | "ReadByte"
+            | "UnreadByte"
+            | "ReadRune"
+            | "UnreadRune"
+            | "WriteByte"
+            | "WriteString"
+            // net/http
+            | "ServeHTTP"
+            | "RoundTrip"
+            | "Flush"
+            | "Hijack"
+            // log/slog
+            | "LogValue"
+    )
+}
+
+fn is_go_concrete_utility_embed(embed: &str) -> bool {
+    matches!(
+        embed,
+        "sync.Mutex"
+            | "sync.RWMutex"
+            | "sync.WaitGroup"
+            | "sync.Once"
+            | "sync.Cond"
+            | "sync.Pool"
+            | "sync.Map"
+            | "bytes.Buffer"
+            | "strings.Builder"
+            | "atomic.Int32"
+            | "atomic.Int64"
+            | "atomic.Uint32"
+            | "atomic.Uint64"
+            | "atomic.Bool"
+            | "atomic.Value"
+            | "embed.FS"
+            | "testing.T"
+            | "testing.B"
+            | "testing.F"
+    )
+}
+
+fn build_import_alias_map<'a>(imports: &'a [String]) -> HashMap<&'a str, &'a str> {
+    let mut alias_map: HashMap<&'a str, &'a str> = HashMap::new();
+    for imp in imports {
+        if let Some((alias, path)) = imp.split_once('=') {
+            alias_map.insert(alias, path);
+        } else if let Some(last) = imp.rsplit('/').next() {
+            alias_map.insert(last, imp.as_str());
+            if last.starts_with('v')
+                && last[1..].chars().all(|c| c.is_ascii_digit())
+                && let Some(prev) = imp.rsplit('/').nth(1)
+            {
+                alias_map.insert(prev, imp.as_str());
+            }
+        }
+    }
+    alias_map
+}
+
+fn resolve_go_local_type(
+    owner: &Symbol,
+    embed_name: &str,
+    file_aliases: &HashMap<&str, HashMap<&str, &str>>,
+    go_types_by_pkg_name: &HashMap<(&str, &str), String>,
+    by_pkg_name: &HashMap<(Language, &str, &str), Vec<String>>,
+    symbols: &HashMap<String, Symbol>,
+) -> Option<String> {
+    if let Some((pkg_alias, type_name)) = embed_name.split_once('.') {
+        let alias_map = file_aliases.get(owner.file.as_str())?;
+        let imp_path = alias_map.get(pkg_alias).copied()?;
+        for pkg_key in pkg_keys_for_import(imp_path, Some(pkg_alias)) {
+            if let Some(ids) = by_pkg_name.get(&(Language::Go, pkg_key, type_name)) {
+                for id in ids {
+                    if let Some(s) = symbols.get(id)
+                        && matches!(
+                            s.kind,
+                            SymbolKind::Struct | SymbolKind::Interface | SymbolKind::Type
+                        )
+                    {
+                        let dir = s.file.rsplit_once('/').map(|(d, _)| d).unwrap_or("");
+                        if import_path_matches_dir(imp_path, dir) {
+                            return Some(id.clone());
+                        }
+                    }
+                }
+            }
+        }
+        None
+    } else {
+        go_types_by_pkg_name
+            .get(&(owner.package_or_module.as_str(), embed_name))
+            .cloned()
+    }
+}
+
+fn materialize_go_interface_edges(
+    extracts: &[FileExtract],
+    symbols: &HashMap<String, Symbol>,
+    by_pkg_name: &HashMap<(Language, &str, &str), Vec<String>>,
+    edges: &mut Vec<Edge>,
+    seen: &mut HashSet<(String, String, EdgeKind)>,
+) -> Vec<InterfaceImpl> {
+    let mut go_types_by_pkg_name: HashMap<(&str, &str), String> = HashMap::new();
+    let mut go_methods_by_type: HashMap<String, HashMap<String, String>> = HashMap::new();
+    let mut raw_iface_methods: HashMap<String, Vec<String>> = HashMap::new();
+    let mut raw_embeds: HashMap<String, Vec<String>> = HashMap::new();
+    let mut file_aliases: HashMap<&str, HashMap<&str, &str>> = HashMap::new();
+
+    for ext in extracts {
+        if ext.lang != Language::Go {
+            continue;
+        }
+        file_aliases.insert(ext.file.as_str(), build_import_alias_map(&ext.imports));
+        for (k, v) in &ext.interface_methods {
+            raw_iface_methods.insert(k.clone(), v.clone());
+        }
+        for (k, v) in &ext.embedded_types {
+            raw_embeds.insert(k.clone(), v.clone());
+        }
+        for sym in &ext.symbols {
+            if matches!(
+                sym.kind,
+                SymbolKind::Struct | SymbolKind::Interface | SymbolKind::Type
+            ) {
+                go_types_by_pkg_name
+                    .entry((sym.package_or_module.as_str(), sym.name.as_str()))
+                    .or_insert_with(|| sym.id.clone());
+            }
+        }
+    }
+
+    for sym in symbols.values() {
+        if sym.lang != Language::Go || sym.kind != SymbolKind::Method {
+            continue;
+        }
+        if let Some((recv_type, _)) = sym.qualified_name.split_once('.')
+            && let Some(type_id) =
+                go_types_by_pkg_name.get(&(sym.package_or_module.as_str(), recv_type))
+        {
+            go_methods_by_type
+                .entry(type_id.clone())
+                .or_default()
+                .insert(sym.name.clone(), sym.id.clone());
+        }
+    }
+
+    // Resolve transitive method sets for local Go interfaces (including embedded local interfaces).
+    let mut iface_method_sets: HashMap<String, HashSet<String>> = HashMap::new();
+    for sym in symbols.values() {
+        if sym.lang != Language::Go || sym.kind != SymbolKind::Interface {
+            continue;
+        }
+        let mut methods: HashSet<String> = HashSet::new();
+        let mut visited: HashSet<String> = HashSet::new();
+        let mut stack = vec![sym.id.clone()];
+        while let Some(curr_id) = stack.pop() {
+            if !visited.insert(curr_id.clone()) {
+                continue;
+            }
+            if let Some(ms) = raw_iface_methods.get(&curr_id) {
+                for m in ms {
+                    methods.insert(m.clone());
+                }
+            }
+            if let (Some(owner), Some(embeds)) = (symbols.get(&curr_id), raw_embeds.get(&curr_id)) {
+                for emb in embeds {
+                    if let Some(target_id) = resolve_go_local_type(
+                        owner,
+                        emb,
+                        &file_aliases,
+                        &go_types_by_pkg_name,
+                        by_pkg_name,
+                        symbols,
+                    ) && symbols
+                            .get(&target_id)
+                            .map(|s| s.kind == SymbolKind::Interface)
+                            .unwrap_or(false)
+                    {
+                        stack.push(target_id);
+                    }
+                }
+            }
+        }
+        if !methods.is_empty() {
+            iface_method_sets.insert(sym.id.clone(), methods);
+        }
+    }
+
+    let mut push_impl_edge = |type_id: &str, method_id: &str, conf: Confidence| {
+        if seen.insert((
+            type_id.to_string(),
+            method_id.to_string(),
+            EdgeKind::Implements,
+        )) {
+            let (file, line) = symbols
+                .get(method_id)
+                .map(|s| (s.file.clone(), s.span.start_line))
+                .unwrap_or_default();
+            edges.push(Edge {
+                from: type_id.to_string(),
+                to: method_id.to_string(),
+                kind: EdgeKind::Implements,
+                confidence: conf,
+                file,
+                line,
+                cross_lang: false,
+                via_bridge: None,
+            });
+        }
+    };
+
+    // 1. Stdlib / built-in interface methods & embedded-interface overrides
+    for (type_id, methods) in &go_methods_by_type {
+        let has_sort = methods.contains_key("Len")
+            && methods.contains_key("Less")
+            && methods.contains_key("Swap");
+        let has_heap = has_sort && methods.contains_key("Push") && methods.contains_key("Pop");
+        let has_flag_value = methods.contains_key("String") && methods.contains_key("Set");
+        let has_response_writer = methods.contains_key("Header")
+            && methods.contains_key("Write")
+            && methods.contains_key("WriteHeader");
+
+        for (m_name, m_id) in methods {
+            let is_stdlib = is_go_stdlib_interface_method(m_name)
+                || (has_sort && matches!(m_name.as_str(), "Len" | "Less" | "Swap"))
+                || (has_heap && matches!(m_name.as_str(), "Push" | "Pop"))
+                || (has_flag_value && m_name == "Set")
+                || (has_response_writer && matches!(m_name.as_str(), "Header" | "WriteHeader"));
+            if is_stdlib {
+                push_impl_edge(type_id, m_id, Confidence::Resolved);
+            }
+        }
+
+        // Embedded interfaces/types on structs
+        if let (Some(owner), Some(embeds)) = (symbols.get(type_id), raw_embeds.get(type_id))
+            && owner.kind == SymbolKind::Struct
+        {
+            let mut has_external_embed = false;
+            let mut embedded_local_iface_methods: HashSet<String> = HashSet::new();
+            for emb in embeds {
+                if let Some(target_id) = resolve_go_local_type(
+                    owner,
+                    emb,
+                    &file_aliases,
+                    &go_types_by_pkg_name,
+                    by_pkg_name,
+                    symbols,
+                ) {
+                    if let Some(ms) = iface_method_sets.get(&target_id) {
+                        embedded_local_iface_methods.extend(ms.iter().cloned());
+                    }
+                } else if !is_go_concrete_utility_embed(emb) {
+                    has_external_embed = true;
+                }
+            }
+            for (m_name, m_id) in methods {
+                if embedded_local_iface_methods.contains(m_name) {
+                    push_impl_edge(type_id, m_id, Confidence::Resolved);
+                } else if has_external_embed
+                    && symbols
+                        .get(m_id)
+                        .map(|s| s.visibility == Visibility::Public)
+                        .unwrap_or(false)
+                {
+                    push_impl_edge(type_id, m_id, Confidence::Heuristic);
+                }
+            }
+        }
+    }
+
+    // 2. Local repo interface structural satisfaction (conditional RTA in dead.rs)
+    // Compute effective method set per concrete Go type (own methods + promoted from local embedded structs).
+    let mut effective_methods_by_type: HashMap<String, HashSet<String>> = HashMap::new();
+    for (type_id, own_methods) in &go_methods_by_type {
+        let mut eff: HashSet<String> = own_methods.keys().cloned().collect();
+        let mut visited: HashSet<String> = HashSet::new();
+        let mut stack = vec![type_id.clone()];
+        while let Some(curr_id) = stack.pop() {
+            if !visited.insert(curr_id.clone()) {
+                continue;
+            }
+            if let Some(ms) = go_methods_by_type.get(&curr_id) {
+                eff.extend(ms.keys().cloned());
+            }
+            if let (Some(owner), Some(embeds)) = (symbols.get(&curr_id), raw_embeds.get(&curr_id)) {
+                for emb in embeds {
+                    if let Some(target_id) = resolve_go_local_type(
+                        owner,
+                        emb,
+                        &file_aliases,
+                        &go_types_by_pkg_name,
+                        by_pkg_name,
+                        symbols,
+                    ) {
+                        if let Some(ms) = iface_method_sets.get(&target_id) {
+                            eff.extend(ms.iter().cloned());
+                        } else {
+                            stack.push(target_id);
+                        }
+                    }
+                }
+            }
+        }
+        effective_methods_by_type.insert(type_id.clone(), eff);
+    }
+
+    let mut types_by_method: HashMap<&str, Vec<&str>> = HashMap::new();
+    for (type_id, eff) in &effective_methods_by_type {
+        for m in eff {
+            types_by_method
+                .entry(m.as_str())
+                .or_default()
+                .push(type_id.as_str());
+        }
+    }
+
+    let mut interface_impls = Vec::new();
+    for (iface_id, iface_methods) in &iface_method_sets {
+        let Some(iface_sym) = symbols.get(iface_id) else {
+            continue;
+        };
+        let has_unexported = iface_methods
+            .iter()
+            .any(|m| m.chars().next().is_some_and(|c| !c.is_ascii_uppercase()));
+        // Start from the rarest method in the interface for fast candidate pruning.
+        let Some(rarest_method) = iface_methods
+            .iter()
+            .min_by_key(|m| types_by_method.get(m.as_str()).map(|v| v.len()).unwrap_or(0))
+        else {
+            continue;
+        };
+        let Some(candidates) = types_by_method.get(rarest_method.as_str()) else {
+            continue;
+        };
+        for &type_id in candidates {
+            let Some(type_sym) = symbols.get(type_id) else {
+                continue;
+            };
+            if type_sym.kind == SymbolKind::Interface {
+                continue;
+            }
+            if has_unexported && type_sym.package_or_module != iface_sym.package_or_module {
+                continue;
+            }
+            let Some(eff) = effective_methods_by_type.get(type_id) else {
+                continue;
+            };
+            if !iface_methods.iter().all(|m| eff.contains(m)) {
+                continue;
+            }
+            if let Some(own_methods) = go_methods_by_type.get(type_id) {
+                let method_ids: Vec<String> = iface_methods
+                    .iter()
+                    .filter_map(|m| own_methods.get(m).cloned())
+                    .collect();
+                if !method_ids.is_empty() {
+                    interface_impls.push(InterfaceImpl {
+                        receiver_type_id: type_id.to_string(),
+                        interface_id: iface_id.clone(),
+                        method_ids,
+                    });
+                }
+            }
+        }
+    }
+
+    interface_impls
 }
 
 #[allow(clippy::too_many_arguments)]
