@@ -70,7 +70,7 @@ fn desugar_node(node: IrNode) -> IrNode {
             if let Some(mb) = try_lift_if_chain_to_multibranch(&cond, &then_br, else_br.as_ref()) {
                 return mb;
             }
-            if is_err_check(&cond) && else_br.is_none() && is_return_only(&then_br) {
+            if is_err_check(&cond) && else_br.is_none() && is_err_return(&then_br) {
                 return IrNode::PropagateErr(Box::new(IrNode::Var("err".into())));
             }
             IrNode::Branch {
@@ -199,6 +199,19 @@ fn is_return_only(node: &IrNode) -> bool {
         IrNode::Seq(items) => items.len() == 1 && matches!(items[0], IrNode::Return(_)),
         _ => false,
     }
+}
+
+fn is_err_return(node: &IrNode) -> bool {
+    fn contains_err(n: &IrNode) -> bool {
+        match n {
+            IrNode::Var(v) => v == "err",
+            IrNode::Return(Some(inner)) => contains_err(inner),
+            IrNode::Seq(items) => items.iter().any(contains_err),
+            IrNode::Call { args, .. } => args.iter().any(contains_err),
+            _ => false,
+        }
+    }
+    is_return_only(node) && contains_err(node)
 }
 
 fn extract_eq_scrutinee<'a>(cond: &'a IrNode) -> Option<(&'a IrNode, &'a IrNode)> {

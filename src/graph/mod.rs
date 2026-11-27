@@ -50,6 +50,7 @@ impl CodeGraph {
         if use_cache {
             let mut next_cache = prev_cache;
             next_cache.version = PARSER_VERSION;
+            next_cache.files.retain(|rel, _| root.join(rel).exists());
             for ext in &extracts {
                 next_cache.files.insert(ext.file.clone(), ext.clone());
             }

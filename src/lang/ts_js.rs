@@ -59,7 +59,14 @@ pub fn extract(
         for ch in root.children(&mut rc) {
             if matches!(
                 ch.kind(),
-                "expression_statement" | "if_statement" | "for_statement" | "for_in_statement" | "while_statement" | "try_statement"
+                "expression_statement"
+                    | "if_statement"
+                    | "for_statement"
+                    | "for_in_statement"
+                    | "while_statement"
+                    | "try_statement"
+                    | "lexical_declaration"
+                    | "variable_declaration"
             ) {
                 has_top_level_exec = true;
                 collect_ts_refs_and_bridges(ch, src, line_offset, &mod_id, &mut refs, &mut bridges);
@@ -80,7 +87,7 @@ pub fn extract(
             },
             visibility: Visibility::Public,
             is_test: is_test_file,
-            is_entrypoint: true,
+            is_entrypoint: lang != Language::Svelte,
             is_dynamic_candidate: false,
             package_or_module: rel_path.to_string(),
         });
