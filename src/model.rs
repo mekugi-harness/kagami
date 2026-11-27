@@ -214,9 +214,9 @@ pub struct FileExtract {
     /// Macro invocations inside impl Type blocks: (impl_type_name, macro_name, line).
     #[serde(default)]
     pub impl_macros: Vec<(String, String, usize)>,
-    /// Symbol IDs of non-test #[cfg(...)]-gated definitions for sibling propagation.
+    /// Non-test #[cfg(...)]-gated symbol ID -> inline module scope path for sibling propagation.
     #[serde(default)]
-    pub cfg_gated_symbols: Vec<String>,
+    pub cfg_gated_symbols: HashMap<String, String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

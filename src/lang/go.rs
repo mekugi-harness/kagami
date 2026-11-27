@@ -353,7 +353,7 @@ pub fn extract(rel_path: &str, src: &str, blake3_hex: String) -> Result<FileExtr
         func_return_types,
         trait_impls: Vec::new(),
         impl_macros: Vec::new(),
-        cfg_gated_symbols: Vec::new(),
+        cfg_gated_symbols: HashMap::new(),
     })
 }
 

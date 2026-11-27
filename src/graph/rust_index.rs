@@ -12,10 +12,12 @@ pub struct RustTypeIndex<'a> {
     traits_by_file_name: HashMap<(&'a str, &'a str), String>,
     traits_by_pkg_name: HashMap<(&'a str, &'a str), String>,
     traits_by_name: HashMap<&'a str, Vec<String>>,
-    methods_by_type: HashMap<String, HashMap<String, Vec<String>>>,
+    inherent_methods_by_type: HashMap<String, HashMap<String, Vec<String>>>,
+    trait_methods_by_type: HashMap<String, HashMap<String, Vec<String>>>,
     test_methods_by_type: HashMap<String, HashMap<String, Vec<String>>>,
     raw_struct_fields: HashMap<String, HashMap<String, String>>,
-    deref_targets: HashMap<String, Vec<String>>,
+    /// Wrapper type ID -> already-resolved Deref target type IDs (resolved in impl Deref scope).
+    deref_target_ids: HashMap<String, Vec<String>>,
     func_return_types: HashMap<String, Vec<String>>,
     pub trait_methods: HashMap<String, HashSet<String>>,
     cfg_sibling_groups: HashMap<String, Vec<String>>,
@@ -35,7 +37,8 @@ impl<'a> RustTypeIndex<'a> {
             HashMap::new();
         let mut func_return_types: HashMap<String, Vec<String>> = HashMap::new();
         let mut trait_methods: HashMap<String, HashSet<String>> = HashMap::new();
-        let mut cfg_gated_set: HashSet<&str> = HashSet::new();
+        let mut trait_method_ids: HashSet<&str> = HashSet::new();
+        let mut cfg_gated_scopes: HashMap<&str, &str> = HashMap::new();
 
         for ext in extracts {
             if ext.lang != Language::Rust {
@@ -57,8 +60,13 @@ impl<'a> RustTypeIndex<'a> {
             for (k, v) in &ext.interface_methods {
                 trait_methods.insert(k.clone(), v.iter().cloned().collect());
             }
-            for id in &ext.cfg_gated_symbols {
-                cfg_gated_set.insert(id.as_str());
+            for imp in &ext.trait_impls {
+                for mid in &imp.method_ids {
+                    trait_method_ids.insert(mid.as_str());
+                }
+            }
+            for (id, scope) in &ext.cfg_gated_symbols {
+                cfg_gated_scopes.insert(id.as_str(), scope.as_str());
             }
             for sym in &ext.symbols {
                 if matches!(
@@ -99,24 +107,32 @@ impl<'a> RustTypeIndex<'a> {
             traits_by_file_name,
             traits_by_pkg_name,
             traits_by_name,
-            methods_by_type: HashMap::new(),
+            inherent_methods_by_type: HashMap::new(),
+            trait_methods_by_type: HashMap::new(),
             test_methods_by_type: HashMap::new(),
             raw_struct_fields,
-            deref_targets: HashMap::new(),
+            deref_target_ids: HashMap::new(),
             func_return_types,
             trait_methods,
             cfg_sibling_groups: HashMap::new(),
         };
 
-        // Resolve Deref targets onto concrete type IDs.
+        // Resolve Deref targets in the impl Deref block's own module scope.
         for ((file, pkg, type_name), targets) in raw_deref_by_name {
             let imps = idx.file_imports.get(file).copied().unwrap_or(&[]);
             if let Some(tid) = idx.resolve_type(file, pkg, imps, &type_name, symbols) {
-                idx.deref_targets.entry(tid).or_default().extend(targets);
+                for tname in targets {
+                    if let Some(target_id) = idx.resolve_type(file, pkg, imps, &tname, symbols) {
+                        let entry = idx.deref_target_ids.entry(tid.clone()).or_default();
+                        if !entry.contains(&target_id) {
+                            entry.push(target_id);
+                        }
+                    }
+                }
             }
         }
 
-        // Index Rust methods onto their owning concrete types.
+        // Index Rust methods onto their owning concrete types, separating inherent vs trait methods.
         for sym in symbols.values() {
             if sym.lang != Language::Rust || sym.kind != SymbolKind::Method {
                 continue;
@@ -138,8 +154,15 @@ impl<'a> RustTypeIndex<'a> {
                             .entry(sym.name.clone())
                             .or_default()
                             .push(sym.id.clone());
+                    } else if trait_method_ids.contains(sym.id.as_str()) {
+                        idx.trait_methods_by_type
+                            .entry(type_id)
+                            .or_default()
+                            .entry(sym.name.clone())
+                            .or_default()
+                            .push(sym.id.clone());
                     } else {
-                        idx.methods_by_type
+                        idx.inherent_methods_by_type
                             .entry(type_id)
                             .or_default()
                             .entry(sym.name.clone())
@@ -150,21 +173,24 @@ impl<'a> RustTypeIndex<'a> {
             }
         }
 
-        // Group #[cfg(...)] sibling definitions sharing the same file + qualified_name + kind + is_test
-        // (and same-crate #[cfg] methods sharing qualified_name across platform files).
-        let mut same_file_groups: HashMap<(&str, &str, SymbolKind, bool), Vec<String>> =
+        // Group #[cfg(...)] sibling definitions sharing (file, inline_mod_scope, qualified_name, kind, is_test)
+        // and same-crate #[cfg] methods sharing (package_or_module, qualified_name, is_test).
+        let mut same_file_groups: HashMap<(&str, &str, &str, SymbolKind, bool), Vec<String>> =
             HashMap::new();
         let mut same_pkg_cfg_methods: HashMap<(&str, &str, bool), Vec<String>> = HashMap::new();
         for sym in symbols.values() {
             if sym.lang != Language::Rust
                 || !matches!(sym.kind, SymbolKind::Function | SymbolKind::Method)
-                || !cfg_gated_set.contains(sym.id.as_str())
             {
                 continue;
             }
+            let Some(&mod_scope) = cfg_gated_scopes.get(sym.id.as_str()) else {
+                continue;
+            };
             same_file_groups
                 .entry((
                     sym.file.as_str(),
+                    mod_scope,
                     sym.qualified_name.as_str(),
                     sym.kind,
                     sym.is_test,
@@ -232,6 +258,35 @@ impl<'a> RustTypeIndex<'a> {
         type_name: &str,
         symbols: &HashMap<String, Symbol>,
     ) -> Option<String> {
+        // Handle module-qualified type paths (e.g. `remote::Worker` or `foo::bar::Worker`).
+        if let Some((mod_qual, short_name)) = type_name.rsplit_once("::") {
+            let cands = self.types_by_name.get(short_name)?;
+            let matched: Vec<&String> = cands
+                .iter()
+                .filter(|id| {
+                    symbols
+                        .get(*id)
+                        .map(|s| symbol_matches_rust_mod_qual(s, mod_qual))
+                        .unwrap_or(false)
+                })
+                .collect();
+            if matched.len() == 1 {
+                return Some(matched[0].clone());
+            }
+            let same_pkg: Vec<&String> = matched
+                .into_iter()
+                .filter(|id| {
+                    symbols
+                        .get(*id)
+                        .map(|s| s.package_or_module == owner_pkg)
+                        .unwrap_or(false)
+                })
+                .collect();
+            if same_pkg.len() == 1 {
+                return Some(same_pkg[0].clone());
+            }
+            return None;
+        }
         if let Some(id) = self.types_by_file_name.get(&(owner_file, type_name)) {
             return Some(id.clone());
         }
@@ -264,9 +319,38 @@ impl<'a> RustTypeIndex<'a> {
         owner_file: &str,
         owner_pkg: &str,
         owner_imports: &[String],
+        trait_path: &str,
         trait_name: &str,
         symbols: &HashMap<String, Symbol>,
     ) -> Option<String> {
+        let clean_path = trait_path.trim().trim_start_matches("::");
+        if is_external_rust_crate_path(clean_path) {
+            return None;
+        }
+        if let Some((raw_mod_qual, short_name)) = clean_path.rsplit_once("::") {
+            let mod_qual = raw_mod_qual
+                .strip_prefix("crate::")
+                .or_else(|| raw_mod_qual.strip_prefix("super::"))
+                .or_else(|| raw_mod_qual.strip_prefix("self::"))
+                .unwrap_or(raw_mod_qual);
+            if !matches!(mod_qual, "crate" | "super" | "self" | "") {
+                let cands = self.traits_by_name.get(short_name)?;
+                let matched: Vec<&String> = cands
+                    .iter()
+                    .filter(|id| {
+                        symbols
+                            .get(*id)
+                            .map(|s| symbol_matches_rust_mod_qual(s, mod_qual))
+                            .unwrap_or(false)
+                    })
+                    .collect();
+                return if matched.len() == 1 {
+                    Some(matched[0].clone())
+                } else {
+                    None
+                };
+            }
+        }
         if let Some(id) = self.traits_by_file_name.get(&(owner_file, trait_name)) {
             return Some(id.clone());
         }
@@ -346,29 +430,21 @@ impl<'a> RustTypeIndex<'a> {
                     symbols,
                 );
             }
-            if let Some(targets) = self.deref_targets.get(&curr_id) {
-                for tname in targets {
-                    if let Some(tid) = self.resolve_type(
-                        &owner.file,
-                        &owner.package_or_module,
-                        imps,
-                        tname,
-                        symbols,
-                    ) {
-                        queue.push_back((tid, depth + 1));
-                    }
+            if let Some(targets) = self.deref_target_ids.get(&curr_id) {
+                for tid in targets {
+                    queue.push_back((tid.clone(), depth + 1));
                 }
             }
         }
         None
     }
 
+    /// Rust receiver method lookup: inherent methods win over trait methods at each Deref depth.
     pub fn lookup_methods_on_type(
         &self,
         type_id: &str,
         method_name: &str,
         caller_is_test: bool,
-        symbols: &HashMap<String, Symbol>,
     ) -> Vec<String> {
         let mut visited: HashSet<String> = HashSet::new();
         let mut queue: std::collections::VecDeque<(String, usize)> =
@@ -378,7 +454,7 @@ impl<'a> RustTypeIndex<'a> {
                 continue;
             }
             if let Some(ids) = self
-                .methods_by_type
+                .inherent_methods_by_type
                 .get(&curr_id)
                 .and_then(|m| m.get(method_name))
                 && !ids.is_empty()
@@ -394,24 +470,17 @@ impl<'a> RustTypeIndex<'a> {
             {
                 return ids.clone();
             }
-            if let (Some(owner), Some(targets)) =
-                (symbols.get(&curr_id), self.deref_targets.get(&curr_id))
+            if let Some(ids) = self
+                .trait_methods_by_type
+                .get(&curr_id)
+                .and_then(|m| m.get(method_name))
+                && !ids.is_empty()
             {
-                let imps = self
-                    .file_imports
-                    .get(owner.file.as_str())
-                    .copied()
-                    .unwrap_or(&[]);
-                for tname in targets {
-                    if let Some(tid) = self.resolve_type(
-                        &owner.file,
-                        &owner.package_or_module,
-                        imps,
-                        tname,
-                        symbols,
-                    ) {
-                        queue.push_back((tid, depth + 1));
-                    }
+                return ids.clone();
+            }
+            if let Some(targets) = self.deref_target_ids.get(&curr_id) {
+                for tid in targets {
+                    queue.push_back((tid.clone(), depth + 1));
                 }
             }
         }
@@ -433,7 +502,7 @@ impl<'a> RustTypeIndex<'a> {
             if let Some(tid) =
                 self.resolve_type(&ext.file, &ext.package_or_module, &ext.imports, q, symbols)
             {
-                let methods = self.lookup_methods_on_type(&tid, name, false, symbols);
+                let methods = self.lookup_methods_on_type(&tid, name, false);
                 if let Some(mid) = methods.first()
                     && let Some(msym) = symbols.get(mid)
                     && let Some(ret_ty) = self
@@ -457,13 +526,14 @@ impl<'a> RustTypeIndex<'a> {
                         return Some(res);
                     }
                 }
-                if name == "new"
-                    || name == "default"
-                    || name == "from"
-                    || name.starts_with("new_")
-                    || name.starts_with("with_")
-                    || name.starts_with("from_")
-                    || matches!(name, "open" | "connect" | "build" | "init")
+                if methods.is_empty()
+                    && (name == "new"
+                        || name == "default"
+                        || name == "from"
+                        || name.starts_with("new_")
+                        || name.starts_with("with_")
+                        || name.starts_with("from_")
+                        || matches!(name, "open" | "connect" | "build" | "init"))
                 {
                     return Some((tid, 0));
                 }
@@ -562,35 +632,153 @@ impl<'a> RustTypeIndex<'a> {
                     state.1 -= 1;
                 }
                 ReceiverStep::MethodCall { name, result_index } => {
-                    if state.1 != 0 {
-                        return None;
+                    // First, if the receiver is a concrete local type with a matching local method,
+                    // always respect that local method's declared return type.
+                    if state.1 == 0 {
+                        let methods = self.lookup_methods_on_type(&state.0, name, false);
+                        if let Some(mid) = methods.first() {
+                            let msym = symbols.get(mid)?;
+                            let ret_ty = self
+                                .func_return_types
+                                .get(mid)
+                                .and_then(|v| v.get(*result_index))
+                                .filter(|s| !s.is_empty())?;
+                            let imps = self
+                                .file_imports
+                                .get(msym.file.as_str())
+                                .copied()
+                                .unwrap_or(&[]);
+                            state = self.resolve_type_with_slices(
+                                &msym.file,
+                                &msym.package_or_module,
+                                imps,
+                                ret_ty,
+                                symbols,
+                            )?;
+                            continue;
+                        }
                     }
-                    let methods = self.lookup_methods_on_type(&state.0, name, false, symbols);
-                    let mid = methods.first()?;
-                    let msym = symbols.get(mid)?;
-                    let ret_ty = self
-                        .func_return_types
-                        .get(mid)
-                        .and_then(|v| v.get(*result_index))
-                        .filter(|s| !s.is_empty())?;
-                    let imps = self
-                        .file_imports
-                        .get(msym.file.as_str())
-                        .copied()
-                        .unwrap_or(&[]);
-                    state = self.resolve_type_with_slices(
-                        &msym.file,
-                        &msym.package_or_module,
-                        imps,
-                        ret_ty,
-                        symbols,
-                    )?;
+                    // Fallback for stdlib/smart-pointer/collection wrapper methods when no local
+                    // method of that name exists on the receiver type.
+                    if is_transparent_wrapper_method(name) {
+                        continue;
+                    }
+                    if state.1 > 0 {
+                        if matches!(
+                            name.as_str(),
+                            "iter" | "iter_mut" | "into_iter" | "values" | "values_mut"
+                        ) {
+                            continue;
+                        }
+                        if matches!(
+                            name.as_str(),
+                            "get" | "get_mut" | "first" | "last" | "pop" | "next" | "remove"
+                        ) {
+                            state.1 -= 1;
+                            continue;
+                        }
+                    }
+                    return None;
                 }
                 ReceiverStep::Type(_) | ReceiverStep::Call { .. } => return None,
             }
         }
         Some(state)
     }
+}
+
+fn is_transparent_wrapper_method(name: &str) -> bool {
+    matches!(
+        name,
+        "lock"
+            | "try_lock"
+            | "blocking_lock"
+            | "read"
+            | "try_read"
+            | "blocking_read"
+            | "write"
+            | "try_write"
+            | "blocking_write"
+            | "borrow"
+            | "borrow_mut"
+            | "try_borrow"
+            | "try_borrow_mut"
+            | "clone"
+            | "cloned"
+            | "copied"
+            | "as_ref"
+            | "as_mut"
+            | "as_deref"
+            | "as_deref_mut"
+            | "unwrap"
+            | "expect"
+            | "ok"
+            | "into_inner"
+            | "deref"
+            | "deref_mut"
+            | "pin"
+            | "load"
+            | "load_full"
+            | "get_or_init"
+    )
+}
+
+fn is_external_rust_crate_path(path: &str) -> bool {
+    let first = path.split("::").next().unwrap_or("");
+    matches!(
+        first,
+        "std"
+            | "core"
+            | "alloc"
+            | "serde"
+            | "tokio"
+            | "futures"
+            | "futures_core"
+            | "futures_util"
+            | "async_trait"
+            | "ratatui"
+            | "tower"
+            | "axum"
+            | "tonic"
+            | "clap"
+            | "anyhow"
+            | "thiserror"
+            | "tracing"
+            | "tracing_subscriber"
+            | "http"
+            | "hyper"
+            | "bytes"
+            | "chrono"
+            | "uuid"
+            | "url"
+            | "reqwest"
+            | "sqlx"
+            | "rusqlite"
+            | "rmcp"
+            | "schemars"
+    )
+}
+
+fn symbol_matches_rust_mod_qual(sym: &Symbol, mod_qual: &str) -> bool {
+    let qual_slash = mod_qual.replace("::", "/");
+    let file = sym.file.as_str();
+    if file == format!("{}.rs", qual_slash)
+        || file.ends_with(&format!("/{}.rs", qual_slash))
+        || file == format!("{}/mod.rs", qual_slash)
+        || file.ends_with(&format!("/{}/mod.rs", qual_slash))
+        || file == format!("{}/lib.rs", qual_slash)
+        || file.ends_with(&format!("/{}/lib.rs", qual_slash))
+    {
+        return true;
+    }
+    let pkg_ident = sym
+        .package_or_module
+        .rsplit('/')
+        .next()
+        .unwrap_or("")
+        .replace('-', "_");
+    !pkg_ident.is_empty()
+        && (pkg_ident == mod_qual || qual_slash.starts_with(&format!("{}/", pkg_ident)))
 }
 
 pub fn rust_imports_match_symbol(imports: &[String], sym: &Symbol) -> bool {
@@ -607,13 +795,22 @@ pub fn rust_imports_match_symbol(imports: &[String], sym: &Symbol) -> bool {
         .unwrap_or("")
         .strip_suffix(".rs")
         .unwrap_or("");
+    let parent_dir = sym
+        .file
+        .rsplit_once('/')
+        .and_then(|(d, _)| d.rsplit('/').next())
+        .unwrap_or("");
     imports.iter().any(|imp| {
         (!crate_ident.is_empty() && imp.contains(&crate_ident))
-            || (!sym.name.is_empty() && imp.contains(&sym.name))
             || (!file_stem.is_empty()
                 && file_stem != "lib"
                 && file_stem != "mod"
+                && file_stem != "main"
                 && imp.contains(file_stem))
+            || ((file_stem == "mod" || file_stem == "lib")
+                && !parent_dir.is_empty()
+                && parent_dir != "src"
+                && imp.contains(&parent_dir.replace('-', "_")))
     })
 }
 
@@ -625,29 +822,27 @@ pub fn resolve_rust_module_qualified(
     by_lang_name: &HashMap<(Language, &str), Vec<String>>,
     symbols: &HashMap<String, Symbol>,
 ) -> Vec<(String, Confidence)> {
-    let matches_mod_file = |file: &str| -> bool {
-        let file_stem = file
-            .rsplit('/')
-            .next()
-            .unwrap_or("")
-            .strip_suffix(".rs")
-            .unwrap_or("");
-        if file_stem == qual {
-            return true;
+    // 0. Same-file inline module match (e.g. mod_a::scoped_cfg)
+    if !ext.cfg_gated_symbols.is_empty() {
+        let inline_hits: Vec<String> = ext
+            .symbols
+            .iter()
+            .filter(|s| {
+                s.name == target_name
+                    && matches!(s.kind, SymbolKind::Function | SymbolKind::Const)
+                    && ext.cfg_gated_symbols.get(&s.id).is_some_and(|scope| {
+                        scope == qual || scope.ends_with(&format!("::{}", qual))
+                    })
+            })
+            .map(|s| s.id.clone())
+            .collect();
+        if !inline_hits.is_empty() {
+            return inline_hits
+                .into_iter()
+                .map(|id| (id, Confidence::Resolved))
+                .collect();
         }
-        if file_stem == "mod" || file_stem == "lib" {
-            let parent = file
-                .rsplit_once('/')
-                .and_then(|(dir, _)| dir.rsplit('/').next())
-                .unwrap_or("");
-            if parent == qual || parent.replace('-', "_") == qual {
-                return true;
-            }
-        }
-        false
-    };
-
-    // 1. Same crate module file match
+    }
     if !ext.package_or_module.is_empty()
         && let Some(ids) =
             by_pkg_name.get(&(Language::Rust, ext.package_or_module.as_str(), target_name))
@@ -659,7 +854,7 @@ pub fn resolve_rust_module_qualified(
                     .get(*id)
                     .map(|s| {
                         matches!(s.kind, SymbolKind::Function | SymbolKind::Const)
-                            && matches_mod_file(&s.file)
+                            && symbol_matches_rust_mod_qual(s, qual)
                     })
                     .unwrap_or(false)
             })
@@ -673,7 +868,6 @@ pub fn resolve_rust_module_qualified(
         }
     }
 
-    // 2. Cross-crate module/crate match via imports
     if let Some(ids) = by_lang_name.get(&(Language::Rust, target_name)) {
         let narrowed: Vec<String> = ids
             .iter()
@@ -681,14 +875,8 @@ pub fn resolve_rust_module_qualified(
                 symbols
                     .get(*id)
                     .map(|s| {
-                        let pkg_ident = s
-                            .package_or_module
-                            .rsplit('/')
-                            .next()
-                            .unwrap_or("")
-                            .replace('-', "_");
                         matches!(s.kind, SymbolKind::Function | SymbolKind::Const)
-                            && (matches_mod_file(&s.file) || pkg_ident == qual)
+                            && symbol_matches_rust_mod_qual(s, qual)
                     })
                     .unwrap_or(false)
             })
@@ -742,7 +930,6 @@ pub fn materialize_rust_trait_and_macro_edges(
             continue;
         }
 
-        // 1. Explicit trait implementations (`impl Trait for Type`).
         for imp in &ext.trait_impls {
             if imp.is_test || imp.method_ids.is_empty() {
                 continue;
@@ -758,13 +945,13 @@ pub fn materialize_rust_trait_and_macro_edges(
                 &ext.file,
                 &ext.package_or_module,
                 &ext.imports,
+                &imp.trait_path,
                 &imp.trait_name,
                 symbols,
             );
 
             match (type_id, local_trait_id) {
                 (Some(tid), Some(tr_id)) => {
-                    // Local trait on local concrete type: two-sided RTA reachability.
                     interface_impls.push(InterfaceImpl {
                         receiver_type_id: tid,
                         interface_id: tr_id,
@@ -772,8 +959,6 @@ pub fn materialize_rust_trait_and_macro_edges(
                     });
                 }
                 (None, Some(tr_id)) => {
-                    // Local trait implemented for an external/primitive type (e.g. String):
-                    // live when the trait itself is live.
                     for mid in &imp.method_ids {
                         let line = symbols.get(mid).map(|s| s.span.start_line).unwrap_or(1);
                         push_edge(
@@ -787,8 +972,6 @@ pub fn materialize_rust_trait_and_macro_edges(
                     }
                 }
                 (Some(tid), None) => {
-                    // External / stdlib trait (Display, Debug, Drop, Default, From, Serialize,
-                    // Deserialize, Future, Stream, Widget, Service, etc.): live when Type is live.
                     for mid in &imp.method_ids {
                         let line = symbols.get(mid).map(|s| s.span.start_line).unwrap_or(1);
                         push_edge(
@@ -802,7 +985,6 @@ pub fn materialize_rust_trait_and_macro_edges(
                     }
                 }
                 (None, None) => {
-                    // e.g. `impl From<LocalErr> for anyhow::Error`: link from local generic arg type.
                     for arg_ty in &imp.trait_type_args {
                         if let Some(arg_tid) = rust_index.resolve_type(
                             &ext.file,
@@ -828,7 +1010,6 @@ pub fn materialize_rust_trait_and_macro_edges(
             }
         }
 
-        // 2. Impl-level macro invocations (`impl Type { my_macro!(...); }`).
         for (type_name, macro_name, line) in &ext.impl_macros {
             let Some(tid) = rust_index.resolve_type(
                 &ext.file,

@@ -1,8 +1,8 @@
 use kagami::config::KagamiConfig;
-use kagami::graph::dead::{analyze_dead, DeadOptions, DeadScope};
 use kagami::graph::CodeGraph;
-use kagami::ir::similar::pair_similarity;
+use kagami::graph::dead::{DeadOptions, DeadScope, analyze_dead};
 use kagami::ir::IrNode;
+use kagami::ir::similar::pair_similarity;
 use kagami::lang;
 use kagami::model::{Confidence, Language};
 use kagami::walker::discover_files;
@@ -28,16 +28,25 @@ fn test_vite_spa_main_ts_links_svelte_app() {
     ).unwrap();
     fs::write(
         root.join("src/Child.svelte"),
-        format!("{}\nfunction childWork() {{}}\nchildWork();\n{}\n<div>Hi</div>\n", tag_open, tag_close),
-    ).unwrap();
+        format!(
+            "{}\nfunction childWork() {{}}\nchildWork();\n{}\n<div>Hi</div>\n",
+            tag_open, tag_close
+        ),
+    )
+    .unwrap();
     fs::write(
         root.join("src/Orphan.svelte"),
-        format!("{}\nfunction orphanWork() {{}}\n{}\n<div>Orphan</div>\n", tag_open, tag_close),
-    ).unwrap();
+        format!(
+            "{}\nfunction orphanWork() {{}}\n{}\n<div>Orphan</div>\n",
+            tag_open, tag_close
+        ),
+    )
+    .unwrap();
     fs::write(
         root.join("src/lib/setup.ts"),
         "export function bootApp() {}\nexport function deadUtil() {}\n",
-    ).unwrap();
+    )
+    .unwrap();
 
     let ignores = KagamiConfig::default().build_ignore_globset().unwrap();
     let files = discover_files(root, &ignores, None).unwrap();
@@ -49,7 +58,10 @@ fn test_vite_spa_main_ts_links_svelte_app() {
             && e.to.starts_with("src/App.svelte::App@")
             && e.confidence == Confidence::Resolved
     });
-    assert!(has_resolved_app_edge, "expected Confidence::Resolved edge from src/main.ts::<module> to src/App.svelte::App");
+    assert!(
+        has_resolved_app_edge,
+        "expected Confidence::Resolved edge from src/main.ts::<module> to src/App.svelte::App"
+    );
 
     let dead = analyze_dead(
         &graph,
@@ -63,11 +75,23 @@ fn test_vite_spa_main_ts_links_svelte_app() {
         },
     );
     let has = |sym: &str| dead.symbols.iter().any(|s| s.symbol == sym);
-    assert!(!has("App"), "App.svelte must be live via main.ts mount(App, ...)");
+    assert!(
+        !has("App"),
+        "App.svelte must be live via main.ts mount(App, ...)"
+    );
     assert!(!has("Child"), "Child.svelte must be live via App.svelte");
-    assert!(!has("handleClick"), "handleClick must be live via App.svelte template");
-    assert!(!has("childWork"), "childWork must be live via Child.svelte <module>");
-    assert!(!has("bootApp"), "bootApp must be live via aliased relative import start()");
+    assert!(
+        !has("handleClick"),
+        "handleClick must be live via App.svelte template"
+    );
+    assert!(
+        !has("childWork"),
+        "childWork must be live via Child.svelte <module>"
+    );
+    assert!(
+        !has("bootApp"),
+        "bootApp must be live via aliased relative import start()"
+    );
     assert!(has("Orphan"), "Orphan.svelte should be dead");
     assert!(has("deadUtil"), "deadUtil should be dead");
 }
@@ -81,7 +105,11 @@ fn test_go_cross_pkg_receiver_var_method_and_testsupport() {
     fs::create_dir_all(root.join("custom_helpers")).unwrap();
     fs::create_dir_all(root.join("cmd/app")).unwrap();
 
-    fs::write(root.join(".kagami.toml"), "test_paths = [\"custom_helpers/**\"]\n").unwrap();
+    fs::write(
+        root.join(".kagami.toml"),
+        "test_paths = [\"custom_helpers/**\"]\n",
+    )
+    .unwrap();
     fs::write(
         root.join("internal/hints/hints.go"),
         "package hints\ntype SelectionHints struct{}\nfunc (h *SelectionHints) ActionAt() {}\nfunc (h *SelectionHints) UnusedAction() {}\n",
@@ -89,11 +117,13 @@ fn test_go_cross_pkg_receiver_var_method_and_testsupport() {
     fs::write(
         root.join("internal/testsupport/fixture.go"),
         "package testsupport\nfunc MakeFixture() {}\n",
-    ).unwrap();
+    )
+    .unwrap();
     fs::write(
         root.join("custom_helpers/helper.go"),
         "package custom_helpers\nfunc CustomHelper() {}\n",
-    ).unwrap();
+    )
+    .unwrap();
     fs::write(
         root.join("cmd/app/main.go"),
         "package main\nimport \"demo.local/app/internal/hints\"\nfunc main() {\n    var receiverVar *hints.SelectionHints\n    receiverVar.ActionAt()\n}\n",
@@ -120,10 +150,22 @@ fn test_go_cross_pkg_receiver_var_method_and_testsupport() {
         },
     );
     let has = |sym: &str| dead.symbols.iter().any(|s| s.symbol == sym);
-    assert!(!has("SelectionHints.ActionAt"), "cross-pkg receiver-var call must keep ActionAt alive");
-    assert!(has("SelectionHints.UnusedAction"), "uncalled method should be dead");
-    assert!(!has("MakeFixture"), "testsupport/ package must be classified as is_test: true");
-    assert!(!has("CustomHelper"), "test_paths glob in .kagami.toml must mark custom_helpers as is_test: true");
+    assert!(
+        !has("SelectionHints.ActionAt"),
+        "cross-pkg receiver-var call must keep ActionAt alive"
+    );
+    assert!(
+        has("SelectionHints.UnusedAction"),
+        "uncalled method should be dead"
+    );
+    assert!(
+        !has("MakeFixture"),
+        "testsupport/ package must be classified as is_test: true"
+    );
+    assert!(
+        !has("CustomHelper"),
+        "test_paths glob in .kagami.toml must mark custom_helpers as is_test: true"
+    );
 }
 
 #[test]
@@ -150,9 +192,22 @@ fn test_dead_min_confidence_filters_heuristic() {
             min_confidence: Confidence::Heuristic,
         },
     );
-    assert_eq!(all_dead.total_dead, all_dead.unreferenced + all_dead.unreachable_clusters);
-    assert!(all_dead.symbols.iter().any(|s| s.symbol == "Svc.DynamicMethod" && s.confidence == Confidence::Heuristic));
-    assert!(all_dead.symbols.iter().any(|s| s.symbol == "UnusedFunc" && s.confidence == Confidence::Resolved));
+    assert_eq!(
+        all_dead.total_dead,
+        all_dead.unreferenced + all_dead.unreachable_clusters
+    );
+    assert!(
+        all_dead
+            .symbols
+            .iter()
+            .any(|s| s.symbol == "Svc.DynamicMethod" && s.confidence == Confidence::Heuristic)
+    );
+    assert!(
+        all_dead
+            .symbols
+            .iter()
+            .any(|s| s.symbol == "UnusedFunc" && s.confidence == Confidence::Resolved)
+    );
 
     let resolved_only = analyze_dead(
         &graph,
@@ -165,9 +220,22 @@ fn test_dead_min_confidence_filters_heuristic() {
             min_confidence: Confidence::Resolved,
         },
     );
-    assert_eq!(resolved_only.total_dead, resolved_only.unreferenced + resolved_only.unreachable_clusters);
-    assert!(!resolved_only.symbols.iter().any(|s| s.symbol == "Svc.DynamicMethod"));
-    assert!(resolved_only.symbols.iter().any(|s| s.symbol == "UnusedFunc"));
+    assert_eq!(
+        resolved_only.total_dead,
+        resolved_only.unreferenced + resolved_only.unreachable_clusters
+    );
+    assert!(
+        !resolved_only
+            .symbols
+            .iter()
+            .any(|s| s.symbol == "Svc.DynamicMethod")
+    );
+    assert!(
+        resolved_only
+            .symbols
+            .iter()
+            .any(|s| s.symbol == "UnusedFunc")
+    );
 
     let exact_only = analyze_dead(
         &graph,
@@ -197,8 +265,14 @@ fn test_ts_richer_ir_lowering_and_equivalence() {
         match n {
             IrNode::Opaque(_) => true,
             IrNode::Seq(items) => items.iter().any(has_opaque),
-            IrNode::Branch { cond, then_br, else_br } => {
-                has_opaque(cond) || has_opaque(then_br) || else_br.as_deref().map(has_opaque).unwrap_or(false)
+            IrNode::Branch {
+                cond,
+                then_br,
+                else_br,
+            } => {
+                has_opaque(cond)
+                    || has_opaque(then_br)
+                    || else_br.as_deref().map(has_opaque).unwrap_or(false)
             }
             IrNode::Call { args, .. } => args.iter().any(has_opaque),
             IrNode::Assign { val, .. }
@@ -212,10 +286,22 @@ fn test_ts_richer_ir_lowering_and_equivalence() {
         }
     }
 
-    assert!(!has_opaque(&ext_a.ir_funcs[0].body), "expected zero Opaque nodes, got {:?}", ext_a.ir_funcs[0].body);
-    assert!(!has_opaque(&ext_b.ir_funcs[0].body), "expected zero Opaque nodes, got {:?}", ext_b.ir_funcs[0].body);
+    assert!(
+        !has_opaque(&ext_a.ir_funcs[0].body),
+        "expected zero Opaque nodes, got {:?}",
+        ext_a.ir_funcs[0].body
+    );
+    assert!(
+        !has_opaque(&ext_b.ir_funcs[0].body),
+        "expected zero Opaque nodes, got {:?}",
+        ext_b.ir_funcs[0].body
+    );
     let score = pair_similarity(&ext_a.ir_funcs[0], &ext_b.ir_funcs[0], false);
-    assert!(score >= 0.95, "expected high similarity for equivalent TS funcs, got {}", score);
+    assert!(
+        score >= 0.95,
+        "expected high similarity for equivalent TS funcs, got {}",
+        score
+    );
 }
 
 #[test]
@@ -228,17 +314,23 @@ fn test_review_fixes_default_export_shadowing_typeof_and_computed_key() {
     fs::write(
         root.join("src/worker.ts"),
         "export default function initialize() {}\nexport { run } from \"./impl\";\n",
-    ).unwrap();
+    )
+    .unwrap();
     fs::write(
         root.join("src/worker/index.ts"),
         "export function run() {}\n",
-    ).unwrap();
+    )
+    .unwrap();
     let tag_open = concat!("<", "script lang=\"ts\">");
     let tag_close = concat!("</", "script>");
     fs::write(
         root.join("src/UnusedComp.svelte"),
-        format!("{}\nfunction unusedWork() {{}}\n{}\n<div>No</div>\n", tag_open, tag_close),
-    ).unwrap();
+        format!(
+            "{}\nfunction unusedWork() {{}}\n{}\n<div>No</div>\n",
+            tag_open, tag_close
+        ),
+    )
+    .unwrap();
     fs::write(
         root.join("src/main.ts"),
         "import start from \"./worker\";\nimport { run as launch } from \"./worker\";\nimport UnusedComp from \"./UnusedComp.svelte\";\ntype CompType = typeof UnusedComp;\nfunction preview(UnusedComp: unknown) { return UnusedComp; }\nstart();\nlaunch();\npreview(null);\n",
@@ -258,10 +350,23 @@ fn test_review_fixes_default_export_shadowing_typeof_and_computed_key() {
             min_confidence: Confidence::Heuristic,
         },
     );
-    let has = |file: &str, sym: &str| dead.symbols.iter().any(|s| s.file == file && s.symbol == sym);
-    assert!(!has("src/worker.ts", "initialize"), "renamed default import start() must keep initialize alive");
-    assert!(has("src/UnusedComp.svelte", "UnusedComp"), "typeof and shadowed param must not keep UnusedComp alive");
-    assert!(has("src/worker/index.ts", "run"), "import from ./worker must not falsely link worker/index.ts when worker.ts exists");
+    let has = |file: &str, sym: &str| {
+        dead.symbols
+            .iter()
+            .any(|s| s.file == file && s.symbol == sym)
+    };
+    assert!(
+        !has("src/worker.ts", "initialize"),
+        "renamed default import start() must keep initialize alive"
+    );
+    assert!(
+        has("src/UnusedComp.svelte", "UnusedComp"),
+        "typeof and shadowed param must not keep UnusedComp alive"
+    );
+    assert!(
+        has("src/worker/index.ts", "run"),
+        "import from ./worker must not falsely link worker/index.ts when worker.ts exists"
+    );
 
     // Computed object key rename equivalence + spread vs non-spread distinction
     let c1 = "function f1(k: string, v: number) { return { [k]: v }; }\n";
@@ -284,9 +389,21 @@ fn test_review_fixes_js_specifier_default_list_and_external_default() {
     fs::create_dir_all(root.join("src")).unwrap();
 
     fs::write(root.join("src/esm.ts"), "export function esmRun() {}\n").unwrap();
-    fs::write(root.join("src/list_def.ts"), "function listRun() {}\nexport { listRun as default };\n").unwrap();
-    fs::write(root.join("src/wrapped.ts"), "function wrappedRun() {}\nexport default (wrappedRun);\n").unwrap();
-    fs::write(root.join("src/unused_def.ts"), "export default function unusedLegacy() {}\n").unwrap();
+    fs::write(
+        root.join("src/list_def.ts"),
+        "function listRun() {}\nexport { listRun as default };\n",
+    )
+    .unwrap();
+    fs::write(
+        root.join("src/wrapped.ts"),
+        "function wrappedRun() {}\nexport default (wrappedRun);\n",
+    )
+    .unwrap();
+    fs::write(
+        root.join("src/unused_def.ts"),
+        "export default function unusedLegacy() {}\n",
+    )
+    .unwrap();
     fs::write(
         root.join("src/main.ts"),
         "import extPkg from \"external-pkg\";\nimport { esmRun } from \"./esm.js\";\nimport listFn from \"./list_def\";\nimport wrappedFn from \"./wrapped\";\nextPkg();\nesmRun();\nlistFn();\nwrappedFn();\n",
@@ -306,11 +423,27 @@ fn test_review_fixes_js_specifier_default_list_and_external_default() {
             min_confidence: Confidence::Heuristic,
         },
     );
-    let has = |file: &str, sym: &str| dead.symbols.iter().any(|s| s.file == file && s.symbol == sym);
-    assert!(!has("src/esm.ts", "esmRun"), "./esm.js specifier must resolve to src/esm.ts");
-    assert!(!has("src/list_def.ts", "listRun"), "export {{ listRun as default }} must keep listRun alive");
-    assert!(!has("src/wrapped.ts", "wrappedRun"), "export default (wrappedRun) must keep wrappedRun alive");
-    assert!(has("src/unused_def.ts", "unusedLegacy"), "external default import must not keep unrelated local default export alive");
+    let has = |file: &str, sym: &str| {
+        dead.symbols
+            .iter()
+            .any(|s| s.file == file && s.symbol == sym)
+    };
+    assert!(
+        !has("src/esm.ts", "esmRun"),
+        "./esm.js specifier must resolve to src/esm.ts"
+    );
+    assert!(
+        !has("src/list_def.ts", "listRun"),
+        "export {{ listRun as default }} must keep listRun alive"
+    );
+    assert!(
+        !has("src/wrapped.ts", "wrappedRun"),
+        "export default (wrappedRun) must keep wrappedRun alive"
+    );
+    assert!(
+        has("src/unused_def.ts", "unusedLegacy"),
+        "external default import must not keep unrelated local default export alive"
+    );
 }
 
 #[test]
@@ -1149,13 +1282,12 @@ func main() {
     assert!(!has_resolved_call("useShadowedCfg", "OuterWorker.Work"));
     assert!(!has_resolved_call("useAnonIface", "ImplA.Ping"));
     assert!(has_resolved_call("useRangeAndChan", "Job.Process"));
-    assert!(has_resolved_call("TestCallsHelper", "Second.TestHelperMethod"));
+    assert!(has_resolved_call(
+        "TestCallsHelper",
+        "Second.TestHelperMethod"
+    ));
 
-    for dead_sym in [
-        "First.Run",
-        "BlankHolder.UnusedReload",
-        "BaseFactory.Make",
-    ] {
+    for dead_sym in ["First.Run", "BlankHolder.UnusedReload", "BaseFactory.Make"] {
         assert!(
             is_dead(dead_sym),
             "Expected {dead_sym} to remain dead; dead={:?}",
@@ -1468,10 +1600,23 @@ fn call_cfg_in_test() {
     let dead = analyze_rust_dead(root);
 
     let dead_count = |sym: &str| dead.symbols.iter().filter(|s| s.symbol == sym).count();
-    assert_eq!(dead_count("Daemon::managed_version"), 0, "dead={:?}", dead.symbols);
+    assert_eq!(
+        dead_count("Daemon::managed_version"),
+        0,
+        "dead={:?}",
+        dead.symbols
+    );
     assert_eq!(dead_count("platform_open"), 0, "dead={:?}", dead.symbols);
-    assert_eq!(dead_count("unused_cfg"), 2, "both unused cfg siblings should be dead");
-    assert_eq!(dead_count("test_only_cfg"), 2, "both test-only cfg siblings should be dead");
+    assert_eq!(
+        dead_count("unused_cfg"),
+        2,
+        "both unused cfg siblings should be dead"
+    );
+    assert_eq!(
+        dead_count("test_only_cfg"),
+        2,
+        "both test-only cfg siblings should be dead"
+    );
 }
 
 #[test]
@@ -1664,4 +1809,198 @@ fn main() {
             dead.symbols
         );
     }
+}
+
+#[test]
+fn test_rust_review_edge_cases() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    let src_dir = root.join("src");
+    let tests_dir = root.join("tests");
+    fs::create_dir_all(&src_dir).unwrap();
+    fs::create_dir_all(&tests_dir).unwrap();
+
+    fs::write(
+        src_dir.join("remote.rs"),
+        r#"
+pub struct Worker;
+impl Worker {
+    pub fn remote_run(&self) {}
+}
+"#,
+    )
+    .unwrap();
+
+    fs::write(
+        tests_dir.join("smoke.rs"),
+        r#"
+fn smoke() {
+    root_test_only_fn();
+}
+"#,
+    )
+    .unwrap();
+
+    fs::write(
+        src_dir.join("main.rs"),
+        r#"
+mod remote;
+
+fn accepts(_x: i32) -> bool { true }
+fn arm_shadowed() {}
+fn mut_shadowed() {}
+fn root_test_only_fn() {}
+fn cli_feature_fn() {}
+fn test_named_feature_fn() {}
+const fn buf_capacity() -> usize { 8 }
+fn rep_helper() {}
+
+struct Registry<T>(std::marker::PhantomData<T>);
+impl<T> Registry<T> {
+    fn install() {}
+}
+
+type Buffer = [u8; buf_capacity()];
+
+struct Worker;
+impl Worker {
+    fn new() -> Self { Self }
+    fn run(&self) {}
+}
+
+trait UnusedTask {
+    fn run(&self);
+}
+impl UnusedTask for Worker {
+    fn run(&self) {}
+}
+
+struct Job;
+impl Job {
+    fn exec(&self) {}
+}
+struct Loader;
+impl Loader {
+    fn new() -> Self { Self }
+    fn load(&self) -> Job { Job }
+}
+
+trait Display {}
+struct Status;
+impl Status {
+    fn new() -> Self { Self }
+}
+impl std::fmt::Display for Status {
+    fn fmt(&self, _f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result { Ok(()) }
+}
+
+macro_rules! call_many {
+    ($($x:expr),*) => {
+        $(
+            let _ = $x;
+            rep_helper();
+        )*
+    };
+}
+
+#[cfg(any(test, feature = "cli"))]
+fn run_cli_entry() {
+    cli_feature_fn();
+}
+
+#[cfg(feature = "test")]
+fn run_test_feature_entry() {
+    test_named_feature_fn();
+}
+
+mod mod_a {
+    #[cfg(unix)]
+    pub fn scoped_cfg() {}
+}
+mod mod_b {
+    #[cfg(unix)]
+    pub fn scoped_cfg() {}
+}
+
+fn start_remote(w: remote::Worker) {
+    w.remote_run();
+}
+
+fn main() {
+    match 1 {
+        arm_shadowed if accepts(arm_shadowed) => {
+            let _ = arm_shadowed;
+        }
+        _ => {}
+    }
+    let (mut mut_shadowed,) = (1,);
+    let _ = mut_shadowed;
+    Registry::<i32>::install();
+    let _b: Buffer = [0; 8];
+    let w = Worker::new();
+    w.run();
+    let loader = Loader::new();
+    loader.load().exec();
+    let _s = Status::new();
+    call_many!(1, 2);
+    run_cli_entry();
+    run_test_feature_entry();
+    mod_a::scoped_cfg();
+    start_remote(remote::Worker);
+}
+"#,
+    )
+    .unwrap();
+
+    let dead = analyze_rust_dead(root);
+    let is_dead = |sym: &str| dead.symbols.iter().any(|s| s.symbol == sym);
+
+    for live_sym in [
+        "accepts",
+        "Registry::install",
+        "buf_capacity",
+        "Job::exec",
+        "Status::fmt",
+        "rep_helper",
+        "cli_feature_fn",
+        "test_named_feature_fn",
+        "Worker::remote_run",
+    ] {
+        assert!(
+            !is_dead(live_sym),
+            "Expected {live_sym} to be live; dead={:?}",
+            dead.symbols
+        );
+    }
+    for dead_sym in ["arm_shadowed", "mut_shadowed", "root_test_only_fn"] {
+        assert!(
+            is_dead(dead_sym),
+            "Expected {dead_sym} to remain dead; dead={:?}",
+            dead.symbols
+        );
+    }
+    // Inherent Worker::run is live, while UnusedTask::run on Worker must remain dead.
+    let dead_worker_runs: Vec<_> = dead
+        .symbols
+        .iter()
+        .filter(|s| s.symbol == "Worker::run")
+        .collect();
+    assert_eq!(
+        dead_worker_runs.len(),
+        1,
+        "Only trait impl Worker::run should be dead; got {:?}",
+        dead_worker_runs
+    );
+    // mod_a::scoped_cfg is live; mod_b::scoped_cfg must remain dead (not grouped across inline mods).
+    let dead_scoped_cfgs: Vec<_> = dead
+        .symbols
+        .iter()
+        .filter(|s| s.symbol == "scoped_cfg")
+        .collect();
+    assert_eq!(
+        dead_scoped_cfgs.len(),
+        1,
+        "Only mod_b::scoped_cfg should be dead; got {:?}",
+        dead_scoped_cfgs
+    );
 }

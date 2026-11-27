@@ -1172,7 +1172,6 @@ fn resolve_ref(
             &target_type_id,
             &r.target_name,
             caller_is_test,
-            symbols,
         );
         if !methods.is_empty() {
             return methods

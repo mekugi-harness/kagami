@@ -26,7 +26,7 @@ struct RustExtractCtx<'a> {
     func_return_types: HashMap<String, Vec<String>>,
     trait_impls: Vec<TraitImplInfo>,
     impl_macros: Vec<(String, String, usize)>,
-    cfg_gated_symbols: Vec<String>,
+    cfg_gated_symbols: HashMap<String, String>,
 }
 
 /// Lexical scope stack for Rust local variables and inferred receiver chains.
@@ -81,7 +81,8 @@ pub fn extract(rel_path: &str, src: &str, blake3_hex: String) -> Result<FileExtr
         .parse(src, None)
         .ok_or_else(|| anyhow::anyhow!("failed to parse Rust file {}", rel_path))?;
 
-    let is_test_file = rel_path.contains("/tests/")
+    let is_test_file = rel_path.starts_with("tests/")
+        || rel_path.contains("/tests/")
         || rel_path.ends_with("_test.rs")
         || rel_path.ends_with("_tests.rs")
         || rel_path.ends_with("tests.rs");
@@ -102,7 +103,7 @@ pub fn extract(rel_path: &str, src: &str, blake3_hex: String) -> Result<FileExtr
         func_return_types: HashMap::new(),
         trait_impls: Vec::new(),
         impl_macros: Vec::new(),
-        cfg_gated_symbols: Vec::new(),
+        cfg_gated_symbols: HashMap::new(),
     };
 
     let mut top_methods = Vec::new();
@@ -110,6 +111,7 @@ pub fn extract(rel_path: &str, src: &str, blake3_hex: String) -> Result<FileExtr
         tree.root_node(),
         &mut ctx,
         None,
+        "",
         is_test_file,
         false,
         false,
@@ -148,25 +150,128 @@ fn attr_is_test(attr: &str) -> bool {
     }
     if let Some(idx) = attr.find("cfg(") {
         let rest = &attr[idx + 4..];
-        let bytes = rest.as_bytes();
-        let mut i = 0;
-        while i + 4 <= bytes.len() {
-            if &bytes[i..i + 4] == b"test" {
-                let before_ok =
-                    i == 0 || !(bytes[i - 1].is_ascii_alphanumeric() || bytes[i - 1] == b'_');
-                let after_ok = i + 4 == bytes.len()
-                    || !(bytes[i + 4].is_ascii_alphanumeric() || bytes[i + 4] == b'_');
-                if before_ok && after_ok {
-                    let prefix = rest[..i].trim_end();
-                    if !prefix.ends_with("not(") {
-                        return true;
-                    }
-                }
-            }
-            i += 1;
+        if let Some(pred) = extract_balanced_parens(rest) {
+            // Strictly test-only iff the predicate CANNOT hold when `test` is false.
+            return !cfg_may_hold_without_test(pred);
         }
     }
     false
+}
+
+fn extract_balanced_parens(s: &str) -> Option<&str> {
+    let mut depth = 1usize;
+    let mut in_str = false;
+    let mut escaped = false;
+    for (i, ch) in s.char_indices() {
+        if in_str {
+            if escaped {
+                escaped = false;
+            } else if ch == '\\' {
+                escaped = true;
+            } else if ch == '"' {
+                in_str = false;
+            }
+            continue;
+        }
+        match ch {
+            '"' => in_str = true,
+            '(' => depth += 1,
+            ')' => {
+                depth -= 1;
+                if depth == 0 {
+                    return Some(&s[..i]);
+                }
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
+fn split_top_level_cfg_args(s: &str) -> Vec<&str> {
+    let mut parts = Vec::new();
+    let mut depth = 0usize;
+    let mut in_str = false;
+    let mut escaped = false;
+    let mut start = 0usize;
+    for (i, ch) in s.char_indices() {
+        if in_str {
+            if escaped {
+                escaped = false;
+            } else if ch == '\\' {
+                escaped = true;
+            } else if ch == '"' {
+                in_str = false;
+            }
+            continue;
+        }
+        match ch {
+            '"' => in_str = true,
+            '(' => depth += 1,
+            ')' => depth = depth.saturating_sub(1),
+            ',' if depth == 0 => {
+                let p = s[start..i].trim();
+                if !p.is_empty() {
+                    parts.push(p);
+                }
+                start = i + 1;
+            }
+            _ => {}
+        }
+    }
+    let tail = s[start..].trim();
+    if !tail.is_empty() {
+        parts.push(tail);
+    }
+    parts
+}
+
+/// Three-valued evaluation of a Rust `cfg(...)` predicate with `test = false`:
+/// returns `(may_be_true, may_be_false)` when `test` is false and all other flags are unknown.
+fn eval_cfg_without_test(pred: &str) -> (bool, bool) {
+    let p = pred.trim();
+    if p == "test" {
+        return (false, true);
+    }
+    if let Some(rest) = p.strip_prefix("not")
+        && let Some(inner) = rest.trim_start().strip_prefix('(')
+        && let Some(arg) = extract_balanced_parens(inner)
+    {
+        let (t, f) = eval_cfg_without_test(arg);
+        return (f, t);
+    }
+    if let Some(rest) = p.strip_prefix("all")
+        && let Some(inner) = rest.trim_start().strip_prefix('(')
+        && let Some(args_str) = extract_balanced_parens(inner)
+    {
+        let mut may_true = true;
+        let mut may_false = false;
+        for arg in split_top_level_cfg_args(args_str) {
+            let (t, f) = eval_cfg_without_test(arg);
+            may_true &= t;
+            may_false |= f;
+        }
+        return (may_true, may_false);
+    }
+    if let Some(rest) = p.strip_prefix("any")
+        && let Some(inner) = rest.trim_start().strip_prefix('(')
+        && let Some(args_str) = extract_balanced_parens(inner)
+    {
+        let mut may_true = false;
+        let mut may_false = true;
+        for arg in split_top_level_cfg_args(args_str) {
+            let (t, f) = eval_cfg_without_test(arg);
+            may_true |= t;
+            may_false &= f;
+        }
+        return (may_true, may_false);
+    }
+    // Any other predicate (feature = "...", unix, windows, etc.) can be either true or false.
+    (true, true)
+}
+
+fn cfg_may_hold_without_test(pred: &str) -> bool {
+    eval_cfg_without_test(pred).0
 }
 
 fn attr_is_non_test_cfg(attr: &str) -> bool {
@@ -234,6 +339,50 @@ fn extract_serde_fn_refs(attrs: &[String], from_id: &str, line: usize, refs: &mu
     }
 }
 
+fn strip_balanced_generics(path: &str) -> String {
+    let trimmed = path.trim();
+    // Handle `<Type as Trait>::method` -> keep `Type::method`
+    let mut out = String::with_capacity(trimmed.len());
+    if let Some(rest) = trimmed.strip_prefix('<') {
+        let mut depth = 1usize;
+        let mut end_idx = None;
+        for (i, ch) in rest.char_indices() {
+            match ch {
+                '<' => depth += 1,
+                '>' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        end_idx = Some(i);
+                        break;
+                    }
+                }
+                _ => {}
+            }
+        }
+        if let Some(end) = end_idx {
+            let inside = &rest[..end];
+            let after = &rest[end + 1..];
+            let target_part = inside.split(" as ").next().unwrap_or(inside).trim();
+            let base = extract_rust_base_type_name(target_part);
+            if !base.is_empty() {
+                out.push_str(&base);
+            }
+            out.push_str(&strip_balanced_generics(after));
+            return out;
+        }
+    }
+    let mut depth = 0usize;
+    for ch in trimmed.chars() {
+        match ch {
+            '<' => depth += 1,
+            '>' => depth = depth.saturating_sub(1),
+            _ if depth == 0 => out.push(ch),
+            _ => {}
+        }
+    }
+    out
+}
+
 fn emit_scoped_call_ref(
     from_id: &str,
     path: &str,
@@ -241,20 +390,27 @@ fn emit_scoped_call_ref(
     line: usize,
     refs: &mut Vec<RawRef>,
 ) {
-    let clean = path.split('<').next().unwrap_or(path).trim();
+    let clean = strip_balanced_generics(path);
     let parts: Vec<&str> = clean.split("::").filter(|p| !p.is_empty()).collect();
     let Some(&last) = parts.last() else {
         return;
     };
-    let raw_qual = if parts.len() >= 2 {
-        Some(parts[parts.len() - 2])
-    } else {
+    let prefix_parts: Vec<&str> = parts[..parts.len() - 1]
+        .iter()
+        .copied()
+        .filter(|p| !matches!(*p, "crate" | "super" | "self"))
+        .collect();
+    let qual = if prefix_parts.is_empty() {
         None
-    };
-    let qual = match raw_qual {
-        Some("Self") => impl_type.map(|t| t.to_string()),
-        Some("crate") | Some("super") | Some("self") | None => None,
-        Some(q) => Some(q.to_string()),
+    } else if prefix_parts.last() == Some(&"Self") {
+        impl_type.map(|t| t.to_string())
+    } else if prefix_parts
+        .last()
+        .is_some_and(|p| p.chars().next().is_some_and(|c| c.is_ascii_uppercase()))
+    {
+        prefix_parts.last().map(|p| (*p).to_string())
+    } else {
+        Some(prefix_parts.join("::"))
     };
     if let Some(ref q) = qual
         && q.chars().next().is_some_and(|c| c.is_ascii_uppercase())
@@ -279,10 +435,12 @@ fn emit_scoped_call_ref(
     });
 }
 
+#[allow(clippy::too_many_arguments)]
 fn walk_rust_items(
     parent: Node<'_>,
     ctx: &mut RustExtractCtx<'_>,
     impl_type: Option<&str>,
+    mod_path: &str,
     in_test_mod: bool,
     in_trait_impl: bool,
     in_cfg_item: bool,
@@ -311,9 +469,29 @@ fn walk_rust_items(
             "mod_item" => {
                 let sub_test = in_test_mod || has_test_attr;
                 let sub_cfg = in_cfg_item || has_cfg_attr;
+                let mod_name = child
+                    .child_by_field_name("name")
+                    .map(|n| node_text(n, ctx.src))
+                    .unwrap_or("");
+                let next_mod = if mod_path.is_empty() {
+                    mod_name.to_string()
+                } else if mod_name.is_empty() {
+                    mod_path.to_string()
+                } else {
+                    format!("{}::{}", mod_path, mod_name)
+                };
                 if let Some(body) = child.child_by_field_name("body") {
                     let mut dummy = Vec::new();
-                    walk_rust_items(body, ctx, impl_type, sub_test, in_trait_impl, sub_cfg, &mut dummy);
+                    walk_rust_items(
+                        body,
+                        ctx,
+                        impl_type,
+                        &next_mod,
+                        sub_test,
+                        in_trait_impl,
+                        sub_cfg,
+                        &mut dummy,
+                    );
                 }
             }
             "impl_item" => {
@@ -360,6 +538,7 @@ fn walk_rust_items(
                         body,
                         ctx,
                         ty.as_deref(),
+                        mod_path,
                         impl_is_test,
                         in_trait_impl || is_trait_impl,
                         impl_is_cfg,
@@ -381,7 +560,8 @@ fn walk_rust_items(
                         .unwrap_or(&trait_path)
                         .trim()
                         .to_string();
-                    let trait_type_args = extract_generic_type_arg_names(&raw_trait, Some(&type_name));
+                    let trait_type_args =
+                        extract_generic_type_arg_names(&raw_trait, Some(&type_name));
                     ctx.trait_impls.push(TraitImplInfo {
                         type_name,
                         trait_name,
@@ -475,7 +655,14 @@ fn walk_rust_items(
                         });
                         let mut env = RustLocalEnv::new();
                         if let Some(ty_node) = child.child_by_field_name("type") {
-                            collect_type_refs(ty_node, ctx.src, &id, &mut ctx.refs);
+                            collect_type_refs(
+                                ty_node,
+                                ctx.src,
+                                &id,
+                                impl_type,
+                                &mut ctx.refs,
+                                &mut ctx.bridges,
+                            );
                         }
                         if let Some(val_node) = child.child_by_field_name("value") {
                             walk_rust_expr(
@@ -505,7 +692,8 @@ fn walk_rust_items(
                     let is_cfg = (in_cfg_item || has_cfg_attr) && !is_test;
                     let is_entrypoint = name == "main" || has_export_attr;
                     if is_cfg {
-                        ctx.cfg_gated_symbols.push(id.clone());
+                        ctx.cfg_gated_symbols
+                            .insert(id.clone(), mod_path.to_string());
                     }
                     collected_methods.push(id.clone());
                     ctx.symbols.push(Symbol {
@@ -543,8 +731,16 @@ fn walk_rust_items(
                     }
 
                     if let Some(ret_node) = child.child_by_field_name("return_type") {
-                        collect_type_refs(ret_node, ctx.src, &id, &mut ctx.refs);
-                        let norm = normalize_rust_type_text(node_text(ret_node, ctx.src), impl_type);
+                        collect_type_refs(
+                            ret_node,
+                            ctx.src,
+                            &id,
+                            impl_type,
+                            &mut ctx.refs,
+                            &mut ctx.bridges,
+                        );
+                        let norm =
+                            normalize_rust_type_text(node_text(ret_node, ctx.src), impl_type);
                         if !norm.is_empty() {
                             ctx.func_return_types.insert(id.clone(), vec![norm]);
                         }
@@ -558,6 +754,7 @@ fn walk_rust_items(
                         &id,
                         &mut env,
                         &mut ctx.refs,
+                        &mut ctx.bridges,
                     );
 
                     if let Some(body) = child.child_by_field_name("body") {
@@ -640,7 +837,14 @@ fn walk_rust_items(
                             ctx.interface_methods.insert(id.clone(), trait_methods);
                         }
                     }
-                    collect_type_refs(child, ctx.src, &id, &mut ctx.refs);
+                    collect_type_refs(
+                        child,
+                        ctx.src,
+                        &id,
+                        impl_type,
+                        &mut ctx.refs,
+                        &mut ctx.bridges,
+                    );
                 }
             }
             _ => {}
@@ -724,7 +928,9 @@ fn extract_rust_trait_methods(
                 }
                 if let Some(fbody) = ch.child_by_field_name("body") {
                     let mut env = RustLocalEnv::new();
-                    let _ = extract_rust_params_into_env(ch, src, None, trait_id, &mut env, refs);
+                    let _ = extract_rust_params_into_env(
+                        ch, src, None, trait_id, &mut env, refs, bridges,
+                    );
                     walk_rust_expr(fbody, src, trait_id, None, &mut env, refs, bridges);
                 }
             }
@@ -754,6 +960,7 @@ fn extract_rust_params_into_env(
     from_id: &str,
     env: &mut RustLocalEnv,
     refs: &mut Vec<RawRef>,
+    bridges: &mut Vec<BridgeHint>,
 ) -> Vec<String> {
     let mut params = Vec::new();
     if let Some(plist) = node.child_by_field_name("parameters") {
@@ -761,7 +968,7 @@ fn extract_rust_params_into_env(
         for ch in plist.children(&mut c) {
             if ch.kind() == "parameter" {
                 let param_ty = ch.child_by_field_name("type").and_then(|t| {
-                    collect_type_refs(t, src, from_id, refs);
+                    collect_type_refs(t, src, from_id, impl_type, refs, bridges);
                     let norm = normalize_rust_type_text(node_text(t, src), impl_type);
                     if norm.is_empty() {
                         None
@@ -770,7 +977,10 @@ fn extract_rust_params_into_env(
                     }
                 });
                 if let Some(pat) = ch.child_by_field_name("pattern") {
-                    let raw_pat = node_text(pat, src).trim().trim_start_matches("mut ").to_string();
+                    let raw_pat = node_text(pat, src)
+                        .trim()
+                        .trim_start_matches("mut ")
+                        .to_string();
                     params.push(raw_pat);
                     bind_rust_pattern(pat, src, param_ty, env);
                 }
@@ -791,15 +1001,31 @@ fn bind_rust_pattern(
     env: &mut RustLocalEnv,
 ) {
     match pat.kind() {
+        "match_pattern" => {
+            let cond_id = pat.child_by_field_name("condition").map(|n| n.id());
+            let mut c = pat.walk();
+            for ch in pat.children(&mut c) {
+                if ch.is_named() && Some(ch.id()) != cond_id {
+                    bind_rust_pattern(ch, src, inferred_chain.clone(), env);
+                }
+            }
+        }
         "identifier" => {
             let name = node_text(pat, src);
-            if name.chars().next().is_some_and(|c| c.is_ascii_lowercase() || c == '_') {
+            if name
+                .chars()
+                .next()
+                .is_some_and(|c| c.is_ascii_lowercase() || c == '_')
+            {
                 env.bind(name.to_string(), inferred_chain);
             }
         }
         "mut_pattern" | "ref_pattern" | "reference_pattern" => {
-            if let Some(inner) = pat.named_child(0) {
-                bind_rust_pattern(inner, src, inferred_chain, env);
+            let mut c = pat.walk();
+            for ch in pat.children(&mut c) {
+                if ch.is_named() && ch.kind() != "mutable_specifier" {
+                    bind_rust_pattern(ch, src, inferred_chain.clone(), env);
+                }
             }
         }
         "tuple_struct_pattern" => {
@@ -819,7 +1045,11 @@ fn bind_rust_pattern(
                     bind_rust_pattern(
                         ch,
                         src,
-                        if is_wrapper { inferred_chain.clone() } else { None },
+                        if is_wrapper {
+                            inferred_chain.clone()
+                        } else {
+                            None
+                        },
                         env,
                     );
                 }
@@ -1186,43 +1416,17 @@ fn normalize_rust_type_text(raw: &str, impl_type: Option<&str>) -> String {
     {
         return String::new();
     }
-    short_base.to_string()
-}
-
-fn is_transparent_wrapper_method(name: &str) -> bool {
-    matches!(
-        name,
-        "lock"
-            | "try_lock"
-            | "blocking_lock"
-            | "read"
-            | "try_read"
-            | "blocking_read"
-            | "write"
-            | "try_write"
-            | "blocking_write"
-            | "borrow"
-            | "borrow_mut"
-            | "try_borrow"
-            | "try_borrow_mut"
-            | "clone"
-            | "cloned"
-            | "copied"
-            | "as_ref"
-            | "as_mut"
-            | "as_deref"
-            | "as_deref_mut"
-            | "unwrap"
-            | "expect"
-            | "ok"
-            | "into_inner"
-            | "deref"
-            | "deref_mut"
-            | "pin"
-            | "load"
-            | "load_full"
-            | "get_or_init"
-    )
+    // Preserve module qualifier (e.g. `remote::Worker`) while dropping `crate`/`super`/`self`.
+    let segs: Vec<&str> = base
+        .split("::")
+        .map(str::trim)
+        .filter(|p| !p.is_empty() && !matches!(*p, "crate" | "super" | "self"))
+        .collect();
+    if segs.len() >= 2 {
+        segs.join("::")
+    } else {
+        short_base.to_string()
+    }
 }
 
 fn is_transparent_wrapper_ctor(ftxt: &str) -> bool {
@@ -1273,13 +1477,9 @@ fn extract_rust_receiver_chain(
         }
         "struct_expression" => {
             let name_node = expr.child_by_field_name("name")?;
-            let base = extract_rust_base_type_name(node_text(name_node, src));
-            let resolved = if base == "Self" {
-                impl_type?.to_string()
-            } else {
-                base
-            };
-            if resolved.is_empty() || is_rust_builtin_type(&resolved) {
+            let norm = normalize_rust_type_text(node_text(name_node, src), impl_type);
+            let resolved = norm.trim_start_matches("[]").to_string();
+            if resolved.is_empty() {
                 None
             } else {
                 Some(vec![ReceiverStep::Type(resolved)])
@@ -1316,15 +1516,6 @@ fn extract_rust_receiver_chain(
                     let recv = func.child_by_field_name("value")?;
                     let mname = node_text(func.child_by_field_name("field")?, src);
                     let mut chain = extract_rust_receiver_chain(recv, src, env, impl_type)?;
-                    if is_transparent_wrapper_method(mname)
-                        || matches!(mname, "iter" | "iter_mut" | "into_iter" | "values" | "values_mut")
-                    {
-                        return Some(chain);
-                    }
-                    if matches!(mname, "get" | "get_mut" | "first" | "last" | "pop" | "next" | "remove") {
-                        chain.push(ReceiverStep::Elem);
-                        return Some(chain);
-                    }
                     chain.push(ReceiverStep::MethodCall {
                         name: mname.to_string(),
                         result_index: 0,
@@ -1332,7 +1523,8 @@ fn extract_rust_receiver_chain(
                     Some(chain)
                 }
                 "scoped_identifier" => {
-                    let parts: Vec<&str> = ftxt.split("::").filter(|p| !p.is_empty()).collect();
+                    let clean = strip_balanced_generics(ftxt);
+                    let parts: Vec<&str> = clean.split("::").filter(|p| !p.is_empty()).collect();
                     let last = *parts.last()?;
                     let raw_qual = if parts.len() >= 2 {
                         Some(parts[parts.len() - 2])
@@ -1362,21 +1554,56 @@ fn extract_rust_receiver_chain(
     }
 }
 
-fn collect_type_refs(node: Node<'_>, src: &str, from_id: &str, refs: &mut Vec<RawRef>) {
+fn collect_type_refs(
+    node: Node<'_>,
+    src: &str,
+    from_id: &str,
+    impl_type: Option<&str>,
+    refs: &mut Vec<RawRef>,
+    bridges: &mut Vec<BridgeHint>,
+) {
     let mut stack = vec![node];
     while let Some(n) = stack.pop() {
-        if n.kind() == "type_identifier" {
-            let t = node_text(n, src);
-            if !is_rust_builtin_type(t) {
-                refs.push(RawRef {
-                    from_symbol_id: from_id.to_string(),
-                    target_name: t.to_string(),
-                    qualifier: None,
-                    kind: EdgeKind::TypeRef,
-                    line: n.start_position().row + 1,
-                    receiver_chain: None,
-                });
+        match n.kind() {
+            "type_identifier" => {
+                let t = node_text(n, src);
+                if !is_rust_builtin_type(t) {
+                    refs.push(RawRef {
+                        from_symbol_id: from_id.to_string(),
+                        target_name: t.to_string(),
+                        qualifier: None,
+                        kind: EdgeKind::TypeRef,
+                        line: n.start_position().row + 1,
+                        receiver_chain: None,
+                    });
+                }
             }
+            "array_type" => {
+                if let Some(elem) = n.child_by_field_name("element") {
+                    stack.push(elem);
+                }
+                if let Some(len_expr) = n.child_by_field_name("length") {
+                    let mut env = RustLocalEnv::new();
+                    walk_rust_expr(len_expr, src, from_id, impl_type, &mut env, refs, bridges);
+                }
+                continue;
+            }
+            "enum_variant" => {
+                if let Some(body) = n.child_by_field_name("body") {
+                    stack.push(body);
+                }
+                if let Some(val_expr) = n.child_by_field_name("value") {
+                    let mut env = RustLocalEnv::new();
+                    walk_rust_expr(val_expr, src, from_id, impl_type, &mut env, refs, bridges);
+                }
+                continue;
+            }
+            "const_block" => {
+                let mut env = RustLocalEnv::new();
+                walk_rust_expr(n, src, from_id, impl_type, &mut env, refs, bridges);
+                continue;
+            }
+            _ => {}
         }
         let mut c = n.walk();
         for ch in n.children(&mut c) {
@@ -1406,7 +1633,7 @@ fn walk_rust_expr(
         }
         "let_declaration" => {
             if let Some(ty) = node.child_by_field_name("type") {
-                collect_type_refs(ty, src, from_id, refs);
+                collect_type_refs(ty, src, from_id, impl_type, refs, bridges);
             }
             if let Some(val) = node.child_by_field_name("value") {
                 walk_rust_expr(val, src, from_id, impl_type, env, refs, bridges);
@@ -1479,7 +1706,7 @@ fn walk_rust_expr(
                 for ch in plist.children(&mut c) {
                     if ch.kind() == "parameter" {
                         let pty = ch.child_by_field_name("type").and_then(|t| {
-                            collect_type_refs(t, src, from_id, refs);
+                            collect_type_refs(t, src, from_id, impl_type, refs, bridges);
                             let norm = normalize_rust_type_text(node_text(t, src), impl_type);
                             if norm.is_empty() {
                                 None
@@ -1503,8 +1730,23 @@ fn walk_rust_expr(
         "match_arm" => {
             env.push_scope();
             if let Some(pat) = node.child_by_field_name("pattern") {
-                collect_pattern_type_refs(pat, src, from_id, refs);
-                bind_rust_pattern(pat, src, None, env);
+                if pat.kind() == "match_pattern" {
+                    let cond = pat.child_by_field_name("condition");
+                    let cond_id = cond.map(|n| n.id());
+                    let mut pc = pat.walk();
+                    for pch in pat.children(&mut pc) {
+                        if pch.is_named() && Some(pch.id()) != cond_id {
+                            collect_pattern_type_refs(pch, src, from_id, refs);
+                            bind_rust_pattern(pch, src, None, env);
+                        }
+                    }
+                    if let Some(guard) = cond {
+                        walk_rust_expr(guard, src, from_id, impl_type, env, refs, bridges);
+                    }
+                } else {
+                    collect_pattern_type_refs(pat, src, from_id, refs);
+                    bind_rust_pattern(pat, src, None, env);
+                }
             }
             let mut c = node.walk();
             for ch in node.children(&mut c) {
@@ -1519,7 +1761,7 @@ fn walk_rust_expr(
             if let Some(raw_func) = node.child_by_field_name("function") {
                 let func = if raw_func.kind() == "generic_function" {
                     if let Some(targs) = raw_func.child_by_field_name("type_arguments") {
-                        collect_type_refs(targs, src, from_id, refs);
+                        collect_type_refs(targs, src, from_id, impl_type, refs, bridges);
                     }
                     raw_func.child_by_field_name("function").unwrap_or(raw_func)
                 } else {
@@ -1643,7 +1885,7 @@ fn walk_rust_expr(
         }
         "generic_function" => {
             if let Some(targs) = node.child_by_field_name("type_arguments") {
-                collect_type_refs(targs, src, from_id, refs);
+                collect_type_refs(targs, src, from_id, impl_type, refs, bridges);
             }
             if let Some(inner) = node.child_by_field_name("function") {
                 walk_rust_expr(inner, src, from_id, impl_type, env, refs, bridges);
@@ -1817,7 +2059,7 @@ fn scan_rust_token_tree(
         let kind = ch.kind();
         let line = ch.start_position().row + 1;
 
-        if kind == "token_tree" {
+        if kind == "token_tree" || kind == "token_repetition" {
             scan_rust_token_tree(ch, src, from_id, impl_type, env, refs, bridges);
             i += 1;
             continue;
@@ -2036,7 +2278,12 @@ pub fn lower_rust_node(node: Node<'_>, src: &str) -> IrNode {
         "let_declaration" => {
             let dst = node
                 .child_by_field_name("pattern")
-                .map(|p| node_text(p, src).trim().trim_start_matches("mut ").to_string())
+                .map(|p| {
+                    node_text(p, src)
+                        .trim()
+                        .trim_start_matches("mut ")
+                        .to_string()
+                })
                 .unwrap_or_else(|| "_".into());
             let val = node
                 .child_by_field_name("value")
@@ -2165,7 +2412,10 @@ pub fn lower_rust_node(node: Node<'_>, src: &str) -> IrNode {
                 let mut c = body.walk();
                 for ch in body.children(&mut c) {
                     if ch.kind() == "match_arm" {
-                        let pat = ch.child_by_field_name("pattern").map(|p| node_text(p, src).trim().to_string()).unwrap_or_default();
+                        let pat = ch
+                            .child_by_field_name("pattern")
+                            .map(|p| node_text(p, src).trim().to_string())
+                            .unwrap_or_default();
                         let val = ch
                             .child_by_field_name("value")
                             .map(|v| lower_rust_node(v, src))
@@ -2193,7 +2443,9 @@ pub fn lower_rust_node(node: Node<'_>, src: &str) -> IrNode {
             IrNode::PropagateErr(Box::new(inner))
         }
         "return_expression" => {
-            let val = node.named_child(0).map(|n| Box::new(lower_rust_node(n, src)));
+            let val = node
+                .named_child(0)
+                .map(|n| Box::new(lower_rust_node(n, src)));
             IrNode::Return(val)
         }
         "break_expression" => IrNode::Break,
@@ -2286,12 +2538,8 @@ pub fn lower_rust_node(node: Node<'_>, src: &str) -> IrNode {
             .map(|n| lower_rust_node(n, src))
             .unwrap_or_else(|| IrNode::Opaque("paren".into())),
         "identifier" | "self" => IrNode::Var(node_text(node, src).to_string()),
-        "integer_literal"
-        | "float_literal"
-        | "string_literal"
-        | "raw_string_literal"
-        | "char_literal"
-        | "boolean_literal" => literal_node(node_text(node, src)),
+        "integer_literal" | "float_literal" | "string_literal" | "raw_string_literal"
+        | "char_literal" | "boolean_literal" => literal_node(node_text(node, src)),
         _ => IrNode::Opaque(node.kind().to_string()),
     }
 }
