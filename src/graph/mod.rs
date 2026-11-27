@@ -1484,7 +1484,20 @@ fn resolve_ref(
                     })
                     .collect()
             } else if r.qualifier.is_some() {
-                ids.iter().filter(|id| *id != &r.from_symbol_id).collect()
+                let ts_family = matches!(
+                    ext.lang,
+                    Language::TypeScript | Language::JavaScript | Language::Svelte
+                ) && r.kind == EdgeKind::Calls;
+                ids.iter()
+                    .filter(|id| {
+                        *id != &r.from_symbol_id
+                            && (!ts_family
+                                || symbols
+                                    .get(*id)
+                                    .map(|s| s.kind == SymbolKind::Method)
+                                    .unwrap_or(false))
+                    })
+                    .collect()
             } else {
                 ids.iter().collect()
             };

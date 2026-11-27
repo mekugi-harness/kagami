@@ -3374,3 +3374,166 @@ testOnlyHelper();
         );
     }
 }
+
+
+#[test]
+fn test_svelte5_ts_review_edge_cases() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    std::fs::create_dir_all(root.join("src/routes")).unwrap();
+    std::fs::create_dir_all(root.join("src/ui")).unwrap();
+
+    // 1. Same-file property read must not hide unused free function;
+    //    hoisted local function / var must shadow imported function;
+    //    for..of & catch destructuring defaults and assignment targets must stay live;
+    //    this.run() on Worker in a.ts must not mark Worker.run in b.ts live.
+    std::fs::write(
+        root.join("src/imported.ts"),
+        r#"
+export function unusedImportedForHoistFn() {}
+export function unusedImportedForHoistVar() {}
+"#,
+    )
+    .unwrap();
+
+    std::fs::write(
+        root.join("src/b.ts"),
+        r#"
+export class Worker {
+  run(): void {}
+}
+"#,
+    )
+    .unwrap();
+
+    std::fs::write(
+        root.join("src/a.ts"),
+        r#"
+import {
+  unusedImportedForHoistFn as hoistedFn,
+  unusedImportedForHoistVar as hoistedVar,
+} from "./imported";
+
+function sameFileFormat() {}
+function makeId() { return "id"; }
+function getIndex() { return 0; }
+function fallbackMessage() { return "err"; }
+
+class Worker {
+  start(): void {
+    this.run();
+  }
+  run(): void {}
+}
+
+function boot(config: { sameFileFormat: string }, rows: Array<{ id?: string }>, target: number[]) {
+  console.log(config.sameFileFormat);
+  hoistedFn();
+  function hoistedFn() {}
+  if (rows.length >= 0) {
+    var hoistedVar = () => {};
+  }
+  hoistedVar();
+  for (const { id = makeId() } of rows) {
+    console.log(id);
+  }
+  for (target[getIndex()] of [1]) {
+    void target;
+  }
+  try {
+    new Worker().start();
+  } catch ({ message = fallbackMessage() }: any) {
+    console.log(message);
+  }
+}
+
+boot({ sameFileFormat: "x" }, [], []);
+"#,
+    )
+    .unwrap();
+
+    // 2. Custom alias Svelte component import (@ui/CustomBtn.svelte)
+    std::fs::write(
+        root.join("src/ui/CustomBtn.svelte"),
+        r#"<button>Click</button>"#,
+    )
+    .unwrap();
+
+    // 3. Script string containing "<!--" must not hide template;
+    //    {#each} / {@const} bindings must shadow unused script functions inside block,
+    //    while outer callable resolves again after block closes.
+    std::fs::write(
+        root.join("src/routes/+page.svelte"),
+        r#"<script lang="ts">
+  import PrimaryBtn from "@ui/CustomBtn.svelte";
+  const marker = "<!--";
+  function renderLabel() { return marker; }
+  function label() { return "unused"; }
+  function afterBlock() { return "used-after"; }
+  let labels = ["a", "b"];
+</script>
+
+<PrimaryBtn />
+<p>{renderLabel()}</p>
+{#each labels as label (label)}
+  <span>{label.toUpperCase()}</span>
+{/each}
+{#each labels as afterBlock}
+  <span>{afterBlock}</span>
+{/each}
+<span>{afterBlock()}</span>
+"#,
+    )
+    .unwrap();
+
+    let ignores = KagamiConfig::default().build_ignore_globset().unwrap();
+    let files = discover_files(root, &ignores, None).unwrap();
+    let graph = CodeGraph::build(root, &files, false).unwrap();
+    let dead = analyze_dead(
+        &graph,
+        &DeadOptions {
+            scope: DeadScope::Prod,
+            langs: None,
+            allowlist: std::collections::HashSet::new(),
+            include_clusters: true,
+            path_filter: None,
+            min_confidence: Confidence::Heuristic,
+        },
+    );
+
+    let is_dead = |file_suffix: &str, sym: &str| {
+        dead.symbols
+            .iter()
+            .any(|s| s.file.ends_with(file_suffix) && s.symbol == sym)
+    };
+
+    for (file, sym) in [
+        ("src/a.ts", "makeId"),
+        ("src/a.ts", "getIndex"),
+        ("src/a.ts", "fallbackMessage"),
+        ("src/a.ts", "Worker.run"),
+        ("src/ui/CustomBtn.svelte", "CustomBtn"),
+        ("src/routes/+page.svelte", "renderLabel"),
+        ("src/routes/+page.svelte", "afterBlock"),
+    ] {
+        assert!(
+            !is_dead(file, sym),
+            "Expected {file}::{sym} to be live; dead={:?}",
+            dead.symbols
+        );
+    }
+
+    for (file, sym) in [
+        ("src/a.ts", "sameFileFormat"),
+        ("src/imported.ts", "unusedImportedForHoistFn"),
+        ("src/imported.ts", "unusedImportedForHoistVar"),
+        ("src/b.ts", "Worker.run"),
+        ("src/routes/+page.svelte", "label"),
+    ] {
+        assert!(
+            is_dead(file, sym),
+            "Expected {file}::{sym} to remain dead; dead={:?}",
+            dead.symbols
+        );
+    }
+}

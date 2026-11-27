@@ -20,6 +20,7 @@ pub(crate) struct ImportedBinding {
 
 #[derive(Debug, Default, Clone)]
 pub(crate) struct TsRefContext {
+    pub(crate) file: String,
     pub(crate) imported_bindings: HashMap<String, ImportedBinding>,
     pub(crate) namespace_imports: HashMap<String, String>,
     pub(crate) local_callables: HashSet<String>,
@@ -37,6 +38,7 @@ pub(crate) struct TemplateExpr {
     pub(crate) line: usize,
     pub(crate) kind: TemplateExprKind,
     pub(crate) code: String,
+    pub(crate) shadowed: HashSet<String>,
 }
 
 pub(crate) fn collect_svelte_script_context(
@@ -81,7 +83,11 @@ pub(crate) fn extract_template_exprs(
         let Some(tree) = parser.parse(&wrapped, None) else {
             continue;
         };
-        let mut scopes = Vec::new();
+        let mut scopes = if expr.shadowed.is_empty() {
+            Vec::new()
+        } else {
+            vec![expr.shadowed.clone()]
+        };
         walk_ts_expr_refs(
             tree.root_node(),
             &wrapped,
@@ -167,6 +173,7 @@ pub(crate) fn extract_with_context(
         svelte_bind_this.extend(extra.svelte_bind_this.clone());
     }
     let ctx = TsRefContext {
+        file: rel_path.to_string(),
         imported_bindings,
         namespace_imports,
         local_callables,
@@ -407,20 +414,24 @@ fn collect_ts_imports(
                 match part.kind() {
                     "identifier" => {
                         let local = node_text(part, src).to_string();
-                        if resolved_file.is_some() {
-                            let target_name = if path.ends_with(".svelte") {
-                                Path::new(&path)
-                                    .file_stem()
-                                    .and_then(|s| s.to_str())
-                                    .unwrap_or(&local)
-                                    .to_string()
-                            } else {
-                                "<default>".to_string()
-                            };
+                        if path.ends_with(".svelte") {
+                            let target_name = Path::new(&path)
+                                .file_stem()
+                                .and_then(|s| s.to_str())
+                                .unwrap_or(&local)
+                                .to_string();
                             bindings.insert(
                                 local,
                                 ImportedBinding {
                                     target_name,
+                                    resolved_file: resolved_file.clone(),
+                                },
+                            );
+                        } else if resolved_file.is_some() {
+                            bindings.insert(
+                                local,
+                                ImportedBinding {
+                                    target_name: "<default>".to_string(),
                                     resolved_file: resolved_file.clone(),
                                 },
                             );
@@ -457,20 +468,24 @@ fn collect_ts_imports(
                                     .map(|a| node_text(a, src).to_string())
                                     .unwrap_or_else(|| orig.clone());
                                 if orig == "default" {
-                                    if resolved_file.is_some() {
-                                        let target_name = if path.ends_with(".svelte") {
-                                            Path::new(&path)
-                                                .file_stem()
-                                                .and_then(|s| s.to_str())
-                                                .unwrap_or(&local)
-                                                .to_string()
-                                        } else {
-                                            "<default>".to_string()
-                                        };
+                                    if path.ends_with(".svelte") {
+                                        let target_name = Path::new(&path)
+                                            .file_stem()
+                                            .and_then(|s| s.to_str())
+                                            .unwrap_or(&local)
+                                            .to_string();
                                         bindings.insert(
                                             local,
                                             ImportedBinding {
                                                 target_name,
+                                                resolved_file: resolved_file.clone(),
+                                            },
+                                        );
+                                    } else if resolved_file.is_some() {
+                                        bindings.insert(
+                                            local,
+                                            ImportedBinding {
+                                                target_name: "<default>".to_string(),
                                                 resolved_file: resolved_file.clone(),
                                             },
                                         );
@@ -819,6 +834,7 @@ fn walk_ts_nodes(
                             collect_ts_param_bindings(pnode, src, &mut param_names);
                             collect_ts_refs_and_bridges(pnode, src, line_offset, &id, ctx, &[], None, refs, bridges);
                         }
+                        collect_hoisted_var_bindings(body, src, &mut param_names);
                         collect_ts_refs_and_bridges(body, src, line_offset, &id, ctx, &[param_names], None, refs, bridges);
                         ir_funcs.push(IrFunc {
                             symbol_id: id,
@@ -869,6 +885,7 @@ fn walk_ts_nodes(
                                     collect_ts_refs_and_bridges(pnode, src, line_offset, &id, ctx, &[], None, refs, bridges);
                                 }
                                 if let Some(body) = fn_val.child_by_field_name("body") {
+                                    collect_hoisted_var_bindings(body, src, &mut param_names);
                                     collect_ts_refs_and_bridges(body, src, line_offset, &id, ctx, &[param_names], None, refs, bridges);
                                     ir_funcs.push(IrFunc {
                                         symbol_id: id,
@@ -934,6 +951,7 @@ fn walk_ts_nodes(
                                             collect_ts_param_bindings(pnode, src, &mut param_names);
                                             collect_ts_refs_and_bridges(pnode, src, line_offset, &mid, ctx, &[], Some(&cls), refs, bridges);
                                         }
+                                        collect_hoisted_var_bindings(mbody, src, &mut param_names);
                                         collect_ts_refs_and_bridges(mbody, src, line_offset, &mid, ctx, &[param_names], Some(&cls), refs, bridges);
                                         ir_funcs.push(IrFunc {
                                             symbol_id: mid,
@@ -1112,38 +1130,134 @@ fn collect_pattern_bindings(node: Node<'_>, src: &str, out: &mut HashSet<String>
     }
 }
 
+pub(crate) fn extract_ts_binding_names(pattern_src: &str) -> HashSet<String> {
+    let trimmed = pattern_src.trim();
+    if trimmed.is_empty() {
+        return HashSet::new();
+    }
+    let mut parser = Parser::new();
+    if parser
+        .set_language(&tree_sitter_typescript::LANGUAGE_TYPESCRIPT.into())
+        .is_err()
+    {
+        return HashSet::new();
+    }
+    let wrapped = format!("({}) => {{}};", trimmed);
+    let Some(tree) = parser.parse(&wrapped, None) else {
+        return HashSet::new();
+    };
+    let mut out = HashSet::new();
+    let mut stack = vec![tree.root_node()];
+    while let Some(n) = stack.pop() {
+        if n.kind() == "arrow_function" {
+            if let Some(p) = n.child_by_field_name("parameter") {
+                collect_pattern_bindings(p, &wrapped, &mut out);
+            }
+            if let Some(plist) = n.child_by_field_name("parameters") {
+                collect_ts_param_bindings(plist, &wrapped, &mut out);
+            }
+            break;
+        }
+        let mut c = n.walk();
+        for ch in n.children(&mut c) {
+            stack.push(ch);
+        }
+    }
+    out
+}
+
 fn collect_ts_param_bindings(plist: Node<'_>, src: &str, out: &mut HashSet<String>) {
     collect_pattern_bindings(plist, src, out);
+}
+
+fn collect_hoisted_var_bindings(node: Node<'_>, src: &str, out: &mut HashSet<String>) {
+    let mut stack = vec![node];
+    while let Some(n) = stack.pop() {
+        match n.kind() {
+            "arrow_function" | "function_expression" | "class_declaration" | "class" => {
+                continue;
+            }
+            "function_declaration" => {
+                if let Some(name_node) = n.child_by_field_name("name")
+                    && name_node.kind() == "identifier"
+                {
+                    out.insert(node_text(name_node, src).to_string());
+                }
+                continue;
+            }
+            "variable_declaration" => {
+                let mut c = n.walk();
+                for ch in n.children(&mut c) {
+                    if ch.kind() == "variable_declarator"
+                        && let Some(name_node) = ch.child_by_field_name("name")
+                    {
+                        collect_pattern_bindings(name_node, src, out);
+                    }
+                }
+            }
+            "for_in_statement" => {
+                let is_var = {
+                    let mut c = n.walk();
+                    n.children(&mut c).any(|ch| ch.kind() == "var")
+                };
+                if is_var && let Some(left) = n.child_by_field_name("left") {
+                    collect_pattern_bindings(left, src, out);
+                }
+            }
+            _ => {}
+        }
+        let mut c = n.walk();
+        for ch in n.children(&mut c) {
+            stack.push(ch);
+        }
+    }
+}
+
+fn collect_block_hoisted_fns(block: Node<'_>, src: &str, out: &mut HashSet<String>) {
+    let mut c = block.walk();
+    for ch in block.children(&mut c) {
+        if ch.kind() == "function_declaration"
+            && let Some(name_node) = ch.child_by_field_name("name")
+            && name_node.kind() == "identifier"
+        {
+            out.insert(node_text(name_node, src).to_string());
+        }
+    }
 }
 
 fn is_shadowed(scopes: &[HashSet<String>], name: &str) -> bool {
     scopes.iter().any(|s| s.contains(name))
 }
 
-fn resolve_member_qualifier(
+fn resolve_member_target(
     obj: Node<'_>,
+    prop: &str,
     src: &str,
     ctx: &TsRefContext,
     scopes: &[HashSet<String>],
     enclosing_class: Option<&str>,
-) -> Option<String> {
+) -> (String, Option<String>) {
     match obj.kind() {
         "identifier" => {
             let name = node_text(obj, src);
             if !is_shadowed(scopes, name) {
                 if let Some(svelte_file) = ctx.svelte_bind_this.get(name) {
-                    return Some(svelte_file.clone());
+                    return (prop.to_string(), Some(svelte_file.clone()));
                 }
                 if let Some(ns_file) = ctx.namespace_imports.get(name) {
-                    return Some(ns_file.clone());
+                    return (prop.to_string(), Some(ns_file.clone()));
                 }
             }
-            Some(name.to_string())
+            (prop.to_string(), Some(name.to_string()))
         }
-        "this" => enclosing_class
-            .map(|c| c.to_string())
-            .or_else(|| Some("this".to_string())),
-        _ => Some(node_text(obj, src).to_string()),
+        "this" => {
+            if let Some(cls) = enclosing_class {
+                (format!("{}.{}", cls, prop), Some(ctx.file.clone()))
+            } else {
+                (prop.to_string(), Some("this".to_string()))
+            }
+        }
+        _ => (prop.to_string(), Some(node_text(obj, src).to_string())),
     }
 }
 
@@ -1188,10 +1302,24 @@ fn walk_ts_expr_refs(
     let line = n.start_position().row + 1 + line_offset;
     match n.kind() {
         "statement_block" | "for_statement" => {
-            scopes.push(HashSet::new());
+            let mut block_scope = HashSet::new();
+            if n.kind() == "statement_block" {
+                collect_block_hoisted_fns(n, src, &mut block_scope);
+            }
+            scopes.push(block_scope);
             let mut c = n.walk();
             for ch in n.children(&mut c) {
-                walk_ts_expr_refs(ch, src, line_offset, from_id, ctx, scopes, enclosing_class, refs, bridges);
+                walk_ts_expr_refs(
+                    ch,
+                    src,
+                    line_offset,
+                    from_id,
+                    ctx,
+                    scopes,
+                    enclosing_class,
+                    refs,
+                    bridges,
+                );
             }
             scopes.pop();
             return;
@@ -1199,28 +1327,85 @@ fn walk_ts_expr_refs(
         "for_in_statement" => {
             scopes.push(HashSet::new());
             if let Some(right) = n.child_by_field_name("right") {
-                walk_ts_expr_refs(right, src, line_offset, from_id, ctx, scopes, enclosing_class, refs, bridges);
+                walk_ts_expr_refs(
+                    right,
+                    src,
+                    line_offset,
+                    from_id,
+                    ctx,
+                    scopes,
+                    enclosing_class,
+                    refs,
+                    bridges,
+                );
             }
-            if let Some(left) = n.child_by_field_name("left")
-                && let Some(top) = scopes.last_mut()
-            {
-                collect_pattern_bindings(left, src, top);
+            if let Some(left) = n.child_by_field_name("left") {
+                walk_ts_expr_refs(
+                    left,
+                    src,
+                    line_offset,
+                    from_id,
+                    ctx,
+                    scopes,
+                    enclosing_class,
+                    refs,
+                    bridges,
+                );
+                let is_decl = {
+                    let mut lc = n.walk();
+                    n.children(&mut lc)
+                        .any(|ch| matches!(ch.kind(), "const" | "let" | "var"))
+                };
+                if is_decl && let Some(top) = scopes.last_mut() {
+                    collect_pattern_bindings(left, src, top);
+                }
             }
             if let Some(body) = n.child_by_field_name("body") {
-                walk_ts_expr_refs(body, src, line_offset, from_id, ctx, scopes, enclosing_class, refs, bridges);
+                walk_ts_expr_refs(
+                    body,
+                    src,
+                    line_offset,
+                    from_id,
+                    ctx,
+                    scopes,
+                    enclosing_class,
+                    refs,
+                    bridges,
+                );
             }
             scopes.pop();
             return;
         }
         "catch_clause" => {
             scopes.push(HashSet::new());
-            if let Some(p) = n.child_by_field_name("parameter")
-                && let Some(top) = scopes.last_mut()
-            {
-                collect_pattern_bindings(p, src, top);
+            if let Some(p) = n.child_by_field_name("parameter") {
+                walk_ts_expr_refs(
+                    p,
+                    src,
+                    line_offset,
+                    from_id,
+                    ctx,
+                    scopes,
+                    enclosing_class,
+                    refs,
+                    bridges,
+                );
+                if let Some(top) = scopes.last_mut() {
+                    collect_pattern_bindings(p, src, top);
+                }
             }
             if let Some(body) = n.child_by_field_name("body") {
-                walk_ts_expr_refs(body, src, line_offset, from_id, ctx, scopes, enclosing_class, refs, bridges);
+                walk_ts_expr_refs(
+                    body,
+                    src,
+                    line_offset,
+                    from_id,
+                    ctx,
+                    scopes,
+                    enclosing_class,
+                    refs,
+                    bridges,
+                );
             }
             scopes.pop();
             return;
@@ -1242,26 +1427,79 @@ fn walk_ts_expr_refs(
                 collect_pattern_bindings(p, src, &mut fn_scope);
             }
             if let Some(pnode) = n.child_by_field_name("parameters") {
-                walk_ts_expr_refs(pnode, src, line_offset, from_id, ctx, scopes, enclosing_class, refs, bridges);
+                walk_ts_expr_refs(
+                    pnode,
+                    src,
+                    line_offset,
+                    from_id,
+                    ctx,
+                    scopes,
+                    enclosing_class,
+                    refs,
+                    bridges,
+                );
                 collect_ts_param_bindings(pnode, src, &mut fn_scope);
+            }
+            if let Some(body) = n.child_by_field_name("body") {
+                collect_hoisted_var_bindings(body, src, &mut fn_scope);
             }
             scopes.push(fn_scope);
             if let Some(body) = n.child_by_field_name("body") {
-                walk_ts_expr_refs(body, src, line_offset, from_id, ctx, scopes, enclosing_class, refs, bridges);
+                walk_ts_expr_refs(
+                    body,
+                    src,
+                    line_offset,
+                    from_id,
+                    ctx,
+                    scopes,
+                    enclosing_class,
+                    refs,
+                    bridges,
+                );
             }
             scopes.pop();
             return;
         }
         "variable_declarator" => {
             if let Some(ty) = n.child_by_field_name("type") {
-                walk_ts_expr_refs(ty, src, line_offset, from_id, ctx, scopes, enclosing_class, refs, bridges);
+                walk_ts_expr_refs(
+                    ty,
+                    src,
+                    line_offset,
+                    from_id,
+                    ctx,
+                    scopes,
+                    enclosing_class,
+                    refs,
+                    bridges,
+                );
             }
             if let Some(val) = n.child_by_field_name("value") {
-                walk_ts_expr_refs(val, src, line_offset, from_id, ctx, scopes, enclosing_class, refs, bridges);
+                walk_ts_expr_refs(
+                    val,
+                    src,
+                    line_offset,
+                    from_id,
+                    ctx,
+                    scopes,
+                    enclosing_class,
+                    refs,
+                    bridges,
+                );
             }
             if let Some(name_node) = n.child_by_field_name("name") {
                 if matches!(name_node.kind(), "object_pattern" | "array_pattern") {
-                    walk_ts_expr_refs(name_node, src, line_offset, from_id, ctx, scopes, enclosing_class, refs, bridges);
+                    walk_ts_expr_refs(
+                        name_node,
+                        src,
+                        line_offset,
+                        from_id,
+                        ctx,
+                        scopes,
+                        enclosing_class,
+                        refs,
+                        bridges,
+                    );
                 }
                 if let Some(top) = scopes.last_mut() {
                     collect_pattern_bindings(name_node, src, top);
@@ -1292,16 +1530,26 @@ fn walk_ts_expr_refs(
                         }
                     }
                     "member_expression" => {
-                        let qualifier = func.child_by_field_name("object").and_then(|o| {
-                            resolve_member_qualifier(o, src, ctx, scopes, enclosing_class)
-                        });
                         let prop = func
                             .child_by_field_name("property")
-                            .map(|p| node_text(p, src).to_string());
-                        if let Some(target) = prop {
+                            .map(|p| node_text(p, src));
+                        if let Some(prop_name) = prop {
+                            let (target_name, qualifier) = func
+                                .child_by_field_name("object")
+                                .map(|o| {
+                                    resolve_member_target(
+                                        o,
+                                        prop_name,
+                                        src,
+                                        ctx,
+                                        scopes,
+                                        enclosing_class,
+                                    )
+                                })
+                                .unwrap_or_else(|| (prop_name.to_string(), None));
                             refs.push(RawRef {
                                 from_symbol_id: from_id.to_string(),
-                                target_name: target,
+                                target_name,
                                 qualifier,
                                 kind: EdgeKind::Calls,
                                 line,
@@ -1309,11 +1557,31 @@ fn walk_ts_expr_refs(
                             });
                         }
                         if let Some(obj) = func.child_by_field_name("object") {
-                            walk_ts_expr_refs(obj, src, line_offset, from_id, ctx, scopes, enclosing_class, refs, bridges);
+                            walk_ts_expr_refs(
+                                obj,
+                                src,
+                                line_offset,
+                                from_id,
+                                ctx,
+                                scopes,
+                                enclosing_class,
+                                refs,
+                                bridges,
+                            );
                         }
                     }
                     _ => {
-                        walk_ts_expr_refs(func, src, line_offset, from_id, ctx, scopes, enclosing_class, refs, bridges);
+                        walk_ts_expr_refs(
+                            func,
+                            src,
+                            line_offset,
+                            from_id,
+                            ctx,
+                            scopes,
+                            enclosing_class,
+                            refs,
+                            bridges,
+                        );
                     }
                 }
             }
@@ -1322,7 +1590,17 @@ fn walk_ts_expr_refs(
                 if Some(ch.id()) == func_id {
                     continue;
                 }
-                walk_ts_expr_refs(ch, src, line_offset, from_id, ctx, scopes, enclosing_class, refs, bridges);
+                walk_ts_expr_refs(
+                    ch,
+                    src,
+                    line_offset,
+                    from_id,
+                    ctx,
+                    scopes,
+                    enclosing_class,
+                    refs,
+                    bridges,
+                );
             }
             return;
         }
@@ -1345,14 +1623,17 @@ fn walk_ts_expr_refs(
                 return;
             }
             if !is_inside_ts_type(n) {
-                let qualifier = n
-                    .child_by_field_name("object")
-                    .and_then(|o| resolve_member_qualifier(o, src, ctx, scopes, enclosing_class));
                 if let Some(prop) = n.child_by_field_name("property") {
-                    let target = node_text(prop, src).to_string();
+                    let prop_name = node_text(prop, src);
+                    let (target_name, qualifier) = n
+                        .child_by_field_name("object")
+                        .map(|o| {
+                            resolve_member_target(o, prop_name, src, ctx, scopes, enclosing_class)
+                        })
+                        .unwrap_or_else(|| (prop_name.to_string(), None));
                     refs.push(RawRef {
                         from_symbol_id: from_id.to_string(),
-                        target_name: target,
+                        target_name,
                         qualifier,
                         kind: EdgeKind::Calls,
                         line,
@@ -1361,7 +1642,17 @@ fn walk_ts_expr_refs(
                 }
             }
             if let Some(obj) = n.child_by_field_name("object") {
-                walk_ts_expr_refs(obj, src, line_offset, from_id, ctx, scopes, enclosing_class, refs, bridges);
+                walk_ts_expr_refs(
+                    obj,
+                    src,
+                    line_offset,
+                    from_id,
+                    ctx,
+                    scopes,
+                    enclosing_class,
+                    refs,
+                    bridges,
+                );
             }
             return;
         }
