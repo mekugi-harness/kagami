@@ -3718,6 +3718,9 @@ export class JsHelper {
   execute() {
     return 1;
   }
+  runAlt() {
+    return 2;
+  }
   unusedJsMethod() {
     return 0;
   }
@@ -3728,14 +3731,14 @@ export class JsConsumer {
   constructor() {
     this.alt = new JsHelper();
   }
-  execute() {
+  runConsumer() {
     this.#helper.execute();
-    this.alt.execute();
+    this.alt.runAlt();
   }
 }
 
 const jc = new JsConsumer();
-jc.execute();
+jc.runConsumer();
 "#,
     )
     .unwrap();
@@ -3834,6 +3837,26 @@ testOnlyHelper();
         has_resolved_auth_edge,
         "Expected Machine.authorize -> Connector.authorize at Confidence::Resolved"
     );
+    for (from_q, to_q) in [
+        ("JsConsumer.runConsumer", "JsHelper.execute"),
+        ("JsConsumer.runConsumer", "JsHelper.runAlt"),
+    ] {
+        let has_edge = graph.edges.iter().any(|e| {
+            graph
+                .symbols
+                .get(&e.from)
+                .is_some_and(|s| s.qualified_name == from_q)
+                && graph
+                    .symbols
+                    .get(&e.to)
+                    .is_some_and(|s| s.qualified_name == to_q)
+                && e.confidence == Confidence::Resolved
+        });
+        assert!(
+            has_edge,
+            "Expected {from_q} -> {to_q} at Confidence::Resolved"
+        );
+    }
     let has_resolved_rebound_ref = graph.extracts.iter().any(|ext| {
         ext.refs
             .iter()
@@ -3873,6 +3896,7 @@ testOnlyHelper();
         ("src/transport.ts", "SharedSvc.reset"),
         ("src/machine.ts", "LocalHelper.assist"),
         ("src/js_helper.js", "JsHelper.execute"),
+        ("src/js_helper.js", "JsHelper.runAlt"),
     ] {
         assert!(
             !is_dead(file, sym),
@@ -3891,6 +3915,186 @@ testOnlyHelper();
         ("src/transport.ts", "testOnlyHelper"),
         ("src/machine.ts", "LocalHelper.unusedLocal"),
         ("src/js_helper.js", "JsHelper.unusedJsMethod"),
+    ] {
+        assert!(
+            is_dead(file, sym),
+            "Expected {file}::{sym} to remain dead; dead={:?}",
+            dead.symbols
+        );
+    }
+}
+
+#[test]
+fn test_ts_js_class_field_review_edge_cases() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    std::fs::create_dir_all(root.join("src")).unwrap();
+
+    std::fs::write(
+        root.join("src/base.ts"),
+        r#"
+export class BaseWorker {
+  baseRun(): void {}
+  overriddenRun(): void {}
+}
+
+export class SubWorker extends BaseWorker {
+  overriddenRun(): void {}
+}
+
+export class DefaultWorker {
+  work(): void {}
+}
+
+export class FastWorker {
+  work(): void {}
+}
+
+export class RealWorker {
+  serve(): void {}
+}
+
+export class OtherWorker {
+  serve(): void {}
+}
+
+export class NullishFirstSvc {
+  ping(): void {}
+}
+"#,
+    )
+    .unwrap();
+
+    std::fs::write(
+        root.join("src/default_svc.ts"),
+        r#"
+export default class DefaultExportedSvc {
+  handle(): void {}
+  unusedDefault(): void {}
+}
+"#,
+    )
+    .unwrap();
+
+    std::fs::write(
+        root.join("src/real_aliased.ts"),
+        r#"
+export class RealAliasedSvc {
+  invoke(): void {}
+  unusedAliased(): void {}
+}
+"#,
+    )
+    .unwrap();
+
+    std::fs::write(
+        root.join("src/barrel.ts"),
+        r#"
+export { RealAliasedSvc as AliasedSvc } from "./real_aliased";
+"#,
+    )
+    .unwrap();
+
+    std::fs::write(
+        root.join("src/consumer.ts"),
+        r#"
+import {
+  BaseWorker,
+  SubWorker,
+  DefaultWorker,
+  FastWorker,
+  RealWorker,
+  OtherWorker,
+  NullishFirstSvc,
+} from "./base";
+import DefaultSvc from "./default_svc";
+import { AliasedSvc } from "./barrel";
+
+export class Consumer {
+  #sub = new SubWorker();
+  readonly poly: BaseWorker = new SubWorker();
+  worker = new DefaultWorker();
+  #real: RealWorker;
+  #nullishFirst: null | undefined | NullishFirstSvc = null;
+  #defSvc = new DefaultSvc();
+  #aliased = new AliasedSvc();
+
+  constructor() {
+    this.worker = new FastWorker();
+    this.#real = new RealWorker();
+    const opts = {
+      init() {
+        this.#real = new OtherWorker();
+      },
+    };
+    void opts;
+  }
+
+  makeBase() {
+    return class {};
+  }
+
+  run(): void {
+    this.#sub.baseRun();
+    this.poly.overriddenRun();
+    this.worker.work();
+    this.#real.serve();
+    this.#nullishFirst?.ping();
+    this.#defSvc.handle();
+    this.#aliased.invoke();
+    class Nested extends this.makeBase() {}
+    void Nested;
+  }
+}
+
+new Consumer().run();
+"#,
+    )
+    .unwrap();
+
+    let ignores = KagamiConfig::default().build_ignore_globset().unwrap();
+    let files = discover_files(root, &ignores, None).unwrap();
+    let graph = CodeGraph::build(root, &files, false).unwrap();
+    let dead = analyze_dead(
+        &graph,
+        &DeadOptions {
+            scope: DeadScope::Prod,
+            langs: None,
+            allowlist: std::collections::HashSet::new(),
+            include_clusters: true,
+            path_filter: None,
+            min_confidence: Confidence::Heuristic,
+        },
+    );
+
+    let is_dead = |file_suffix: &str, sym: &str| {
+        dead.symbols
+            .iter()
+            .any(|s| s.file.ends_with(file_suffix) && s.symbol == sym)
+    };
+
+    for (file, sym) in [
+        ("src/base.ts", "BaseWorker.baseRun"),
+        ("src/base.ts", "SubWorker.overriddenRun"),
+        ("src/base.ts", "FastWorker.work"),
+        ("src/base.ts", "RealWorker.serve"),
+        ("src/base.ts", "NullishFirstSvc.ping"),
+        ("src/default_svc.ts", "DefaultExportedSvc.handle"),
+        ("src/real_aliased.ts", "RealAliasedSvc.invoke"),
+        ("src/consumer.ts", "Consumer.makeBase"),
+    ] {
+        assert!(
+            !is_dead(file, sym),
+            "Expected {file}::{sym} to be live; dead={:?}",
+            dead.symbols
+        );
+    }
+
+    for (file, sym) in [
+        ("src/base.ts", "DefaultWorker.work"),
+        ("src/base.ts", "OtherWorker.serve"),
+        ("src/default_svc.ts", "DefaultExportedSvc.unusedDefault"),
+        ("src/real_aliased.ts", "RealAliasedSvc.unusedAliased"),
     ] {
         assert!(
             is_dead(file, sym),
