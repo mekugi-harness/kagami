@@ -1,10 +1,11 @@
 pub mod blast;
 pub mod bridges;
 pub mod dead;
+pub mod scip;
 
 use crate::cache::{CacheData, CacheStore, PARSER_VERSION};
 use crate::lang;
-use crate::model::{Confidence, Edge, EdgeKind, FileExtract, Language, Symbol};
+use crate::model::{Confidence, Edge, EdgeKind, FileExtract, Language, Symbol, SymbolKind};
 use crate::walker::DiscoveredFile;
 use anyhow::Result;
 use rayon::prelude::*;
@@ -82,6 +83,12 @@ impl CodeGraph {
                         .entry((sym.lang, sym.package_or_module.as_str(), sym.name.as_str()))
                         .or_default()
                         .push(sym.id.clone());
+                    if let Some((_, short_pkg)) = sym.package_or_module.rsplit_once("::") {
+                        by_pkg_name
+                            .entry((sym.lang, short_pkg, sym.name.as_str()))
+                            .or_default()
+                            .push(sym.id.clone());
+                    }
                 }
                 by_lang_name
                     .entry((sym.lang, sym.name.as_str()))
@@ -109,6 +116,20 @@ impl CodeGraph {
         let mut seen: HashSet<(String, String, EdgeKind)> = HashSet::new();
 
         for ext in &extracts {
+            let mut alias_map: HashMap<&str, &str> = HashMap::new();
+            for imp in &ext.imports {
+                if let Some((alias, path)) = imp.split_once('=') {
+                    alias_map.insert(alias, path);
+                } else if let Some(last) = imp.rsplit('/').next() {
+                    alias_map.insert(last, imp.as_str());
+                    if last.starts_with('v') && last[1..].chars().all(|c| c.is_ascii_digit()) {
+                        if let Some(prev) = imp.rsplit('/').nth(1) {
+                            alias_map.insert(prev, imp.as_str());
+                        }
+                    }
+                }
+            }
+
             for r in &ext.refs {
                 if !symbols.contains_key(&r.from_symbol_id) {
                     continue;
@@ -116,6 +137,7 @@ impl CodeGraph {
                 let resolved = resolve_ref(
                     ext,
                     r,
+                    &alias_map,
                     &symbols,
                     &by_file_name,
                     &by_pkg_name,
@@ -165,9 +187,11 @@ impl CodeGraph {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn resolve_ref(
     ext: &FileExtract,
     r: &crate::model::RawRef,
+    alias_map: &HashMap<&str, &str>,
     symbols: &HashMap<String, Symbol>,
     by_file_name: &HashMap<(&str, &str), String>,
     by_pkg_name: &HashMap<(Language, &str, &str), Vec<String>>,
@@ -189,6 +213,68 @@ fn resolve_ref(
                 if ids.len() <= 3 {
                     return ids.iter().map(|id| (id.clone(), Confidence::Resolved)).collect();
                 }
+            }
+        }
+
+        // Package-qualified lookup (e.g. launch.Run(), composition.NativeRenderer())
+        if let Some(imp_path) = alias_map.get(qual.as_str()).copied() {
+            let mut pkg_keys = Vec::new();
+            if let Some(last) = imp_path.rsplit('/').next() {
+                pkg_keys.push(last);
+                if last.starts_with('v') && last[1..].chars().all(|c| c.is_ascii_digit()) {
+                    if let Some(prev) = imp_path.rsplit('/').nth(1) {
+                        pkg_keys.push(prev);
+                    }
+                }
+            }
+            if !pkg_keys.contains(&qual.as_str()) {
+                pkg_keys.push(qual.as_str());
+            }
+            let imp_tail = imp_path
+                .split('/')
+                .skip(1) // drop domain/module prefix when present
+                .collect::<Vec<_>>()
+                .join("/");
+            for pkg_key in pkg_keys {
+                if let Some(ids) = by_pkg_name.get(&(ext.lang, pkg_key, r.target_name.as_str())) {
+                    let narrowed: Vec<String> = ids
+                        .iter()
+                        .filter(|id| {
+                            symbols
+                                .get(*id)
+                                .map(|s| {
+                                    if s.kind == SymbolKind::Method {
+                                        return false;
+                                    }
+                                    let dir = s.file.rsplit_once('/').map(|(d, _)| d).unwrap_or("");
+                                    if imp_path.contains('/') {
+                                        dir == imp_path
+                                            || (!imp_tail.is_empty() && (dir == imp_tail || dir.ends_with(&format!("/{}", imp_tail))))
+                                            || (!dir.is_empty() && imp_path.ends_with(&format!("/{}", dir)))
+                                            || (dir.is_empty() && imp_path.split('/').count() <= 3)
+                                    } else {
+                                        dir == imp_path
+                                    }
+                                })
+                                .unwrap_or(false)
+                        })
+                        .cloned()
+                        .collect();
+                    if !narrowed.is_empty() && narrowed.len() <= 4 {
+                        return narrowed
+                            .into_iter()
+                            .map(|id| (id, Confidence::Resolved))
+                            .collect();
+                    }
+                }
+            }
+            return Vec::new();
+        }
+
+        // Non-package qualifier (receiver variable like c.Close()): prefer same-file method match first
+        if let Some(id) = by_file_name.get(&(ext.file.as_str(), r.target_name.as_str())) {
+            if symbols.get(id).map(|s| s.kind == SymbolKind::Method).unwrap_or(false) {
+                return vec![(id.clone(), Confidence::Resolved)];
             }
         }
     }
