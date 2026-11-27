@@ -150,9 +150,13 @@ fn scip_symbol_matches_name(scip_sym: &str, name: &str) -> bool {
     if name.is_empty() {
         return false;
     }
-    scip_sym
-        .split(|c: char| !c.is_ascii_alphanumeric() && c != '_')
-        .any(|tok| tok == name)
+    // Match against the terminal descriptor segment (ignoring earlier owner/type prefixes)
+    let trimmed = scip_sym.trim_end_matches(|c: char| matches!(c, '.' | '#' | '/' | '(' | ')' | '!' | ':'));
+    let terminal = trimmed
+        .rsplit(|c: char| !c.is_alphanumeric() && c != '_')
+        .next()
+        .unwrap_or("");
+    terminal == name
 }
 
 /// Apply a SCIP index overlay onto an existing CodeGraph, adding or upgrading edges to Confidence::Exact.
