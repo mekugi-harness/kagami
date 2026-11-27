@@ -22,9 +22,58 @@ pub(crate) struct ImportedBinding {
 pub(crate) struct TsRefContext {
     pub(crate) file: String,
     pub(crate) imported_bindings: HashMap<String, ImportedBinding>,
+    pub(crate) type_imported_bindings: HashMap<String, ImportedBinding>,
     pub(crate) namespace_imports: HashMap<String, String>,
+    pub(crate) type_namespace_imports: HashMap<String, String>,
     pub(crate) local_callables: HashSet<String>,
+    pub(crate) local_classes: HashSet<String>,
     pub(crate) svelte_bind_this: HashMap<String, String>,
+}
+
+#[derive(Debug, Default)]
+struct TsImports {
+    bindings: HashMap<String, ImportedBinding>,
+    type_bindings: HashMap<String, ImportedBinding>,
+    namespaces: HashMap<String, String>,
+    type_namespaces: HashMap<String, String>,
+}
+
+impl TsRefContext {
+    fn resolve_class_ident(&self, ident: &str, allow_type_only: bool) -> Option<ClassFieldTarget> {
+        let binding = self.imported_bindings.get(ident).or_else(|| {
+            if allow_type_only {
+                self.type_imported_bindings.get(ident)
+            } else {
+                None
+            }
+        });
+        if let Some(binding) = binding {
+            if binding.resolved_file.is_some() {
+                return Some((binding.target_name.clone(), binding.resolved_file.clone()));
+            }
+            return None;
+        }
+        if self.local_classes.contains(ident) {
+            return Some((ident.to_string(), Some(self.file.clone())));
+        }
+        None
+    }
+
+    fn resolve_ns_class(
+        &self,
+        ns: &str,
+        name: &str,
+        allow_type_only: bool,
+    ) -> Option<ClassFieldTarget> {
+        let ns_file = self.namespace_imports.get(ns).or_else(|| {
+            if allow_type_only {
+                self.type_namespace_imports.get(ns)
+            } else {
+                None
+            }
+        })?;
+        Some((name.to_string(), Some(ns_file.clone())))
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -32,6 +81,313 @@ struct EnclosingClassInfo {
     name: String,
     declared_methods: HashSet<String>,
     base_class: Option<(String, Option<String>)>,
+    instance_fields: ClassFieldMap,
+    static_fields: ClassFieldMap,
+    in_static_method: bool,
+}
+
+type ClassFieldTarget = (String, Option<String>);
+type ClassFieldMap = HashMap<String, ClassFieldTarget>;
+
+fn unwrap_ts_expr(mut node: Node<'_>) -> Node<'_> {
+    while matches!(
+        node.kind(),
+        "parenthesized_expression" | "non_null_expression"
+    ) {
+        if let Some(inner) = node.named_child(0) {
+            node = inner;
+        } else {
+            break;
+        }
+    }
+    node
+}
+
+fn has_child_kind(node: Node<'_>, kind: &str) -> bool {
+    let mut c = node.walk();
+    node.children(&mut c).any(|ch| ch.kind() == kind)
+}
+
+fn extract_ts_annotated_or_new_target(
+    node: Node<'_>,
+    src: &str,
+    ctx: &TsRefContext,
+    prefer_value: bool,
+) -> Option<ClassFieldTarget> {
+    let from_type = || {
+        node.child_by_field_name("type")
+            .and_then(|t| extract_ts_type_target(t, src, ctx))
+    };
+    let from_value = || {
+        node.child_by_field_name("value")
+            .and_then(|v| extract_ts_new_expr_target(v, src, ctx))
+    };
+    if prefer_value {
+        from_value().or_else(from_type)
+    } else {
+        from_type().or_else(from_value)
+    }
+}
+
+fn is_nullish_ts_type(node: Node<'_>, src: &str) -> bool {
+    match node.kind() {
+        "predefined_type" => {
+            matches!(
+                node_text(node, src),
+                "undefined" | "null" | "void" | "never"
+            )
+        }
+        "literal_type" => matches!(node_text(node, src).trim(), "null" | "undefined"),
+        _ => false,
+    }
+}
+
+fn collect_non_nullish_union_members<'a>(node: Node<'a>, src: &str, out: &mut Vec<Node<'a>>) {
+    match node.kind() {
+        "union_type" => {
+            let mut c = node.walk();
+            for ch in node.children(&mut c) {
+                if ch.is_named() {
+                    collect_non_nullish_union_members(ch, src, out);
+                }
+            }
+        }
+        "parenthesized_type" => {
+            if let Some(inner) = node.named_child(0) {
+                collect_non_nullish_union_members(inner, src, out);
+            }
+        }
+        _ if is_nullish_ts_type(node, src) => {}
+        _ => out.push(node),
+    }
+}
+
+fn extract_ts_type_target(
+    node: Node<'_>,
+    src: &str,
+    ctx: &TsRefContext,
+) -> Option<ClassFieldTarget> {
+    match node.kind() {
+        "type_annotation" | "parenthesized_type" | "readonly_type" => {
+            let inner = node.named_child(0)?;
+            extract_ts_type_target(inner, src, ctx)
+        }
+        "union_type" => {
+            let mut members = Vec::new();
+            collect_non_nullish_union_members(node, src, &mut members);
+            if members.len() != 1 {
+                return None;
+            }
+            extract_ts_type_target(members[0], src, ctx)
+        }
+        "generic_type" => {
+            let name_node = node.child_by_field_name("name")?;
+            extract_ts_type_target(name_node, src, ctx)
+        }
+        "type_identifier" => ctx.resolve_class_ident(node_text(node, src), true),
+        "nested_type_identifier" => {
+            let module_node = node.child_by_field_name("module")?;
+            let name_node = node.child_by_field_name("name")?;
+            if module_node.kind() == "identifier" && name_node.kind() == "type_identifier" {
+                ctx.resolve_ns_class(node_text(module_node, src), node_text(name_node, src), true)
+            } else {
+                None
+            }
+        }
+        _ => None,
+    }
+}
+
+fn extract_ts_new_expr_target(
+    node: Node<'_>,
+    src: &str,
+    ctx: &TsRefContext,
+) -> Option<(String, Option<String>)> {
+    let node = unwrap_ts_expr(node);
+    if node.kind() != "new_expression" {
+        return None;
+    }
+    let ctor = node.child_by_field_name("constructor")?;
+    match ctor.kind() {
+        "identifier" => ctx.resolve_class_ident(node_text(ctor, src), false),
+        "member_expression" => {
+            let obj = ctor.child_by_field_name("object")?;
+            let prop = ctor.child_by_field_name("property")?;
+            if obj.kind() == "identifier" && prop.kind() == "property_identifier" {
+                ctx.resolve_ns_class(node_text(obj, src), node_text(prop, src), false)
+            } else {
+                None
+            }
+        }
+        _ => None,
+    }
+}
+
+fn extract_ts_class_fields(
+    body: Node<'_>,
+    src: &str,
+    ctx: &TsRefContext,
+) -> (ClassFieldMap, ClassFieldMap) {
+    let mut instance_fields = HashMap::new();
+    let mut static_fields = HashMap::new();
+    let mut ctor_node = None;
+
+    let mut c = body.walk();
+    for member in body.children(&mut c) {
+        match member.kind() {
+            "public_field_definition" | "field_definition" => {
+                let Some(name_node) = member
+                    .child_by_field_name("name")
+                    .or_else(|| member.child_by_field_name("property"))
+                else {
+                    continue;
+                };
+                if !matches!(
+                    name_node.kind(),
+                    "property_identifier" | "private_property_identifier"
+                ) {
+                    continue;
+                }
+                if let Some(target) = extract_ts_annotated_or_new_target(member, src, ctx, true) {
+                    let field_name = node_text(name_node, src).to_string();
+                    if has_child_kind(member, "static") {
+                        static_fields.insert(field_name, target);
+                    } else {
+                        instance_fields.insert(field_name, target);
+                    }
+                }
+            }
+            "method_definition"
+                if member
+                    .child_by_field_name("name")
+                    .is_some_and(|n| node_text(n, src) == "constructor") =>
+            {
+                ctor_node = Some(member);
+            }
+            _ => {}
+        }
+    }
+
+    if let Some(ctor) = ctor_node {
+        let mut ctor_param_types: HashMap<String, (String, Option<String>)> = HashMap::new();
+        if let Some(plist) = ctor.child_by_field_name("parameters") {
+            let mut pc = plist.walk();
+            for param in plist.children(&mut pc) {
+                if !matches!(param.kind(), "required_parameter" | "optional_parameter") {
+                    continue;
+                }
+                let Some(pat) = param
+                    .child_by_field_name("pattern")
+                    .or_else(|| param.child_by_field_name("name"))
+                else {
+                    continue;
+                };
+                if pat.kind() != "identifier" {
+                    continue;
+                }
+                if let Some(target) = extract_ts_annotated_or_new_target(param, src, ctx, false) {
+                    let param_name = node_text(pat, src).to_string();
+                    ctor_param_types.insert(param_name.clone(), target.clone());
+                    let is_param_prop = {
+                        let mut qc = param.walk();
+                        param.children(&mut qc).any(|ch| {
+                            matches!(
+                                ch.kind(),
+                                "accessibility_modifier" | "readonly" | "override_modifier"
+                            )
+                        })
+                    };
+                    if is_param_prop {
+                        instance_fields.entry(param_name).or_insert(target);
+                    }
+                }
+            }
+        }
+        if let Some(cbody) = ctor.child_by_field_name("body") {
+            let mut ctor_writes: HashMap<String, Option<ClassFieldTarget>> = HashMap::new();
+            let mut stack = vec![(cbody, false)];
+            while let Some((n, in_branch)) = stack.pop() {
+                match n.kind() {
+                    "arrow_function"
+                    | "function"
+                    | "function_expression"
+                    | "function_declaration"
+                    | "generator_function"
+                    | "generator_function_declaration"
+                    | "method_definition"
+                    | "class_declaration"
+                    | "class" => continue,
+                    "assignment_expression" => {
+                        if let (Some(left), Some(right)) = (
+                            n.child_by_field_name("left"),
+                            n.child_by_field_name("right"),
+                        ) && left.kind() == "member_expression"
+                            && let (Some(obj), Some(prop)) = (
+                                left.child_by_field_name("object"),
+                                left.child_by_field_name("property"),
+                            )
+                            && obj.kind() == "this"
+                            && matches!(
+                                prop.kind(),
+                                "property_identifier" | "private_property_identifier"
+                            )
+                        {
+                            let target =
+                                extract_ts_new_expr_target(right, src, ctx).or_else(|| {
+                                    let rhs = unwrap_ts_expr(right);
+                                    (rhs.kind() == "identifier")
+                                        .then(|| ctor_param_types.get(node_text(rhs, src)).cloned())
+                                        .flatten()
+                                });
+                            if let Some(target) = target {
+                                let field = node_text(prop, src).to_string();
+                                if !in_branch {
+                                    ctor_writes.insert(field, Some(target));
+                                } else {
+                                    let existing = ctor_writes
+                                        .get(&field)
+                                        .cloned()
+                                        .unwrap_or_else(|| instance_fields.get(&field).cloned());
+                                    match existing {
+                                        Some(ref prev) if prev != &target => {
+                                            ctor_writes.insert(field, None);
+                                        }
+                                        None if ctor_writes.contains_key(&field) => {}
+                                        _ => {
+                                            ctor_writes.insert(field, Some(target));
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    _ => {}
+                }
+                let child_in_branch = in_branch
+                    || matches!(
+                        n.kind(),
+                        "if_statement" | "ternary_expression" | "switch_statement" | "catch_clause"
+                    );
+                let mut sc = n.walk();
+                let children: Vec<_> = n.children(&mut sc).collect();
+                for ch in children.into_iter().rev() {
+                    stack.push((ch, child_in_branch));
+                }
+            }
+            for (field, target_opt) in ctor_writes {
+                match target_opt {
+                    Some(target) => {
+                        instance_fields.insert(field, target);
+                    }
+                    None => {
+                        instance_fields.remove(&field);
+                    }
+                }
+            }
+        }
+    }
+
+    (instance_fields, static_fields)
 }
 
 fn extract_ts_extends_base(
@@ -111,11 +467,16 @@ pub(crate) fn collect_svelte_script_context(
     let Some(tree) = parser.parse(script_src, None) else {
         return Ok(());
     };
-    let (bindings, namespaces) = collect_ts_imports(tree.root_node(), script_src, rel_path);
-    ctx.imported_bindings.extend(bindings);
-    ctx.namespace_imports.extend(namespaces);
+    let ts_imports = collect_ts_imports(tree.root_node(), script_src, rel_path);
+    ctx.imported_bindings.extend(ts_imports.bindings);
+    ctx.type_imported_bindings.extend(ts_imports.type_bindings);
+    ctx.namespace_imports.extend(ts_imports.namespaces);
+    ctx.type_namespace_imports
+        .extend(ts_imports.type_namespaces);
     ctx.local_callables
         .extend(collect_ts_local_callables(tree.root_node(), script_src));
+    ctx.local_classes
+        .extend(collect_ts_local_classes(tree.root_node(), script_src));
     Ok(())
 }
 
@@ -218,25 +579,44 @@ pub(crate) fn extract_with_context(
     let mut refs = Vec::new();
     let mut bridges = Vec::new();
     let mut ir_funcs = Vec::new();
-    let (mut imported_bindings, mut namespace_imports) =
-        collect_ts_imports(tree.root_node(), src, rel_path);
+    let mut embedded_types: HashMap<String, Vec<String>> = HashMap::new();
+    let ts_imports = collect_ts_imports(tree.root_node(), src, rel_path);
+    let mut imported_bindings = ts_imports.bindings;
+    let mut type_imported_bindings = ts_imports.type_bindings;
+    let mut namespace_imports = ts_imports.namespaces;
+    let mut type_namespace_imports = ts_imports.type_namespaces;
     let mut local_callables = collect_ts_local_callables(tree.root_node(), src);
+    let mut local_classes = collect_ts_local_classes(tree.root_node(), src);
     let mut svelte_bind_this = HashMap::new();
     if let Some(extra) = extra_ctx {
         for (k, v) in &extra.imported_bindings {
             imported_bindings.entry(k.clone()).or_insert_with(|| v.clone());
         }
+        for (k, v) in &extra.type_imported_bindings {
+            type_imported_bindings
+                .entry(k.clone())
+                .or_insert_with(|| v.clone());
+        }
         for (k, v) in &extra.namespace_imports {
             namespace_imports.entry(k.clone()).or_insert_with(|| v.clone());
         }
+        for (k, v) in &extra.type_namespace_imports {
+            type_namespace_imports
+                .entry(k.clone())
+                .or_insert_with(|| v.clone());
+        }
         local_callables.extend(extra.local_callables.iter().cloned());
+        local_classes.extend(extra.local_classes.iter().cloned());
         svelte_bind_this.extend(extra.svelte_bind_this.clone());
     }
     let ctx = TsRefContext {
         file: rel_path.to_string(),
         imported_bindings,
+        type_imported_bindings,
         namespace_imports,
+        type_namespace_imports,
         local_callables,
+        local_classes,
         svelte_bind_this,
     };
 
@@ -363,6 +743,7 @@ pub(crate) fn extract_with_context(
         &mut refs,
         &mut bridges,
         &mut ir_funcs,
+        &mut embedded_types,
     );
 
     Ok(FileExtract {
@@ -376,7 +757,7 @@ pub(crate) fn extract_with_context(
         bridges,
         ir_funcs,
         interface_methods: std::collections::HashMap::new(),
-        embedded_types: std::collections::HashMap::new(),
+        embedded_types,
         struct_fields: std::collections::HashMap::new(),
         func_return_types: std::collections::HashMap::new(),
         trait_impls: Vec::new(),
@@ -439,25 +820,17 @@ pub(crate) fn resolve_relative_path(current_file: &str, import_path: &str) -> Op
     }
 }
 
-fn collect_ts_imports(
-    root: Node<'_>,
-    src: &str,
-    rel_path: &str,
-) -> (HashMap<String, ImportedBinding>, HashMap<String, String>) {
-    let mut bindings = HashMap::new();
-    let mut namespaces = HashMap::new();
+fn collect_ts_imports(root: Node<'_>, src: &str, rel_path: &str) -> TsImports {
+    let mut out = TsImports::default();
     let mut rc = root.walk();
     for ch in root.children(&mut rc) {
         if ch.kind() != "import_statement" {
             continue;
         }
-        let is_type_only = {
+        let stmt_is_type_only = {
             let mut ic = ch.walk();
             ch.children(&mut ic).any(|k| k.kind() == "type")
         };
-        if is_type_only {
-            continue;
-        }
         let Some(source_node) = ch.child_by_field_name("source") else {
             continue;
         };
@@ -473,6 +846,11 @@ fn collect_ts_imports(
             for part in clause.children(&mut cc) {
                 match part.kind() {
                     "identifier" => {
+                        let target_map = if stmt_is_type_only {
+                            &mut out.type_bindings
+                        } else {
+                            &mut out.bindings
+                        };
                         let local = node_text(part, src).to_string();
                         if path.ends_with(".svelte") {
                             let target_name = Path::new(&path)
@@ -480,7 +858,7 @@ fn collect_ts_imports(
                                 .and_then(|s| s.to_str())
                                 .unwrap_or(&local)
                                 .to_string();
-                            bindings.insert(
+                            target_map.insert(
                                 local,
                                 ImportedBinding {
                                     target_name,
@@ -488,7 +866,7 @@ fn collect_ts_imports(
                                 },
                             );
                         } else if resolved_file.is_some() {
-                            bindings.insert(
+                            target_map.insert(
                                 local,
                                 ImportedBinding {
                                     target_name: "<default>".to_string(),
@@ -499,10 +877,15 @@ fn collect_ts_imports(
                     }
                     "namespace_import" => {
                         if let Some(ref rf) = resolved_file {
+                            let target_ns = if stmt_is_type_only {
+                                &mut out.type_namespaces
+                            } else {
+                                &mut out.namespaces
+                            };
                             let mut nc = part.walk();
                             for nch in part.children(&mut nc) {
                                 if nch.kind() == "identifier" {
-                                    namespaces.insert(node_text(nch, src).to_string(), rf.clone());
+                                    target_ns.insert(node_text(nch, src).to_string(), rf.clone());
                                     break;
                                 }
                             }
@@ -518,9 +901,11 @@ fn collect_ts_imports(
                                 let mut sc = spec.walk();
                                 spec.children(&mut sc).any(|k| k.kind() == "type")
                             };
-                            if spec_is_type {
-                                continue;
-                            }
+                            let target_map = if stmt_is_type_only || spec_is_type {
+                                &mut out.type_bindings
+                            } else {
+                                &mut out.bindings
+                            };
                             if let Some(orig_node) = spec.child_by_field_name("name") {
                                 let orig = node_text(orig_node, src).to_string();
                                 let local = spec
@@ -534,7 +919,7 @@ fn collect_ts_imports(
                                             .and_then(|s| s.to_str())
                                             .unwrap_or(&local)
                                             .to_string();
-                                        bindings.insert(
+                                        target_map.insert(
                                             local,
                                             ImportedBinding {
                                                 target_name,
@@ -542,7 +927,7 @@ fn collect_ts_imports(
                                             },
                                         );
                                     } else if resolved_file.is_some() {
-                                        bindings.insert(
+                                        target_map.insert(
                                             local,
                                             ImportedBinding {
                                                 target_name: "<default>".to_string(),
@@ -551,7 +936,7 @@ fn collect_ts_imports(
                                         );
                                     }
                                 } else {
-                                    bindings.insert(
+                                    target_map.insert(
                                         local,
                                         ImportedBinding {
                                             target_name: orig,
@@ -567,7 +952,27 @@ fn collect_ts_imports(
             }
         }
     }
-    (bindings, namespaces)
+    out
+}
+
+fn collect_ts_local_classes(root: Node<'_>, src: &str) -> HashSet<String> {
+    let mut classes = HashSet::new();
+    fn visit_top(node: Node<'_>, src: &str, out: &mut HashSet<String>) {
+        let mut c = node.walk();
+        for ch in node.children(&mut c) {
+            match ch.kind() {
+                "export_statement" => visit_top(ch, src, out),
+                "class_declaration" => {
+                    if let Some(name_node) = ch.child_by_field_name("name") {
+                        out.insert(node_text(name_node, src).to_string());
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+    visit_top(root, src, &mut classes);
+    classes
 }
 
 fn collect_ts_local_callables(root: Node<'_>, src: &str) -> HashSet<String> {
@@ -662,6 +1067,7 @@ fn walk_ts_nodes(
     refs: &mut Vec<RawRef>,
     bridges: &mut Vec<BridgeHint>,
     ir_funcs: &mut Vec<IrFunc>,
+    embedded_types: &mut HashMap<String, Vec<String>>,
 ) {
     let mut cursor = parent.walk();
     for child in parent.children(&mut cursor) {
@@ -692,6 +1098,7 @@ fn walk_ts_nodes(
                     refs,
                     bridges,
                     ir_funcs,
+                    embedded_types,
                 );
                 if is_default {
                     let span = node_span(child, line_offset);
@@ -993,10 +1400,22 @@ fn walk_ts_nodes(
                                 }
                             }
                         }
+                        let (instance_fields, static_fields) =
+                            extract_ts_class_fields(body, src, ctx);
+                        let base_class = extract_ts_extends_base(child, src, ctx);
+                        if let Some((ref base_name, Some(ref base_file))) = base_class {
+                            embedded_types
+                                .entry(cls_id.clone())
+                                .or_default()
+                                .push(format!("{}|{}", base_file, base_name));
+                        }
                         let cls_info = EnclosingClassInfo {
                             name: cls.clone(),
                             declared_methods,
-                            base_class: extract_ts_extends_base(child, src, ctx),
+                            base_class,
+                            instance_fields,
+                            static_fields,
+                            in_static_method: false,
                         };
                         let mut bc = body.walk();
                         for member in body.children(&mut bc) {
@@ -1021,14 +1440,44 @@ fn walk_ts_nodes(
                                         package_or_module: rel_path.to_string(),
                                     });
                                     if let Some(mbody) = member.child_by_field_name("body") {
+                                        let static_cls_info;
+                                        let method_cls_info = if has_child_kind(member, "static") {
+                                            static_cls_info = EnclosingClassInfo {
+                                                in_static_method: true,
+                                                ..cls_info.clone()
+                                            };
+                                            &static_cls_info
+                                        } else {
+                                            &cls_info
+                                        };
                                         let params = extract_ts_params(member, src);
                                         let mut param_names = HashSet::new();
                                         if let Some(pnode) = member.child_by_field_name("parameters") {
                                             collect_ts_param_bindings(pnode, src, &mut param_names);
-                                            collect_ts_refs_and_bridges(pnode, src, line_offset, &mid, ctx, &[], Some(&cls_info), refs, bridges);
+                                            collect_ts_refs_and_bridges(
+                                                pnode,
+                                                src,
+                                                line_offset,
+                                                &mid,
+                                                ctx,
+                                                &[],
+                                                Some(method_cls_info),
+                                                refs,
+                                                bridges,
+                                            );
                                         }
                                         collect_hoisted_var_bindings(mbody, src, &mut param_names);
-                                        collect_ts_refs_and_bridges(mbody, src, line_offset, &mid, ctx, &[param_names], Some(&cls_info), refs, bridges);
+                                        collect_ts_refs_and_bridges(
+                                            mbody,
+                                            src,
+                                            line_offset,
+                                            &mid,
+                                            ctx,
+                                            &[param_names],
+                                            Some(method_cls_info),
+                                            refs,
+                                            bridges,
+                                        );
                                         ir_funcs.push(IrFunc {
                                             symbol_id: mid,
                                             name: qname,
@@ -1312,9 +1761,10 @@ fn resolve_member_target(
     scopes: &[HashSet<String>],
     enclosing_class: Option<&EnclosingClassInfo>,
 ) -> (String, Option<String>) {
-    match obj.kind() {
+    let unwrapped = unwrap_ts_expr(obj);
+    match unwrapped.kind() {
         "identifier" => {
-            let name = node_text(obj, src);
+            let name = node_text(unwrapped, src);
             if !is_shadowed(scopes, name) {
                 if let Some(svelte_file) = ctx.svelte_bind_this.get(name) {
                     return (prop.to_string(), Some(svelte_file.clone()));
@@ -1337,6 +1787,28 @@ fn resolve_member_target(
             } else {
                 (prop.to_string(), Some("this".to_string()))
             }
+        }
+        "member_expression" => {
+            if let Some(cls_info) = enclosing_class
+                && let Some(inner_obj) = unwrapped.child_by_field_name("object")
+                && let Some(field_node) = unwrapped.child_by_field_name("property")
+                && matches!(
+                    field_node.kind(),
+                    "property_identifier" | "private_property_identifier"
+                )
+                && unwrap_ts_expr(inner_obj).kind() == "this"
+            {
+                let field_name = node_text(field_node, src);
+                let fields = if cls_info.in_static_method {
+                    &cls_info.static_fields
+                } else {
+                    &cls_info.instance_fields
+                };
+                if let Some((target_cls, target_file)) = fields.get(field_name) {
+                    return (format!("{}.{}", target_cls, prop), target_file.clone());
+                }
+            }
+            (prop.to_string(), Some(node_text(obj, src).to_string()))
         }
         _ => (prop.to_string(), Some(node_text(obj, src).to_string())),
     }
@@ -1522,11 +1994,15 @@ fn walk_ts_expr_refs(
             return;
         }
         "arrow_function"
+        | "function"
         | "function_expression"
         | "function_declaration"
         | "generator_function"
         | "generator_function_declaration"
         | "method_definition" => {
+            let inner_class = (n.kind() == "arrow_function")
+                .then_some(enclosing_class)
+                .flatten();
             let mut fn_scope = HashSet::new();
             if let Some(name_node) = n.child_by_field_name("name") {
                 if name_node.kind() == "computed_property_name" {
@@ -1562,7 +2038,7 @@ fn walk_ts_expr_refs(
                     from_id,
                     ctx,
                     scopes,
-                    enclosing_class,
+                    inner_class,
                     refs,
                     bridges,
                 );
@@ -1580,12 +2056,34 @@ fn walk_ts_expr_refs(
                     from_id,
                     ctx,
                     scopes,
-                    enclosing_class,
+                    inner_class,
                     refs,
                     bridges,
                 );
             }
             scopes.pop();
+            return;
+        }
+        "class" | "class_declaration" => {
+            let mut c = n.walk();
+            for ch in n.children(&mut c) {
+                let child_cls = if matches!(ch.kind(), "class_heritage" | "decorator") {
+                    enclosing_class
+                } else {
+                    None
+                };
+                walk_ts_expr_refs(
+                    ch,
+                    src,
+                    line_offset,
+                    from_id,
+                    ctx,
+                    scopes,
+                    child_cls,
+                    refs,
+                    bridges,
+                );
+            }
             return;
         }
         "variable_declarator" => {

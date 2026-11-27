@@ -151,6 +151,7 @@ impl CodeGraph {
         let mut seen: HashSet<(String, String, EdgeKind)> = HashSet::new();
         let go_index = GoTypeIndex::build(&extracts, &symbols, &by_pkg_name);
         let rust_index = RustTypeIndex::build(&extracts, &symbols, crate_roots);
+        let ts_index = TsClassIndex::build(&extracts, &known_files, &symbols);
 
         for ext in &extracts {
             let alias_map = build_import_alias_map(&ext.imports);
@@ -185,6 +186,7 @@ impl CodeGraph {
                     &by_lang_qname,
                     &go_index,
                     &rust_index,
+                    &ts_index,
                 );
                 let resolved = if ext.lang == Language::Rust && r.kind == EdgeKind::Calls {
                     rust_index.expand_cfg_siblings(resolved)
@@ -1094,6 +1096,178 @@ fn push_const_qualifier_refs(
     }
 }
 
+fn resolve_ts_module_file(qual: &str, known_files: &HashSet<&str>) -> Option<String> {
+    if known_files.contains(qual) {
+        return Some(qual.to_string());
+    }
+    let mut candidates: Vec<String> = Vec::new();
+    // TS NodeNext/ESM imports often use .js/.jsx/.mjs/.cjs specifiers backed by .ts/.tsx sources
+    for (js_ext, ts_exts) in [
+        (".js", &[".ts", ".tsx"][..]),
+        (".jsx", &[".tsx", ".ts"][..]),
+        (".mjs", &[".mts"][..]),
+        (".cjs", &[".cts"][..]),
+    ] {
+        if let Some(stem) = qual.strip_suffix(js_ext) {
+            for ts_ext in ts_exts {
+                candidates.push(format!("{}{}", stem, ts_ext));
+            }
+        }
+    }
+    for suffix in [
+        ".ts",
+        ".tsx",
+        ".js",
+        ".jsx",
+        ".mjs",
+        ".cjs",
+        "/index.ts",
+        "/index.tsx",
+        "/index.js",
+    ] {
+        candidates.push(format!("{}{}", qual, suffix));
+    }
+    candidates
+        .into_iter()
+        .find(|cand| known_files.contains(cand.as_str()))
+}
+
+struct TsClassIndex {
+    /// Class symbol ID -> (resolved_base_file, base_class_name)
+    class_bases: HashMap<String, (String, String)>,
+    /// Re-export / default-export Script symbol ID -> unambiguous (resolved_target_file, target_name)
+    reexports: HashMap<String, Option<(String, String)>>,
+}
+
+impl TsClassIndex {
+    fn build(
+        extracts: &[FileExtract],
+        known_files: &HashSet<&str>,
+        symbols: &HashMap<String, Symbol>,
+    ) -> Self {
+        let mut class_bases = HashMap::new();
+        let mut reexports: HashMap<String, Option<(String, String)>> = HashMap::new();
+
+        for ext in extracts {
+            if !matches!(
+                ext.lang,
+                Language::TypeScript | Language::JavaScript | Language::Svelte
+            ) {
+                continue;
+            }
+            for (cls_id, bases) in &ext.embedded_types {
+                if let Some(entry) = bases.first()
+                    && let Some((raw_file, base_name)) = entry.rsplit_once('|')
+                    && let Some(tf) = resolve_ts_module_file(raw_file, known_files)
+                {
+                    class_bases.insert(cls_id.clone(), (tf, base_name.to_string()));
+                }
+            }
+            for r in &ext.refs {
+                if r.kind != EdgeKind::Calls {
+                    continue;
+                }
+                let Some(from_sym) = symbols.get(&r.from_symbol_id) else {
+                    continue;
+                };
+                if from_sym.kind != SymbolKind::Script || from_sym.name == "<module>" {
+                    continue;
+                }
+                let target = if r.qualifier.is_none()
+                    && let Some(target_sym) = symbols.get(&r.target_name)
+                {
+                    Some((target_sym.file.clone(), target_sym.name.clone()))
+                } else if let Some(ref qual) = r.qualifier {
+                    resolve_ts_module_file(qual, known_files)
+                        .map(|tf| (tf, r.target_name.clone()))
+                } else {
+                    Some((ext.file.clone(), r.target_name.clone()))
+                };
+                if let Some(target) = target {
+                    reexports
+                        .entry(from_sym.id.clone())
+                        .and_modify(|existing| {
+                            if existing.as_ref() != Some(&target) {
+                                *existing = None;
+                            }
+                        })
+                        .or_insert(Some(target));
+                }
+            }
+        }
+
+        Self {
+            class_bases,
+            reexports,
+        }
+    }
+
+    fn follow_aliases(
+        &self,
+        mut file: String,
+        mut name: String,
+        by_file_name: &HashMap<(&str, &str), String>,
+        symbols: &HashMap<String, Symbol>,
+    ) -> (String, String) {
+        let mut visited = HashSet::new();
+        loop {
+            let Some(sym_id) = by_file_name.get(&(file.as_str(), name.as_str())) else {
+                break;
+            };
+            if !visited.insert(sym_id.clone()) {
+                break;
+            }
+            let is_script = symbols
+                .get(sym_id)
+                .is_some_and(|s| s.kind == SymbolKind::Script);
+            if !is_script {
+                break;
+            }
+            if let Some(Some((next_file, next_name))) = self.reexports.get(sym_id) {
+                file = next_file.clone();
+                name = next_name.clone();
+            } else {
+                break;
+            }
+        }
+        (file, name)
+    }
+
+    fn resolve_class_method(
+        &self,
+        start_file: &str,
+        start_class: &str,
+        method: &str,
+        by_file_name: &HashMap<(&str, &str), String>,
+        symbols: &HashMap<String, Symbol>,
+    ) -> Option<String> {
+        let (mut curr_file, mut curr_class) = self.follow_aliases(
+            start_file.to_string(),
+            start_class.to_string(),
+            by_file_name,
+            symbols,
+        );
+        let mut visited_classes = HashSet::new();
+        loop {
+            let qname = format!("{}.{}", curr_class, method);
+            if let Some(mid) = by_file_name.get(&(curr_file.as_str(), qname.as_str())) {
+                return Some(mid.clone());
+            }
+            let Some(cls_id) = by_file_name.get(&(curr_file.as_str(), curr_class.as_str())) else {
+                return None;
+            };
+            if !visited_classes.insert(cls_id.clone()) {
+                return None;
+            }
+            let Some((base_file, base_name)) = self.class_bases.get(cls_id) else {
+                return None;
+            };
+            (curr_file, curr_class) =
+                self.follow_aliases(base_file.clone(), base_name.clone(), by_file_name, symbols);
+        }
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 fn resolve_ref(
     ext: &FileExtract,
@@ -1108,6 +1282,7 @@ fn resolve_ref(
     by_lang_qname: &HashMap<(Language, &str), Vec<String>>,
     go_index: &GoTypeIndex<'_>,
     rust_index: &RustTypeIndex<'_>,
+    ts_index: &TsClassIndex,
 ) -> Vec<(String, Confidence)> {
     // 0. Direct symbol ID match (e.g. Svelte component -> <module> script block)
     if r.qualifier.is_none() && symbols.contains_key(&r.target_name) {
@@ -1250,46 +1425,32 @@ fn resolve_ref(
         if let Some(id) = by_file_name.get(&(qual.as_str(), r.target_name.as_str())) {
             return vec![(id.clone(), Confidence::Resolved)];
         }
+        if matches!(
+            ext.lang,
+            Language::TypeScript | Language::JavaScript | Language::Svelte
+        ) && known_files.contains(qual.as_str())
+            && let Some((cls, method)) = r.target_name.split_once('.')
+            && let Some(id) =
+                ts_index.resolve_class_method(qual, cls, method, by_file_name, symbols)
+        {
+            return vec![(id, Confidence::Resolved)];
+        }
         if rel_import_paths.contains(qual.as_str()) {
             // Select the first existing target module by path priority before looking up the binding
             // so we never fall through to a lower-priority file (e.g. worker/index.ts when worker.ts exists).
-            let target_file = if known_files.contains(qual.as_str()) {
-                Some(qual.clone())
-            } else {
-                let mut candidates: Vec<String> = Vec::new();
-                // TS NodeNext/ESM imports often use .js/.jsx/.mjs/.cjs specifiers backed by .ts/.tsx sources
-                for (js_ext, ts_exts) in [
-                    (".js", &[ ".ts", ".tsx" ][..]),
-                    (".jsx", &[ ".tsx", ".ts" ][..]),
-                    (".mjs", &[ ".mts" ][..]),
-                    (".cjs", &[ ".cts" ][..]),
-                ] {
-                    if let Some(stem) = qual.strip_suffix(js_ext) {
-                        for ts_ext in ts_exts {
-                            candidates.push(format!("{}{}", stem, ts_ext));
-                        }
-                    }
-                }
-                for suffix in [
-                    ".ts",
-                    ".tsx",
-                    ".js",
-                    ".jsx",
-                    ".mjs",
-                    ".cjs",
-                    "/index.ts",
-                    "/index.tsx",
-                    "/index.js",
-                ] {
-                    candidates.push(format!("{}{}", qual, suffix));
-                }
-                candidates
-                    .into_iter()
-                    .find(|cand| known_files.contains(cand.as_str()))
-            };
+            let target_file = resolve_ts_module_file(qual, known_files);
             if let Some(tf) = target_file {
                 if let Some(id) = by_file_name.get(&(tf.as_str(), r.target_name.as_str())) {
                     return vec![(id.clone(), Confidence::Resolved)];
+                }
+                if matches!(
+                    ext.lang,
+                    Language::TypeScript | Language::JavaScript | Language::Svelte
+                ) && let Some((cls, method)) = r.target_name.split_once('.')
+                    && let Some(id) =
+                        ts_index.resolve_class_method(&tf, cls, method, by_file_name, symbols)
+                {
+                    return vec![(id, Confidence::Resolved)];
                 }
             }
             return Vec::new();

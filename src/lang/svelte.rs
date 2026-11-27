@@ -48,6 +48,7 @@ pub fn extract(rel_path: &str, src: &str, blake3_hex: String) -> Result<FileExtr
     let mut refs = Vec::new();
     let mut bridges = Vec::new();
     let mut ir_funcs = Vec::new();
+    let mut embedded_types: HashMap<String, Vec<String>> = HashMap::new();
 
     // 1. Locate all <script> and <style> ranges (HTML comments are handled inline in markup)
     let mut script_blocks = Vec::new();
@@ -147,6 +148,9 @@ pub fn extract(rel_path: &str, src: &str, blake3_hex: String) -> Result<FileExtr
             refs.extend(sub.refs);
             bridges.extend(sub.bridges);
             ir_funcs.extend(sub.ir_funcs);
+            for (k, v) in sub.embedded_types {
+                embedded_types.entry(k).or_default().extend(v);
+            }
         }
     }
 
@@ -170,7 +174,7 @@ pub fn extract(rel_path: &str, src: &str, blake3_hex: String) -> Result<FileExtr
         bridges,
         ir_funcs,
         interface_methods: HashMap::new(),
-        embedded_types: HashMap::new(),
+        embedded_types,
         struct_fields: HashMap::new(),
         func_return_types: HashMap::new(),
         trait_impls: Vec::new(),
