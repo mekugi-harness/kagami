@@ -5,11 +5,13 @@ use crate::lang::{
 };
 use crate::model::{
     BridgeHint, BridgeKind, BridgeRole, Confidence, EdgeKind, FileExtract, Language, RawRef,
-    Symbol, SymbolKind, Visibility,
+    ReceiverStep, Symbol, SymbolKind, Visibility,
 };
 use anyhow::Result;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use tree_sitter::{Node, Parser};
+
+const MAX_RECEIVER_CHAIN_LEN: usize = 12;
 
 pub fn extract(rel_path: &str, src: &str, blake3_hex: String) -> Result<FileExtract> {
     let mut parser = Parser::new();
@@ -30,8 +32,35 @@ pub fn extract(rel_path: &str, src: &str, blake3_hex: String) -> Result<FileExtr
     let mut ir_funcs = Vec::new();
     let mut interface_methods: HashMap<String, Vec<String>> = HashMap::new();
     let mut embedded_types: HashMap<String, Vec<String>> = HashMap::new();
+    let mut struct_fields: HashMap<String, HashMap<String, String>> = HashMap::new();
+    let mut func_return_types: HashMap<String, Vec<String>> = HashMap::new();
 
     let root = tree.root_node();
+    // Pre-pass: collect imports and top-level package var types so function/method bodies
+    // can distinguish imported package aliases from local variables and resolve package vars.
+    {
+        let mut pre_cursor = root.walk();
+        for child in root.children(&mut pre_cursor) {
+            if child.kind() == "import_declaration" {
+                collect_imports(child, src, &mut imports);
+            }
+        }
+    }
+    let pkg_aliases = build_pkg_alias_set(&imports);
+    let mut pkg_var_types: HashMap<String, Vec<ReceiverStep>> = HashMap::new();
+    {
+        let empty_vars = HashMap::new();
+        let empty_env = GoLocalEnv::new(&pkg_aliases, &empty_vars);
+        let mut pre_cursor = root.walk();
+        for child in root.children(&mut pre_cursor) {
+            if child.kind() == "var_declaration" {
+                for spec in collect_var_const_specs(child) {
+                    bind_var_spec_to_map(spec, src, &empty_env, &mut pkg_var_types);
+                }
+            }
+        }
+    }
+
     let mut cursor = root.walk();
     for child in root.children(&mut cursor) {
         match child.kind() {
@@ -46,7 +75,7 @@ pub fn extract(rel_path: &str, src: &str, blake3_hex: String) -> Result<FileExtr
                 }
             }
             "import_declaration" => {
-                collect_imports(child, src, &mut imports);
+                // Already collected in pre-pass
             }
             "function_declaration" => {
                 if let Some(name_node) = child.child_by_field_name("name") {
@@ -74,13 +103,29 @@ pub fn extract(rel_path: &str, src: &str, blake3_hex: String) -> Result<FileExtr
                         is_dynamic_candidate: false,
                         package_or_module: pkg.clone(),
                     });
+                    let ret_types = extract_go_return_types(child, src);
+                    if ret_types.iter().any(|t| !t.is_empty()) {
+                        func_return_types.insert(id.clone(), ret_types);
+                    }
                     if let Some(body) = child.child_by_field_name("body") {
                         let params = extract_go_params(child, src);
                         let mut seed_locals = params.clone();
                         seed_locals.extend(extract_go_named_results(child, src));
                         let locals = collect_go_locals(body, src, &seed_locals);
+                        let mut env = GoLocalEnv::new(&pkg_aliases, &pkg_var_types);
+                        env.seed_typed_params(child, src, body.end_byte());
+                        env.seed_typed_named_results(child, src, body.end_byte());
+                        env.collect_body(body, src, body.end_byte());
                         collect_signature_type_refs(child, src, &id, &mut refs);
-                        collect_refs_and_bridges(body, src, &id, &locals, &mut refs, &mut bridges);
+                        collect_refs_and_bridges(
+                            body,
+                            src,
+                            &id,
+                            &locals,
+                            &env,
+                            &mut refs,
+                            &mut bridges,
+                        );
                         let ir_body = lower_go_node(body, src);
                         ir_funcs.push(IrFunc {
                             symbol_id: id,
@@ -120,16 +165,40 @@ pub fn extract(rel_path: &str, src: &str, blake3_hex: String) -> Result<FileExtr
                         is_dynamic_candidate: vis == Visibility::Public,
                         package_or_module: pkg.clone(),
                     });
+                    let ret_types = extract_go_return_types(child, src);
+                    if ret_types.iter().any(|t| !t.is_empty()) {
+                        func_return_types.insert(id.clone(), ret_types);
+                    }
                     if let Some(body) = child.child_by_field_name("body") {
                         let params = extract_go_params(child, src);
                         let mut seed_locals = params.clone();
                         seed_locals.extend(extract_go_named_results(child, src));
+                        let mut env = GoLocalEnv::new(&pkg_aliases, &pkg_var_types);
                         if let Some(recv_name) = extract_receiver_var_name(child, src) {
+                            if !recv.is_empty() {
+                                env.bind(
+                                    recv_name.clone(),
+                                    0,
+                                    body.end_byte(),
+                                    vec![ReceiverStep::Type(recv.clone())],
+                                );
+                            }
                             seed_locals.push(recv_name);
                         }
                         let locals = collect_go_locals(body, src, &seed_locals);
+                        env.seed_typed_params(child, src, body.end_byte());
+                        env.seed_typed_named_results(child, src, body.end_byte());
+                        env.collect_body(body, src, body.end_byte());
                         collect_signature_type_refs(child, src, &id, &mut refs);
-                        collect_refs_and_bridges(body, src, &id, &locals, &mut refs, &mut bridges);
+                        collect_refs_and_bridges(
+                            body,
+                            src,
+                            &id,
+                            &locals,
+                            &env,
+                            &mut refs,
+                            &mut bridges,
+                        );
                         let ir_body = lower_go_node(body, src);
                         ir_funcs.push(IrFunc {
                             symbol_id: id,
@@ -197,7 +266,11 @@ pub fn extract(rel_path: &str, src: &str, blake3_hex: String) -> Result<FileExtr
                                         }
                                     }
                                     "struct_type" => {
-                                        let embeds = extract_struct_embeds(type_node, src);
+                                        let (fields, embeds) =
+                                            extract_struct_fields_and_embeds(type_node, src);
+                                        if !fields.is_empty() {
+                                            struct_fields.insert(id.clone(), fields);
+                                        }
                                         if !embeds.is_empty() {
                                             embedded_types.insert(id.clone(), embeds);
                                         }
@@ -206,28 +279,22 @@ pub fn extract(rel_path: &str, src: &str, blake3_hex: String) -> Result<FileExtr
                                 }
                             }
                             let empty_locals = HashMap::new();
-                            collect_refs_and_bridges(spec, src, &id, &empty_locals, &mut refs, &mut bridges);
+                            let empty_env = GoLocalEnv::new(&pkg_aliases, &pkg_var_types);
+                            collect_refs_and_bridges(
+                                spec,
+                                src,
+                                &id,
+                                &empty_locals,
+                                &empty_env,
+                                &mut refs,
+                                &mut bridges,
+                            );
                         }
                     }
                 }
             }
             "const_declaration" | "var_declaration" => {
-                let mut specs = Vec::new();
-                let mut vc = child.walk();
-                for ch in child.children(&mut vc) {
-                    match ch.kind() {
-                        "const_spec" | "var_spec" => specs.push(ch),
-                        "var_spec_list" => {
-                            let mut lc = ch.walk();
-                            for sub in ch.children(&mut lc) {
-                                if sub.kind() == "var_spec" {
-                                    specs.push(sub);
-                                }
-                            }
-                        }
-                        _ => {}
-                    }
-                }
+                let specs = collect_var_const_specs(child);
                 for spec in specs {
                     if let Some(name_node) = spec.child_by_field_name("name") {
                         let name = node_text(name_node, src).to_string();
@@ -253,11 +320,13 @@ pub fn extract(rel_path: &str, src: &str, blake3_hex: String) -> Result<FileExtr
                             package_or_module: pkg.clone(),
                         });
                         let empty_locals = HashMap::new();
+                        let empty_env = GoLocalEnv::new(&pkg_aliases, &pkg_var_types);
                         collect_refs_and_bridges(
                             spec,
                             src,
                             &id,
                             &empty_locals,
+                            &empty_env,
                             &mut refs,
                             &mut bridges,
                         );
@@ -280,7 +349,47 @@ pub fn extract(rel_path: &str, src: &str, blake3_hex: String) -> Result<FileExtr
         ir_funcs,
         interface_methods,
         embedded_types,
+        struct_fields,
+        func_return_types,
     })
+}
+
+fn collect_var_const_specs<'a>(node: Node<'a>) -> Vec<Node<'a>> {
+    let mut specs = Vec::new();
+    let mut vc = node.walk();
+    for ch in node.children(&mut vc) {
+        match ch.kind() {
+            "const_spec" | "var_spec" => specs.push(ch),
+            "var_spec_list" => {
+                let mut lc = ch.walk();
+                for sub in ch.children(&mut lc) {
+                    if sub.kind() == "var_spec" {
+                        specs.push(sub);
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    specs
+}
+
+fn build_pkg_alias_set(imports: &[String]) -> HashSet<String> {
+    let mut aliases = HashSet::new();
+    for imp in imports {
+        if let Some((alias, _)) = imp.split_once('=') {
+            aliases.insert(alias.to_string());
+        } else if let Some(last) = imp.rsplit('/').next() {
+            aliases.insert(last.to_string());
+            if last.starts_with('v')
+                && last[1..].chars().all(|c| c.is_ascii_digit())
+                && let Some(prev) = imp.rsplit('/').nth(1)
+            {
+                aliases.insert(prev.to_string());
+            }
+        }
+    }
+    aliases
 }
 
 fn contains_call_outside_func_literal(node: Node<'_>) -> bool {
@@ -449,22 +558,148 @@ fn extract_interface_members(node: Node<'_>, src: &str) -> (Vec<String>, Vec<Str
     (methods, embeds)
 }
 
-fn extract_struct_embeds(node: Node<'_>, src: &str) -> Vec<String> {
+fn is_go_builtin_type(target: &str) -> bool {
+    matches!(
+        target,
+        "string"
+            | "int"
+            | "int8"
+            | "int16"
+            | "int32"
+            | "int64"
+            | "uint"
+            | "uint8"
+            | "uint16"
+            | "uint32"
+            | "uint64"
+            | "uintptr"
+            | "float32"
+            | "float64"
+            | "complex64"
+            | "complex128"
+            | "bool"
+            | "byte"
+            | "rune"
+            | "error"
+            | "any"
+            | "comparable"
+    )
+}
+
+fn extract_go_type_name(node: Node<'_>, src: &str) -> Option<String> {
+    let mut cur = node;
+    loop {
+        match cur.kind() {
+            "pointer_type" => {
+                cur = cur.named_child(0)?;
+            }
+            "generic_type" => {
+                cur = cur.child_by_field_name("type")?;
+            }
+            "slice_type" | "array_type" => {
+                let elem = cur.child_by_field_name("element")?;
+                let inner = extract_go_type_name(elem, src)?;
+                return Some(format!("[]{}", inner));
+            }
+            "map_type" => {
+                let val = cur.child_by_field_name("value")?;
+                let inner = extract_go_type_name(val, src)?;
+                return Some(format!("[]{}", inner));
+            }
+            "type_identifier" => {
+                let t = node_text(cur, src).trim();
+                return (!t.is_empty() && !is_go_builtin_type(t)).then(|| t.to_string());
+            }
+            "qualified_type" => {
+                let pkg = cur
+                    .child_by_field_name("package")
+                    .map(|p| node_text(p, src).trim())?;
+                let name = cur
+                    .child_by_field_name("name")
+                    .map(|n| node_text(n, src).trim())?;
+                if !pkg.is_empty() && !name.is_empty() {
+                    return Some(format!("{}.{}", pkg, name));
+                }
+                return None;
+            }
+            _ => return None,
+        }
+    }
+}
+
+fn extract_struct_fields_and_embeds(
+    node: Node<'_>,
+    src: &str,
+) -> (HashMap<String, String>, Vec<String>) {
+    let mut field_map = HashMap::new();
     let mut embeds = Vec::new();
     let Some(fields) = find_child_by_kind(node, "field_declaration_list") else {
-        return embeds;
+        return (field_map, embeds);
     };
     let mut c = fields.walk();
     for ch in fields.children(&mut c) {
-        if ch.kind() == "field_declaration"
-            && ch.child_by_field_name("name").is_none()
-            && let Some(ty) = ch.child_by_field_name("type")
-            && let Some(embed) = extract_embedded_type_name(ty, src)
-        {
-            embeds.push(embed);
+        if ch.kind() != "field_declaration" {
+            continue;
+        }
+        let Some(ty) = ch.child_by_field_name("type") else {
+            continue;
+        };
+        let mut names = Vec::new();
+        let mut fc = ch.walk();
+        for sub in ch.children(&mut fc) {
+            if sub.kind() == "field_identifier" {
+                let t = node_text(sub, src).trim();
+                if !t.is_empty() && t != "_" {
+                    names.push(t.to_string());
+                }
+            }
+        }
+        if names.is_empty() {
+            if let Some(embed) = extract_embedded_type_name(ty, src) {
+                let field_name = embed.rsplit('.').next().unwrap_or(&embed).to_string();
+                if !field_name.is_empty() {
+                    field_map.insert(field_name, embed.clone());
+                }
+                embeds.push(embed);
+            }
+        } else if let Some(field_ty) = extract_go_type_name(ty, src) {
+            for fname in names {
+                field_map.insert(fname, field_ty.clone());
+            }
         }
     }
-    embeds
+    (field_map, embeds)
+}
+
+fn extract_go_return_types(node: Node<'_>, src: &str) -> Vec<String> {
+    let Some(res) = node.child_by_field_name("result") else {
+        return Vec::new();
+    };
+    let mut out = Vec::new();
+    if res.kind() == "parameter_list" {
+        let mut c = res.walk();
+        for ch in res.children(&mut c) {
+            if ch.kind() == "parameter_declaration" {
+                let ty = ch
+                    .child_by_field_name("type")
+                    .and_then(|t| extract_go_type_name(t, src))
+                    .unwrap_or_default();
+                let mut name_count = 0usize;
+                let mut pc = ch.walk();
+                for sub in ch.children(&mut pc) {
+                    if sub.kind() == "identifier" {
+                        name_count += 1;
+                    }
+                }
+                for _ in 0..name_count.max(1) {
+                    out.push(ty.clone());
+                }
+            }
+        }
+    } else {
+        out.push(extract_go_type_name(res, src).unwrap_or_default());
+    }
+    out
 }
 
 fn collect_signature_type_refs(node: Node<'_>, src: &str, from_id: &str, refs: &mut Vec<RawRef>) {
@@ -508,43 +743,21 @@ fn emit_qualified_type_ref(node: Node<'_>, src: &str, from_id: &str, refs: &mut 
             qualifier: pkg.filter(|s| !s.is_empty()),
             kind: EdgeKind::TypeRef,
             line: node.start_position().row + 1,
+            receiver_chain: None,
         });
     }
 }
 
 fn emit_type_identifier_ref(node: Node<'_>, src: &str, from_id: &str, refs: &mut Vec<RawRef>) {
     let target = node_text(node, src);
-    if !matches!(
-        target,
-        "string"
-            | "int"
-            | "int8"
-            | "int16"
-            | "int32"
-            | "int64"
-            | "uint"
-            | "uint8"
-            | "uint16"
-            | "uint32"
-            | "uint64"
-            | "uintptr"
-            | "float32"
-            | "float64"
-            | "complex64"
-            | "complex128"
-            | "bool"
-            | "byte"
-            | "rune"
-            | "error"
-            | "any"
-            | "comparable"
-    ) {
+    if !is_go_builtin_type(target) {
         refs.push(RawRef {
             from_symbol_id: from_id.to_string(),
             target_name: target.to_string(),
             qualifier: None,
             kind: EdgeKind::TypeRef,
             line: node.start_position().row + 1,
+            receiver_chain: None,
         });
     }
 }
@@ -680,11 +893,422 @@ fn collect_go_locals(
     locals
 }
 
+struct GoLocalEnv<'a> {
+    pkg_aliases: &'a HashSet<String>,
+    pkg_var_types: &'a HashMap<String, Vec<ReceiverStep>>,
+    locals: HashMap<String, Vec<(usize, usize, Vec<ReceiverStep>)>>,
+}
+
+impl<'a> GoLocalEnv<'a> {
+    fn new(
+        pkg_aliases: &'a HashSet<String>,
+        pkg_var_types: &'a HashMap<String, Vec<ReceiverStep>>,
+    ) -> Self {
+        Self {
+            pkg_aliases,
+            pkg_var_types,
+            locals: HashMap::new(),
+        }
+    }
+
+    fn bind(&mut self, name: String, start: usize, end: usize, chain: Vec<ReceiverStep>) {
+        if !name.is_empty() && name != "_" && !chain.is_empty() && chain.len() <= MAX_RECEIVER_CHAIN_LEN
+        {
+            self.locals.entry(name).or_default().push((start, end, chain));
+        }
+    }
+
+    fn lookup(&self, name: &str, pos: usize) -> Option<&[ReceiverStep]> {
+        if let Some(entries) = self.locals.get(name)
+            && let Some((_, _, chain)) = entries
+                .iter()
+                .filter(|(s, e, _)| pos >= *s && pos < *e)
+                .min_by_key(|(s, e, _)| (e.saturating_sub(*s), usize::MAX - *s))
+        {
+            return Some(chain.as_slice());
+        }
+        self.pkg_var_types.get(name).map(|v| v.as_slice())
+    }
+
+    fn is_local_at(&self, name: &str, pos: usize) -> bool {
+        self.locals
+            .get(name)
+            .map(|entries| entries.iter().any(|(s, e, _)| pos >= *s && pos < *e))
+            .unwrap_or(false)
+    }
+
+    fn is_pkg_alias(&self, name: &str, pos: usize) -> bool {
+        self.pkg_aliases.contains(name) && !self.is_local_at(name, pos)
+    }
+
+    fn seed_param_list(&mut self, param_list: Node<'_>, src: &str, start: usize, end: usize) {
+        let mut c = param_list.walk();
+        for ch in param_list.children(&mut c) {
+            match ch.kind() {
+                "parameter_declaration" => {
+                    let Some(ty) = ch
+                        .child_by_field_name("type")
+                        .and_then(|t| extract_go_type_name(t, src))
+                    else {
+                        continue;
+                    };
+                    let mut pc = ch.walk();
+                    for sub in ch.children(&mut pc) {
+                        if sub.kind() == "identifier" {
+                            let name = node_text(sub, src).trim().to_string();
+                            self.bind(name, start, end, vec![ReceiverStep::Type(ty.clone())]);
+                        }
+                    }
+                }
+                "variadic_parameter_declaration" => {
+                    let Some(ty) = ch
+                        .child_by_field_name("type")
+                        .and_then(|t| extract_go_type_name(t, src))
+                    else {
+                        continue;
+                    };
+                    let slice_ty = format!("[]{}", ty);
+                    if let Some(name_node) = ch.child_by_field_name("name") {
+                        let name = node_text(name_node, src).trim().to_string();
+                        self.bind(name, start, end, vec![ReceiverStep::Type(slice_ty)]);
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+
+    fn seed_typed_params(&mut self, func_node: Node<'_>, src: &str, end: usize) {
+        if let Some(p) = func_node.child_by_field_name("parameters") {
+            self.seed_param_list(p, src, 0, end);
+        }
+    }
+
+    fn seed_typed_named_results(&mut self, func_node: Node<'_>, src: &str, end: usize) {
+        if let Some(res) = func_node.child_by_field_name("result")
+            && res.kind() == "parameter_list"
+        {
+            self.seed_param_list(res, src, 0, end);
+        }
+    }
+
+    fn collect_body(&mut self, node: Node<'_>, src: &str, body_end: usize) {
+        match node.kind() {
+            "short_var_declaration" => {
+                let start = node.end_byte();
+                let end = enclosing_scope_end(node, body_end);
+                if let (Some(lhs), Some(rhs)) = (
+                    node.child_by_field_name("left"),
+                    node.child_by_field_name("right"),
+                ) {
+                    let lhs_names = collect_lhs_identifiers(lhs, src);
+                    let rhs_exprs = collect_expr_list(rhs);
+                    self.bind_paired(&lhs_names, &rhs_exprs, src, start, end);
+                }
+            }
+            "var_spec" => {
+                let start = node.end_byte();
+                let end = enclosing_scope_end(node, body_end);
+                let names = collect_spec_names(node, src);
+                if let Some(ty) = node
+                    .child_by_field_name("type")
+                    .and_then(|t| extract_go_type_name(t, src))
+                {
+                    for name in names {
+                        self.bind(name, start, end, vec![ReceiverStep::Type(ty.clone())]);
+                    }
+                } else if let Some(val) = node.child_by_field_name("value") {
+                    let rhs_exprs = collect_expr_list(val);
+                    self.bind_paired(&names, &rhs_exprs, src, start, end);
+                }
+            }
+            "range_clause" => {
+                if let (Some(lhs), Some(rhs)) = (
+                    node.child_by_field_name("left"),
+                    node.child_by_field_name("right"),
+                ) {
+                    let lhs_names = collect_lhs_identifiers(lhs, src);
+                    if lhs_names.len() >= 2
+                        && !lhs_names[1].is_empty()
+                        && lhs_names[1] != "_"
+                        && let Some(mut chain) = resolve_expr_chain(rhs, 0, src, self)
+                        && chain.len() < MAX_RECEIVER_CHAIN_LEN
+                    {
+                        chain.push(ReceiverStep::Elem);
+                        let start = node.end_byte();
+                        let end = enclosing_scope_end(node, body_end);
+                        self.bind(lhs_names[1].clone(), start, end, chain);
+                    }
+                }
+            }
+            "func_literal" => {
+                if let Some(p) = node.child_by_field_name("parameters") {
+                    self.seed_param_list(p, src, node.start_byte(), node.end_byte());
+                }
+            }
+            _ => {}
+        }
+        // Pre-order traversal so earlier declarations are visible to later statements.
+        let mut c = node.walk();
+        for ch in node.children(&mut c) {
+            self.collect_body(ch, src, body_end);
+        }
+    }
+
+    fn bind_paired(
+        &mut self,
+        lhs_names: &[String],
+        rhs_exprs: &[Node<'_>],
+        src: &str,
+        start: usize,
+        end: usize,
+    ) {
+        if rhs_exprs.len() == lhs_names.len() {
+            for (name, &expr) in lhs_names.iter().zip(rhs_exprs.iter()) {
+                if let Some(chain) = resolve_expr_chain(expr, 0, src, self) {
+                    self.bind(name.clone(), start, end, chain);
+                }
+            }
+        } else if rhs_exprs.len() == 1 {
+            let expr = rhs_exprs[0];
+            for (idx, name) in lhs_names.iter().enumerate() {
+                if let Some(chain) = resolve_expr_chain(expr, idx, src, self) {
+                    self.bind(name.clone(), start, end, chain);
+                }
+            }
+        }
+    }
+}
+
+fn collect_lhs_identifiers(node: Node<'_>, src: &str) -> Vec<String> {
+    if node.kind() == "expression_list" {
+        let mut names = Vec::new();
+        let mut c = node.walk();
+        for ch in node.children(&mut c) {
+            if ch.is_named() {
+                names.push(if ch.kind() == "identifier" {
+                    node_text(ch, src).trim().to_string()
+                } else {
+                    String::new()
+                });
+            }
+        }
+        names
+    } else if node.kind() == "identifier" {
+        vec![node_text(node, src).trim().to_string()]
+    } else {
+        Vec::new()
+    }
+}
+
+fn collect_expr_list<'a>(node: Node<'a>) -> Vec<Node<'a>> {
+    if node.kind() == "expression_list" {
+        let mut exprs = Vec::new();
+        let mut c = node.walk();
+        for ch in node.children(&mut c) {
+            if ch.is_named() {
+                exprs.push(ch);
+            }
+        }
+        exprs
+    } else {
+        vec![node]
+    }
+}
+
+fn collect_spec_names(spec: Node<'_>, src: &str) -> Vec<String> {
+    let mut names = Vec::new();
+    let mut c = spec.walk();
+    for ch in spec.children(&mut c) {
+        if ch.kind() == "identifier"
+            && spec.child_by_field_name("type").map(|t| t.id()) != Some(ch.id())
+            && spec.child_by_field_name("value").map(|v| v.id()) != Some(ch.id())
+        {
+            let t = node_text(ch, src).trim();
+            if !t.is_empty() && t != "_" {
+                names.push(t.to_string());
+            }
+        }
+    }
+    names
+}
+
+fn bind_var_spec_to_map(
+    spec: Node<'_>,
+    src: &str,
+    env: &GoLocalEnv<'_>,
+    out: &mut HashMap<String, Vec<ReceiverStep>>,
+) {
+    let names = collect_spec_names(spec, src);
+    if let Some(ty) = spec
+        .child_by_field_name("type")
+        .and_then(|t| extract_go_type_name(t, src))
+    {
+        for name in names {
+            out.insert(name, vec![ReceiverStep::Type(ty.clone())]);
+        }
+    } else if let Some(val) = spec.child_by_field_name("value") {
+        let rhs_exprs = collect_expr_list(val);
+        if rhs_exprs.len() == names.len() {
+            for (name, &expr) in names.iter().zip(rhs_exprs.iter()) {
+                if let Some(chain) = resolve_expr_chain(expr, 0, src, env) {
+                    out.insert(name.clone(), chain);
+                }
+            }
+        } else if rhs_exprs.len() == 1 {
+            for (idx, name) in names.iter().enumerate() {
+                if let Some(chain) = resolve_expr_chain(rhs_exprs[0], idx, src, env) {
+                    out.insert(name.clone(), chain);
+                }
+            }
+        }
+    }
+}
+
+fn resolve_expr_chain(
+    mut expr: Node<'_>,
+    result_index: usize,
+    src: &str,
+    env: &GoLocalEnv<'_>,
+) -> Option<Vec<ReceiverStep>> {
+    loop {
+        match expr.kind() {
+            "parenthesized_expression" => {
+                expr = expr.named_child(0)?;
+            }
+            "unary_expression" => {
+                let op = expr
+                    .child_by_field_name("operator")
+                    .map(|o| node_text(o, src).trim());
+                if matches!(op, Some("&" | "*")) {
+                    expr = expr.child_by_field_name("operand")?;
+                } else {
+                    return None;
+                }
+            }
+            _ => break,
+        }
+    }
+    match expr.kind() {
+        "identifier" => {
+            if result_index != 0 {
+                return None;
+            }
+            let name = node_text(expr, src).trim();
+            if env.is_pkg_alias(name, expr.start_byte()) {
+                return None;
+            }
+            env.lookup(name, expr.start_byte()).map(|s| s.to_vec())
+        }
+        "composite_literal" => {
+            if result_index != 0 {
+                return None;
+            }
+            let ty = expr
+                .child_by_field_name("type")
+                .and_then(|t| extract_go_type_name(t, src))?;
+            Some(vec![ReceiverStep::Type(ty)])
+        }
+        "type_assertion_expression" => {
+            if result_index != 0 {
+                return None;
+            }
+            let ty = expr
+                .child_by_field_name("type")
+                .and_then(|t| extract_go_type_name(t, src))?;
+            Some(vec![ReceiverStep::Type(ty)])
+        }
+        "selector_expression" => {
+            if result_index != 0 {
+                return None;
+            }
+            let operand = expr.child_by_field_name("operand")?;
+            let field = expr
+                .child_by_field_name("field")
+                .map(|f| node_text(f, src).trim().to_string())?;
+            if field.is_empty() {
+                return None;
+            }
+            let mut chain = resolve_expr_chain(operand, 0, src, env)?;
+            if chain.len() >= MAX_RECEIVER_CHAIN_LEN {
+                return None;
+            }
+            chain.push(ReceiverStep::Field(field));
+            Some(chain)
+        }
+        "index_expression" => {
+            if result_index != 0 {
+                return None;
+            }
+            let operand = expr.child_by_field_name("operand")?;
+            let mut chain = resolve_expr_chain(operand, 0, src, env)?;
+            if chain.len() >= MAX_RECEIVER_CHAIN_LEN {
+                return None;
+            }
+            chain.push(ReceiverStep::Elem);
+            Some(chain)
+        }
+        "call_expression" => {
+            let func = expr.child_by_field_name("function")?;
+            match func.kind() {
+                "identifier" => {
+                    let fname = node_text(func, src).trim();
+                    if (fname == "new" || fname == "make") && result_index == 0 {
+                        let args = expr.child_by_field_name("arguments")?;
+                        let first_arg = args.named_child(0)?;
+                        let ty = extract_go_type_name(first_arg, src)?;
+                        return Some(vec![ReceiverStep::Type(ty)]);
+                    }
+                    if fname.is_empty() || is_go_builtin_type(fname) {
+                        return None;
+                    }
+                    Some(vec![ReceiverStep::Call {
+                        qualifier: None,
+                        name: fname.to_string(),
+                        result_index,
+                    }])
+                }
+                "selector_expression" => {
+                    let operand = func.child_by_field_name("operand")?;
+                    let field = func
+                        .child_by_field_name("field")
+                        .map(|f| node_text(f, src).trim().to_string())?;
+                    if field.is_empty() {
+                        return None;
+                    }
+                    if operand.kind() == "identifier" {
+                        let op_name = node_text(operand, src).trim();
+                        if env.is_pkg_alias(op_name, operand.start_byte()) {
+                            return Some(vec![ReceiverStep::Call {
+                                qualifier: Some(op_name.to_string()),
+                                name: field,
+                                result_index,
+                            }]);
+                        }
+                    }
+                    let mut chain = resolve_expr_chain(operand, 0, src, env)?;
+                    if chain.len() >= MAX_RECEIVER_CHAIN_LEN {
+                        return None;
+                    }
+                    chain.push(ReceiverStep::MethodCall {
+                        name: field,
+                        result_index,
+                    });
+                    Some(chain)
+                }
+                _ => None,
+            }
+        }
+        _ => None,
+    }
+}
+
 fn emit_value_ref(
     mut expr: Node<'_>,
     src: &str,
     from_id: &str,
     locals: &HashMap<String, Vec<(usize, usize)>>,
+    env: &GoLocalEnv<'_>,
     refs: &mut Vec<RawRef>,
 ) {
     while expr.kind() == "parenthesized_expression" {
@@ -709,23 +1333,26 @@ fn emit_value_ref(
                     qualifier: None,
                     kind: EdgeKind::Calls,
                     line,
+                    receiver_chain: None,
                 });
             }
         }
         "selector_expression" => {
-            let operand = expr
-                .child_by_field_name("operand")
-                .map(|o| node_text(o, src).to_string());
+            let operand_node = expr.child_by_field_name("operand");
+            let operand = operand_node.map(|o| node_text(o, src).to_string());
             let field = expr
                 .child_by_field_name("field")
                 .map(|f| node_text(f, src).to_string());
             if let Some(target) = field {
+                let receiver_chain =
+                    operand_node.and_then(|o| resolve_expr_chain(o, 0, src, env));
                 refs.push(RawRef {
                     from_symbol_id: from_id.to_string(),
                     target_name: target,
                     qualifier: operand,
                     kind: EdgeKind::Calls,
                     line,
+                    receiver_chain,
                 });
             }
         }
@@ -738,17 +1365,18 @@ fn emit_expr_list_refs(
     src: &str,
     from_id: &str,
     locals: &HashMap<String, Vec<(usize, usize)>>,
+    env: &GoLocalEnv<'_>,
     refs: &mut Vec<RawRef>,
 ) {
     if node.kind() == "expression_list" {
         let mut c = node.walk();
         for ch in node.children(&mut c) {
             if ch.is_named() {
-                emit_value_ref(ch, src, from_id, locals, refs);
+                emit_value_ref(ch, src, from_id, locals, env, refs);
             }
         }
     } else {
-        emit_value_ref(node, src, from_id, locals, refs);
+        emit_value_ref(node, src, from_id, locals, env, refs);
     }
 }
 
@@ -757,6 +1385,7 @@ fn collect_refs_and_bridges(
     src: &str,
     from_id: &str,
     locals: &HashMap<String, Vec<(usize, usize)>>,
+    env: &GoLocalEnv<'_>,
     refs: &mut Vec<RawRef>,
     bridges: &mut Vec<BridgeHint>,
 ) {
@@ -775,10 +1404,12 @@ fn collect_refs_and_bridges(
                                 qualifier: None,
                                 kind: EdgeKind::Calls,
                                 line,
+                                receiver_chain: None,
                             });
                         }
                         "selector_expression" => {
-                            let operand = func.child_by_field_name("operand").map(|o| node_text(o, src).to_string());
+                            let operand_node = func.child_by_field_name("operand");
+                            let operand = operand_node.map(|o| node_text(o, src).to_string());
                             let field = func.child_by_field_name("field").map(|f| node_text(f, src).to_string());
                             if let Some(target) = field {
                                 // Check os.Getenv / exec.Command
@@ -805,12 +1436,15 @@ fn collect_refs_and_bridges(
                                         });
                                     }
                                 }
+                                let receiver_chain = operand_node
+                                    .and_then(|o| resolve_expr_chain(o, 0, src, env));
                                 refs.push(RawRef {
                                     from_symbol_id: from_id.to_string(),
                                     target_name: target,
                                     qualifier: operand,
                                     kind: EdgeKind::Calls,
                                     line,
+                                    receiver_chain,
                                 });
                             }
                         }
@@ -833,25 +1467,25 @@ fn collect_refs_and_bridges(
             }
             "assignment_statement" | "short_var_declaration" => {
                 if let Some(rhs) = n.child_by_field_name("right") {
-                    emit_expr_list_refs(rhs, src, from_id, locals, refs);
+                    emit_expr_list_refs(rhs, src, from_id, locals, env, refs);
                 }
             }
             "var_spec" => {
                 if let Some(val) = n.child_by_field_name("value") {
-                    emit_expr_list_refs(val, src, from_id, locals, refs);
+                    emit_expr_list_refs(val, src, from_id, locals, env, refs);
                 }
             }
             "return_statement" => {
                 let mut rc = n.walk();
                 for ch in n.children(&mut rc) {
                     if ch.is_named() {
-                        emit_expr_list_refs(ch, src, from_id, locals, refs);
+                        emit_expr_list_refs(ch, src, from_id, locals, env, refs);
                     }
                 }
             }
             "send_statement" => {
                 if let Some(val) = n.child_by_field_name("value") {
-                    emit_value_ref(val, src, from_id, locals, refs);
+                    emit_value_ref(val, src, from_id, locals, env, refs);
                 }
             }
             "keyed_element" => {
@@ -861,7 +1495,7 @@ fn collect_refs_and_bridges(
                     } else {
                         val_elem
                     };
-                    emit_value_ref(val, src, from_id, locals, refs);
+                    emit_value_ref(val, src, from_id, locals, env, refs);
                 }
             }
             "literal_value" => {
@@ -870,7 +1504,7 @@ fn collect_refs_and_bridges(
                     if ch.kind() == "literal_element"
                         && let Some(inner) = ch.named_child(0)
                     {
-                        emit_value_ref(inner, src, from_id, locals, refs);
+                        emit_value_ref(inner, src, from_id, locals, env, refs);
                     }
                 }
             }
@@ -878,7 +1512,7 @@ fn collect_refs_and_bridges(
                 let mut ac = n.walk();
                 for ch in n.children(&mut ac) {
                     if ch.is_named() {
-                        emit_value_ref(ch, src, from_id, locals, refs);
+                        emit_value_ref(ch, src, from_id, locals, env, refs);
                     }
                 }
             }

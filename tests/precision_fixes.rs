@@ -713,3 +713,246 @@ func main() {
         );
     }
 }
+
+#[test]
+fn test_go_chained_struct_embedded_and_cross_pkg_field_method_calls() {
+    let dir = TempDir::new().unwrap();
+    let root = dir.path();
+    fs::create_dir_all(root.join("internal/ui")).unwrap();
+    fs::create_dir_all(root.join("internal/launch")).unwrap();
+    fs::create_dir_all(root.join("cmd/app")).unwrap();
+
+    fs::write(root.join("go.mod"), "module demo\n\ngo 1.24\n").unwrap();
+
+    // Structs with overloaded method names (Update, Key, Render, Mouse)
+    // across single-hop, multi-hop, embedded field, slice/map, and return-value chains.
+    fs::write(
+        root.join("internal/ui/components.go"),
+        r#"package ui
+
+type BTWDock struct{}
+func (b *BTWDock) Update() { btwUpdateHelper() }
+func (b *BTWDock) Key()    { btwKeyHelper() }
+func (b *BTWDock) Render() { btwRenderHelper() }
+func btwUpdateHelper() {}
+func btwKeyHelper()    {}
+func btwRenderHelper() {}
+
+type Menu struct{}
+func (m *Menu) Update() { menuUpdateHelper() }
+func menuUpdateHelper() {}
+
+type Dialog struct{}
+func (d *Dialog) Key()   { dialogKeyHelper() }
+func (d *Dialog) Mouse() { dialogMouseHelper() }
+func dialogKeyHelper()   {}
+func dialogMouseHelper() {}
+
+type ContentDialog struct {
+	Dialog
+}
+func (d *ContentDialog) Key()   { d.Dialog.Key() }
+func (d *ContentDialog) Mouse() { d.Dialog.Mouse() }
+
+type Item struct{}
+func (i *Item) Render() { itemRenderHelper() }
+func itemRenderHelper() {}
+
+type Transcript struct{}
+func (t *Transcript) Render() { transcriptRenderHelper() }
+func transcriptRenderHelper() {}
+
+type Main struct {
+	BTW   *BTWDock
+	Menu  *Menu
+	Items []*Item
+}
+func (m *Main) Update() {
+	m.Menu.Update()
+	m.BTW.Update()
+}
+func (m *Main) Render() {
+	m.BTW.Render()
+	m.Items[0].Render()
+	for _, it := range m.Items {
+		it.Render()
+	}
+}
+
+type Attachment struct {
+	Main *Main
+}
+
+type FrameInput struct {
+	Main   *Main
+	Dialog *ContentDialog
+}
+func (in FrameInput) displayedTranscript() *Transcript {
+	return &Transcript{}
+}
+func (in FrameInput) Handle(anyVal any) {
+	// Single-hop field calls
+	in.Dialog.Key()
+	in.Dialog.Mouse()
+	// Local var initialized from struct field, then chained field call
+	main, dlg := in.Main, in.Dialog
+	main.BTW.Key()
+	_ = dlg
+	// Direct field call on receiver
+	in.Main.Render()
+	// Method-return chain
+	in.displayedTranscript().Render()
+	// Type assertion chain
+	if cd, ok := anyVal.(*ContentDialog); ok {
+		cd.Dialog.Key()
+	}
+}
+
+func NewAttachment() *Attachment {
+	return &Attachment{Main: &Main{BTW: &BTWDock{}, Menu: &Menu{}}}
+}
+
+// Truly unused structs/methods (including overloaded names) MUST remain dead.
+type UnusedDock struct{}
+func (u *UnusedDock) Update() {}
+func (u *UnusedDock) Key()    {}
+func (u *UnusedDock) Render() {}
+
+type ComposerOperation struct{}
+func (c *ComposerOperation) ClientLocal() {}
+
+type NativeAnswers struct{}
+func (n *NativeAnswers) PublicAnswer() {}
+"#,
+    )
+    .unwrap();
+
+    // Cross-package struct field chain: r.terminal (type *ui.Attachment) -> u.Main.Update()
+    fs::write(
+        root.join("internal/launch/renderer.go"),
+        r#"package launch
+
+import "demo/internal/ui"
+
+type Renderer struct {
+	terminal *ui.Attachment
+}
+
+func (r *Renderer) Step() {
+	u := r.terminal
+	u.Main.Update()
+	// Function-return chain across packages
+	ui.NewAttachment().Main.Render()
+	in := ui.FrameInput{Main: u.Main, Dialog: &ui.ContentDialog{}}
+	in.Handle(nil)
+}
+
+func Run() {
+	r := &Renderer{terminal: ui.NewAttachment()}
+	r.Step()
+}
+"#,
+    )
+    .unwrap();
+
+    fs::write(
+        root.join("cmd/app/main.go"),
+        r#"package main
+
+import "demo/internal/launch"
+
+func main() {
+	launch.Run()
+}
+"#,
+    )
+    .unwrap();
+
+    let ignores = KagamiConfig::default().build_ignore_globset().unwrap();
+    let files = discover_files(root, &ignores, None).unwrap();
+    let graph = CodeGraph::build(root, &files, false).unwrap();
+    let dead = analyze_dead(
+        &graph,
+        &DeadOptions {
+            scope: DeadScope::Prod,
+            langs: None,
+            allowlist: Default::default(),
+            include_clusters: true,
+            path_filter: None,
+            min_confidence: Confidence::Heuristic,
+        },
+    );
+    let is_dead = |sym: &str| dead.symbols.iter().any(|s| s.symbol == sym);
+    let has_resolved_call = |from_qname: &str, to_qname: &str| {
+        graph.edges.iter().any(|e| {
+            e.kind == kagami::model::EdgeKind::Calls
+                && e.confidence == Confidence::Resolved
+                && graph.symbols.get(&e.from).map(|s| s.qualified_name.as_str()) == Some(from_qname)
+                && graph.symbols.get(&e.to).map(|s| s.qualified_name.as_str()) == Some(to_qname)
+        })
+    };
+
+    for (caller, callee) in [
+        ("Main.Update", "BTWDock.Update"),
+        ("Main.Update", "Menu.Update"),
+        ("Main.Render", "BTWDock.Render"),
+        ("Main.Render", "Item.Render"),
+        ("FrameInput.Handle", "ContentDialog.Key"),
+        ("FrameInput.Handle", "ContentDialog.Mouse"),
+        ("FrameInput.Handle", "BTWDock.Key"),
+        ("FrameInput.Handle", "Main.Render"),
+        ("FrameInput.Handle", "Transcript.Render"),
+        ("ContentDialog.Key", "Dialog.Key"),
+        ("ContentDialog.Mouse", "Dialog.Mouse"),
+        ("Renderer.Step", "Main.Update"),
+        ("Renderer.Step", "Main.Render"),
+    ] {
+        assert!(
+            has_resolved_call(caller, callee),
+            "Expected Resolved call edge {caller} -> {callee}"
+        );
+    }
+
+    for live_sym in [
+        "BTWDock.Update",
+        "BTWDock.Key",
+        "BTWDock.Render",
+        "btwUpdateHelper",
+        "btwKeyHelper",
+        "btwRenderHelper",
+        "Menu.Update",
+        "menuUpdateHelper",
+        "ContentDialog.Key",
+        "ContentDialog.Mouse",
+        "Dialog.Key",
+        "Dialog.Mouse",
+        "dialogKeyHelper",
+        "dialogMouseHelper",
+        "Main.Update",
+        "Main.Render",
+        "Item.Render",
+        "itemRenderHelper",
+        "Transcript.Render",
+        "transcriptRenderHelper",
+    ] {
+        assert!(
+            !is_dead(live_sym),
+            "Expected {live_sym} to be resolved and live; dead={:?}",
+            dead.symbols
+        );
+    }
+
+    for dead_sym in [
+        "UnusedDock.Update",
+        "UnusedDock.Key",
+        "UnusedDock.Render",
+        "ComposerOperation.ClientLocal",
+        "NativeAnswers.PublicAnswer",
+    ] {
+        assert!(
+            is_dead(dead_sym),
+            "Expected truly unused {dead_sym} to remain dead; dead={:?}",
+            dead.symbols
+        );
+    }
+}

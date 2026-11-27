@@ -163,6 +163,8 @@ fn extract_json_schema(rel_path: &str, src: &str, blake3_hex: String) -> Result<
         ir_funcs: Vec::new(),
         interface_methods: std::collections::HashMap::new(),
         embedded_types: std::collections::HashMap::new(),
+        struct_fields: std::collections::HashMap::new(),
+        func_return_types: std::collections::HashMap::new(),
     })
 }
 

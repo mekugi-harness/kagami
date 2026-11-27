@@ -87,6 +87,7 @@ pub fn extract(
                                         qualifier: Some(resolved_file),
                                         kind: EdgeKind::Calls,
                                         line: ch.start_position().row + 1 + line_offset,
+                                        receiver_chain: None,
                                     });
                                 }
                             }
@@ -195,6 +196,8 @@ pub fn extract(
         ir_funcs,
         interface_methods: std::collections::HashMap::new(),
         embedded_types: std::collections::HashMap::new(),
+        struct_fields: std::collections::HashMap::new(),
+        func_return_types: std::collections::HashMap::new(),
     })
 }
 
@@ -489,6 +492,7 @@ fn walk_ts_nodes(
                             qualifier: None,
                             kind: EdgeKind::Calls,
                             line: span.start_line,
+                            receiver_chain: None,
                         });
                     } else if let Some(mut val) = child.child_by_field_name("value") {
                         while val.kind() == "parenthesized_expression" {
@@ -511,6 +515,7 @@ fn walk_ts_nodes(
                                 qualifier,
                                 kind: EdgeKind::Calls,
                                 line: span.start_line,
+                                receiver_chain: None,
                             });
                         } else {
                             collect_ts_refs_and_bridges(
@@ -584,6 +589,7 @@ fn walk_ts_nodes(
                                                 qualifier: Some(resolved_file),
                                                 kind: EdgeKind::Calls,
                                                 line: span.start_line,
+                                                receiver_chain: None,
                                             });
                                         }
                                     } else {
@@ -597,6 +603,7 @@ fn walk_ts_nodes(
                                             qualifier,
                                             kind: EdgeKind::Calls,
                                             line: span.start_line,
+                                            receiver_chain: None,
                                         });
                                     }
                                 }
@@ -899,6 +906,7 @@ fn collect_ts_refs_and_bridges(
                                 qualifier,
                                 kind: EdgeKind::Calls,
                                 line,
+                                receiver_chain: None,
                             });
                         }
                         "member_expression" => {
@@ -911,6 +919,7 @@ fn collect_ts_refs_and_bridges(
                                     qualifier: obj,
                                     kind: EdgeKind::Calls,
                                     line,
+                                    receiver_chain: None,
                                 });
                             }
                         }
@@ -957,6 +966,7 @@ fn collect_ts_refs_and_bridges(
                                 qualifier: binding.resolved_file.clone(),
                                 kind: EdgeKind::Calls,
                                 line,
+                                receiver_chain: None,
                             });
                         }
                     }
@@ -972,6 +982,7 @@ fn collect_ts_refs_and_bridges(
                             qualifier: binding.resolved_file.clone(),
                             kind: EdgeKind::Calls,
                             line,
+                            receiver_chain: None,
                         });
                     }
                 }
@@ -985,6 +996,7 @@ fn collect_ts_refs_and_bridges(
                         qualifier: None,
                         kind: EdgeKind::TypeRef,
                         line,
+                        receiver_chain: None,
                     });
                 }
             }

@@ -115,12 +115,36 @@ pub enum Confidence {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub enum ReceiverStep {
+    /// Starting named type in the caller file's scope (e.g. "Main", "pkg.Main", or "[]Item").
+    Type(String),
+    /// Starting function call or type conversion return value in the caller file's scope.
+    Call {
+        qualifier: Option<String>,
+        name: String,
+        result_index: usize,
+    },
+    /// Struct field (or embedded field) access on the current type.
+    Field(String),
+    /// Method call on the current type returning result at result_index.
+    MethodCall {
+        name: String,
+        result_index: usize,
+    },
+    /// Element access via indexing (x[i]) or range iteration on a slice/array/map.
+    Elem,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RawRef {
     pub from_symbol_id: String,
     pub target_name: String,
     pub qualifier: Option<String>,
     pub kind: EdgeKind,
     pub line: usize,
+    /// Optional structured receiver type/field chain for precise method resolution (Go).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub receiver_chain: Option<Vec<ReceiverStep>>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -166,6 +190,13 @@ pub struct FileExtract {
     /// Struct or interface symbol ID -> embedded type names (e.g. Go embedded fields/interfaces).
     #[serde(default)]
     pub embedded_types: HashMap<String, Vec<String>>,
+    /// Struct symbol ID -> field name -> field type name (including embedded fields where
+    /// field name is the unqualified base type name; slice/array/map element types prefixed with "[]").
+    #[serde(default)]
+    pub struct_fields: HashMap<String, HashMap<String, String>>,
+    /// Function or method symbol ID -> return type names by result position (empty string if unknown/builtin).
+    #[serde(default)]
+    pub func_return_types: HashMap<String, Vec<String>>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

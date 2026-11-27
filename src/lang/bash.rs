@@ -89,6 +89,8 @@ pub fn extract(
         ir_funcs,
         interface_methods: std::collections::HashMap::new(),
         embedded_types: std::collections::HashMap::new(),
+        struct_fields: std::collections::HashMap::new(),
+        func_return_types: std::collections::HashMap::new(),
     })
 }
 
@@ -159,6 +161,7 @@ fn collect_bash_walk(
                         qualifier: None,
                         kind: EdgeKind::Calls,
                         line,
+                        receiver_chain: None,
                     });
                     // Emit ExecTarget bridges for scripts, binaries, go run, bun run, just
                     emit_bash_exec_bridges(&cmd, &args, current_sym, line, bridges);
