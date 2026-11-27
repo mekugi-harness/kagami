@@ -27,6 +27,7 @@ Returns symbols with no reachable call site.
 - `--lang <go,rust,ts,js,svelte,just,sh>`: Restrict reported symbols to selected languages.
 - `--allowlist <path>`: Allowlist file (auto-detects `.deadcode-allowlist` at repo root if present).
 - `--include-clusters`: Also report unreachable call cycles (`unreachable_cluster`, default: `true`).
+- `--min-confidence <heuristic|resolved|exact>`: Minimum confidence level to report (default: `heuristic`; use `resolved` to filter out dynamic-dispatch / interface / trait `Heuristic` candidates; `dead` currently emits `Heuristic` and `Resolved` findings).
 - `--format <md|json>`: Output format (default: `md`).
 
 ### 3. `kagami similar`

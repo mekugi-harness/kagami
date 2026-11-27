@@ -4,7 +4,7 @@ use kagami::graph::dead::{analyze_dead, DeadOptions, DeadScope};
 use kagami::graph::CodeGraph;
 use kagami::ir::similar::{find_similar, pair_similarity, SimilarOptions};
 use kagami::lang;
-use kagami::model::Language;
+use kagami::model::{Confidence, Language};
 use kagami::walker::discover_files;
 use std::fs;
 use tempfile::TempDir;
@@ -260,6 +260,7 @@ echo ok
             allowlist: allow,
             include_clusters: true,
             path_filter: build_path_filter(&[]).unwrap(),
+            min_confidence: Confidence::Heuristic,
         },
     );
 

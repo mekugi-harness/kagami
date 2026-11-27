@@ -10,6 +10,8 @@ pub struct KagamiConfig {
     #[serde(default)]
     pub ignore: Vec<String>,
     #[serde(default)]
+    pub test_paths: Vec<String>,
+    #[serde(default)]
     pub dead: DeadConfig,
 }
 
@@ -35,6 +37,10 @@ impl KagamiConfig {
             builder.add(Glob::new(pat)?);
         }
         Ok(builder.build()?)
+    }
+
+    pub fn build_test_paths_globset(&self) -> Result<Option<GlobSet>> {
+        build_path_filter(&self.test_paths)
     }
 }
 

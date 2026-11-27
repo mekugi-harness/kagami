@@ -6,7 +6,7 @@ use kagami::graph::dead::{analyze_dead, DeadOptions, DeadScope};
 use kagami::graph::scip::{apply_scip_overlay, load_scip_file};
 use kagami::graph::CodeGraph;
 use kagami::ir::similar::{find_similar, SimilarOptions};
-use kagami::model::Language;
+use kagami::model::{Confidence, Language};
 use kagami::output::{render_blast, render_dead, render_similar, Format};
 use kagami::walker::discover_files;
 use std::collections::HashSet;
@@ -90,6 +90,23 @@ impl From<CliDeadScope> for DeadScope {
     }
 }
 
+#[derive(ValueEnum, Debug, Clone, Copy)]
+enum CliConfidence {
+    Heuristic,
+    Resolved,
+    Exact,
+}
+
+impl From<CliConfidence> for Confidence {
+    fn from(c: CliConfidence) -> Self {
+        match c {
+            CliConfidence::Heuristic => Confidence::Heuristic,
+            CliConfidence::Resolved => Confidence::Resolved,
+            CliConfidence::Exact => Confidence::Exact,
+        }
+    }
+}
+
 #[derive(Subcommand, Debug)]
 enum Commands {
     /// Return a symbol, its references, and relationships across languages
@@ -128,6 +145,9 @@ enum Commands {
         /// Exclude unreachable call cycles (report only 0-caller symbols)
         #[arg(long)]
         no_clusters: bool,
+        /// Minimum confidence level to report (heuristic, resolved, exact)
+        #[arg(long = "min-confidence", value_enum, default_value = "heuristic")]
+        min_confidence: CliConfidence,
         /// Max rows in markdown output (0 = unlimited)
         #[arg(long, default_value_t = 100)]
         limit: usize,
@@ -157,6 +177,7 @@ fn main() -> Result<()> {
     let root = cli.root.canonicalize().unwrap_or(cli.root.clone());
     let cfg = KagamiConfig::load(&root)?;
     let extra_ignores = cfg.build_ignore_globset()?;
+    let test_paths = cfg.build_test_paths_globset()?;
     let path_filter = build_path_filter(&cli.paths)?;
     let fmt: Format = cli.format.into();
 
@@ -173,6 +194,9 @@ fn main() -> Result<()> {
             // Always index whole repo for blast-radius so cross-file/cross-lang callers are visible
             let files = discover_files(&root, &extra_ignores, path_filter.as_ref())?;
             let mut graph = CodeGraph::build(&root, &files, !cli.no_cache)?;
+            if let Some(ref tp) = test_paths {
+                graph.apply_test_paths(tp);
+            }
             for scip_path in &cli.scip_files {
                 let idx = load_scip_file(scip_path)?;
                 apply_scip_overlay(&mut graph, &idx, &root);
@@ -196,11 +220,15 @@ fn main() -> Result<()> {
             lang,
             allowlist,
             no_clusters,
+            min_confidence,
             limit,
         } => {
             // Index whole repo so callers outside --path still keep symbols alive
             let files = discover_files(&root, &extra_ignores, None)?;
             let mut graph = CodeGraph::build(&root, &files, !cli.no_cache)?;
+            if let Some(ref tp) = test_paths {
+                graph.apply_test_paths(tp);
+            }
             for scip_path in &cli.scip_files {
                 let idx = load_scip_file(scip_path)?;
                 apply_scip_overlay(&mut graph, &idx, &root);
@@ -220,6 +248,7 @@ fn main() -> Result<()> {
                     allowlist: allow,
                     include_clusters: !no_clusters,
                     path_filter,
+                    min_confidence: min_confidence.into(),
                 },
             );
             print!("{}", render_dead(&report, fmt, limit)?);

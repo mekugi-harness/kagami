@@ -18,7 +18,9 @@ pub fn extract(rel_path: &str, src: &str, blake3_hex: String) -> Result<FileExtr
         .parse(src, None)
         .ok_or_else(|| anyhow::anyhow!("failed to parse Go file {}", rel_path))?;
 
-    let is_test_file = rel_path.ends_with("_test.go");
+    let is_test_file = rel_path.ends_with("_test.go")
+        || rel_path.starts_with("testsupport/")
+        || rel_path.contains("/testsupport/");
     let dir_prefix = rel_path.rsplit_once('/').map(|(d, _)| d).unwrap_or("");
     let mut pkg = dir_prefix.to_string();
     let mut imports = Vec::new();

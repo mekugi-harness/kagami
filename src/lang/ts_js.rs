@@ -8,7 +8,15 @@ use crate::model::{
     Symbol, SymbolKind, Visibility,
 };
 use anyhow::Result;
+use std::collections::{HashMap, HashSet};
+use std::path::Path;
 use tree_sitter::{Node, Parser};
+
+#[derive(Debug, Clone)]
+struct ImportedBinding {
+    target_name: String,
+    resolved_file: Option<String>,
+}
 
 pub fn extract(
     rel_path: &str,
@@ -49,6 +57,8 @@ pub fn extract(
     let mut refs = Vec::new();
     let mut bridges = Vec::new();
     let mut ir_funcs = Vec::new();
+    let imported_bindings = collect_ts_imported_bindings(tree.root_node(), src, rel_path);
+    let no_shadowed: HashSet<String> = HashSet::new();
 
     // Collect module-scope (top-level) calls/expressions under a <module> entrypoint symbol
     let mod_id = make_symbol_id(rel_path, "<module>", 1 + line_offset);
@@ -90,10 +100,27 @@ pub fn extract(
                 | "while_statement"
                 | "try_statement" => {
                     has_top_level_exec = true;
-                    collect_ts_refs_and_bridges(ch, src, line_offset, &mod_id, &mut refs, &mut bridges);
+                    collect_ts_refs_and_bridges(
+                        ch,
+                        src,
+                        line_offset,
+                        &mod_id,
+                        &imported_bindings,
+                        &no_shadowed,
+                        &mut refs,
+                        &mut bridges,
+                    );
                 }
                 "lexical_declaration" | "variable_declaration" => {
-                    if collect_ts_non_func_var_inits(ch, src, line_offset, &mod_id, &mut refs, &mut bridges) {
+                    if collect_ts_non_func_var_inits(
+                        ch,
+                        src,
+                        line_offset,
+                        &mod_id,
+                        &imported_bindings,
+                        &mut refs,
+                        &mut bridges,
+                    ) {
                         has_top_level_exec = true;
                     }
                 }
@@ -101,7 +128,15 @@ pub fn extract(
                     let mut ec = ch.walk();
                     for ech in ch.children(&mut ec) {
                         if matches!(ech.kind(), "lexical_declaration" | "variable_declaration")
-                            && collect_ts_non_func_var_inits(ech, src, line_offset, &mod_id, &mut refs, &mut bridges)
+                            && collect_ts_non_func_var_inits(
+                                ech,
+                                src,
+                                line_offset,
+                                &mod_id,
+                                &imported_bindings,
+                                &mut refs,
+                                &mut bridges,
+                            )
                         {
                             has_top_level_exec = true;
                         }
@@ -140,6 +175,7 @@ pub fn extract(
         false,
         is_test_file,
         is_sveltekit_route,
+        &imported_bindings,
         &mut imports,
         &mut symbols,
         &mut refs,
@@ -184,6 +220,117 @@ pub(crate) fn resolve_relative_path(current_file: &str, import_path: &str) -> Op
     }
 }
 
+fn collect_ts_imported_bindings(
+    root: Node<'_>,
+    src: &str,
+    rel_path: &str,
+) -> HashMap<String, ImportedBinding> {
+    let mut bindings = HashMap::new();
+    let mut rc = root.walk();
+    for ch in root.children(&mut rc) {
+        if ch.kind() != "import_statement" {
+            continue;
+        }
+        let is_type_only = {
+            let mut ic = ch.walk();
+            ch.children(&mut ic).any(|k| k.kind() == "type")
+        };
+        if is_type_only {
+            continue;
+        }
+        let Some(source_node) = ch.child_by_field_name("source") else {
+            continue;
+        };
+        let path = strip_quotes(node_text(source_node, src));
+        let resolved_file = resolve_relative_path(rel_path, &path);
+
+        let mut ic = ch.walk();
+        for clause in ch.children(&mut ic) {
+            if clause.kind() != "import_clause" {
+                continue;
+            }
+            let mut cc = clause.walk();
+            for part in clause.children(&mut cc) {
+                match part.kind() {
+                    "identifier" => {
+                        let local = node_text(part, src).to_string();
+                        if resolved_file.is_some() {
+                            let target_name = if path.ends_with(".svelte") {
+                                Path::new(&path)
+                                    .file_stem()
+                                    .and_then(|s| s.to_str())
+                                    .unwrap_or(&local)
+                                    .to_string()
+                            } else {
+                                "<default>".to_string()
+                            };
+                            bindings.insert(
+                                local,
+                                ImportedBinding {
+                                    target_name,
+                                    resolved_file: resolved_file.clone(),
+                                },
+                            );
+                        }
+                    }
+                    "named_imports" => {
+                        let mut nc = part.walk();
+                        for spec in part.children(&mut nc) {
+                            if spec.kind() != "import_specifier" {
+                                continue;
+                            }
+                            let spec_is_type = {
+                                let mut sc = spec.walk();
+                                spec.children(&mut sc).any(|k| k.kind() == "type")
+                            };
+                            if spec_is_type {
+                                continue;
+                            }
+                            if let Some(orig_node) = spec.child_by_field_name("name") {
+                                let orig = node_text(orig_node, src).to_string();
+                                let local = spec
+                                    .child_by_field_name("alias")
+                                    .map(|a| node_text(a, src).to_string())
+                                    .unwrap_or_else(|| orig.clone());
+                                if orig == "default" {
+                                    if resolved_file.is_some() {
+                                        let target_name = if path.ends_with(".svelte") {
+                                            Path::new(&path)
+                                                .file_stem()
+                                                .and_then(|s| s.to_str())
+                                                .unwrap_or(&local)
+                                                .to_string()
+                                        } else {
+                                            "<default>".to_string()
+                                        };
+                                        bindings.insert(
+                                            local,
+                                            ImportedBinding {
+                                                target_name,
+                                                resolved_file: resolved_file.clone(),
+                                            },
+                                        );
+                                    }
+                                } else {
+                                    bindings.insert(
+                                        local,
+                                        ImportedBinding {
+                                            target_name: orig,
+                                            resolved_file: resolved_file.clone(),
+                                        },
+                                    );
+                                }
+                            }
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
+    }
+    bindings
+}
+
 fn unwrap_ts_function_value(mut node: Node<'_>) -> Option<Node<'_>> {
     while node.kind() == "parenthesized_expression" {
         node = node.named_child(0)?;
@@ -196,22 +343,70 @@ fn collect_ts_non_func_var_inits(
     src: &str,
     line_offset: usize,
     mod_id: &str,
+    imported_bindings: &HashMap<String, ImportedBinding>,
     refs: &mut Vec<RawRef>,
     bridges: &mut Vec<BridgeHint>,
 ) -> bool {
     let mut found = false;
+    let empty_shadowed: HashSet<String> = HashSet::new();
     let mut vc = decl_node.walk();
     for decl in decl_node.children(&mut vc) {
         if decl.kind() == "variable_declarator" {
             if let Some(val) = decl.child_by_field_name("value") {
                 if unwrap_ts_function_value(val).is_none() {
                     found = true;
-                    collect_ts_refs_and_bridges(decl, src, line_offset, mod_id, refs, bridges);
+                    collect_ts_refs_and_bridges(
+                        decl,
+                        src,
+                        line_offset,
+                        mod_id,
+                        imported_bindings,
+                        &empty_shadowed,
+                        refs,
+                        bridges,
+                    );
                 }
             }
         }
     }
     found
+}
+
+fn collect_ts_local_bindings(body: Node<'_>, src: &str, params: &[String]) -> HashSet<String> {
+    let mut locals: HashSet<String> = params.iter().cloned().collect();
+    let mut stack = vec![body];
+    while let Some(n) = stack.pop() {
+        match n.kind() {
+            "variable_declarator" | "function_declaration" | "class_declaration" => {
+                if let Some(name_node) = n.child_by_field_name("name") {
+                    if name_node.kind() == "identifier" {
+                        locals.insert(node_text(name_node, src).to_string());
+                    }
+                }
+            }
+            "catch_clause" => {
+                if let Some(p) = n.child_by_field_name("parameter") {
+                    if p.kind() == "identifier" {
+                        locals.insert(node_text(p, src).to_string());
+                    }
+                }
+            }
+            "arrow_function" | "function_expression" => {
+                if let Some(p) = n.child_by_field_name("parameter") {
+                    locals.insert(node_text(p, src).to_string());
+                }
+                for p in extract_ts_params(n, src) {
+                    locals.insert(p);
+                }
+            }
+            _ => {}
+        }
+        let mut c = n.walk();
+        for ch in n.children(&mut c) {
+            stack.push(ch);
+        }
+    }
+    locals
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -224,6 +419,7 @@ fn walk_ts_nodes(
     exported: bool,
     is_test_file: bool,
     is_sveltekit_route: bool,
+    imported_bindings: &HashMap<String, ImportedBinding>,
     imports: &mut Vec<String>,
     symbols: &mut Vec<Symbol>,
     refs: &mut Vec<RawRef>,
@@ -239,6 +435,11 @@ fn walk_ts_nodes(
                 }
             }
             "export_statement" => {
+                let is_default = {
+                    let mut ec = child.walk();
+                    child.children(&mut ec).any(|k| k.kind() == "default")
+                };
+                let sym_len_before = symbols.len();
                 walk_ts_nodes(
                     child,
                     src,
@@ -248,12 +449,159 @@ fn walk_ts_nodes(
                     true,
                     is_test_file,
                     is_sveltekit_route,
+                    imported_bindings,
                     imports,
                     symbols,
                     refs,
                     bridges,
                     ir_funcs,
                 );
+                if is_default {
+                    let span = node_span(child, line_offset);
+                    let def_id = make_symbol_id(rel_path, "<default>", span.start_line);
+                    let has_decl = symbols.len() > sym_len_before;
+                    symbols.push(Symbol {
+                        id: def_id.clone(),
+                        name: "<default>".to_string(),
+                        qualified_name: "<default>".to_string(),
+                        kind: SymbolKind::Script,
+                        lang,
+                        file: rel_path.to_string(),
+                        span: if has_decl {
+                            crate::model::Span { start_line: 0, end_line: 0 }
+                        } else {
+                            span
+                        },
+                        visibility: Visibility::Public,
+                        is_test: is_test_file,
+                        is_entrypoint: false,
+                        is_dynamic_candidate: false,
+                        package_or_module: rel_path.to_string(),
+                    });
+                    if has_decl {
+                        // Link <default> to the first declared symbol inside export default ...
+                        let target_id = symbols[sym_len_before].id.clone();
+                        refs.push(RawRef {
+                            from_symbol_id: def_id,
+                            target_name: target_id,
+                            qualifier: None,
+                            kind: EdgeKind::Calls,
+                            line: span.start_line,
+                        });
+                    } else if let Some(mut val) = child.child_by_field_name("value") {
+                        while val.kind() == "parenthesized_expression" {
+                            if let Some(inner) = val.named_child(0) {
+                                val = inner;
+                            } else {
+                                break;
+                            }
+                        }
+                        let empty_shadowed = HashSet::new();
+                        if val.kind() == "identifier" {
+                            let ident = node_text(val, src);
+                            let (target_name, qualifier) = imported_bindings
+                                .get(ident)
+                                .map(|b| (b.target_name.clone(), b.resolved_file.clone()))
+                                .unwrap_or_else(|| (ident.to_string(), None));
+                            refs.push(RawRef {
+                                from_symbol_id: def_id,
+                                target_name,
+                                qualifier,
+                                kind: EdgeKind::Calls,
+                                line: span.start_line,
+                            });
+                        } else {
+                            collect_ts_refs_and_bridges(
+                                val,
+                                src,
+                                line_offset,
+                                &def_id,
+                                imported_bindings,
+                                &empty_shadowed,
+                                refs,
+                                bridges,
+                            );
+                        }
+                    }
+                } else {
+                    // Handle export { localFn as default }; and export { run as default } from './mod';
+                    let reexport_source = child
+                        .child_by_field_name("source")
+                        .map(|s| strip_quotes(node_text(s, src)));
+                    if let Some(ref spath) = reexport_source {
+                        imports.push(spath.clone());
+                    }
+                    let mut ec = child.walk();
+                    for clause in child.children(&mut ec) {
+                        if clause.kind() != "export_clause" {
+                            continue;
+                        }
+                        let mut sc = clause.walk();
+                        for spec in clause.children(&mut sc) {
+                            if spec.kind() != "export_specifier" {
+                                continue;
+                            }
+                            let alias = spec.child_by_field_name("alias").map(|a| node_text(a, src));
+                            if alias == Some("default") {
+                                if let Some(orig) = spec.child_by_field_name("name") {
+                                    let span = node_span(child, line_offset);
+                                    let def_id = make_symbol_id(rel_path, "<default>", span.start_line);
+                                    symbols.push(Symbol {
+                                        id: def_id.clone(),
+                                        name: "<default>".to_string(),
+                                        qualified_name: "<default>".to_string(),
+                                        kind: SymbolKind::Script,
+                                        lang,
+                                        file: rel_path.to_string(),
+                                        span: crate::model::Span { start_line: 0, end_line: 0 },
+                                        visibility: Visibility::Public,
+                                        is_test: is_test_file,
+                                        is_entrypoint: false,
+                                        is_dynamic_candidate: false,
+                                        package_or_module: rel_path.to_string(),
+                                    });
+                                    let ident = node_text(orig, src);
+                                    if let Some(ref spath) = reexport_source {
+                                        if let Some(resolved_file) = resolve_relative_path(rel_path, spath) {
+                                            let target_name = if ident == "default" {
+                                                if spath.ends_with(".svelte") {
+                                                    Path::new(spath)
+                                                        .file_stem()
+                                                        .and_then(|s| s.to_str())
+                                                        .unwrap_or(ident)
+                                                        .to_string()
+                                                } else {
+                                                    "<default>".to_string()
+                                                }
+                                            } else {
+                                                ident.to_string()
+                                            };
+                                            refs.push(RawRef {
+                                                from_symbol_id: def_id,
+                                                target_name,
+                                                qualifier: Some(resolved_file),
+                                                kind: EdgeKind::Calls,
+                                                line: span.start_line,
+                                            });
+                                        }
+                                    } else {
+                                        let (target_name, qualifier) = imported_bindings
+                                            .get(ident)
+                                            .map(|b| (b.target_name.clone(), b.resolved_file.clone()))
+                                            .unwrap_or_else(|| (ident.to_string(), None));
+                                        refs.push(RawRef {
+                                            from_symbol_id: def_id,
+                                            target_name,
+                                            qualifier,
+                                            kind: EdgeKind::Calls,
+                                            line: span.start_line,
+                                        });
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
             }
             "function_declaration" => {
                 if let Some(name_node) = child.child_by_field_name("name") {
@@ -277,11 +625,12 @@ fn walk_ts_nodes(
                         package_or_module: rel_path.to_string(),
                     });
                     if let Some(body) = child.child_by_field_name("body") {
-                        if let Some(pnode) = child.child_by_field_name("parameters") {
-                            collect_ts_refs_and_bridges(pnode, src, line_offset, &id, refs, bridges);
-                        }
-                        collect_ts_refs_and_bridges(body, src, line_offset, &id, refs, bridges);
                         let params = extract_ts_params(child, src);
+                        let shadowed = collect_ts_local_bindings(body, src, &params);
+                        if let Some(pnode) = child.child_by_field_name("parameters") {
+                            collect_ts_refs_and_bridges(pnode, src, line_offset, &id, imported_bindings, &shadowed, refs, bridges);
+                        }
+                        collect_ts_refs_and_bridges(body, src, line_offset, &id, imported_bindings, &shadowed, refs, bridges);
                         ir_funcs.push(IrFunc {
                             symbol_id: id,
                             name,
@@ -321,12 +670,16 @@ fn walk_ts_nodes(
                                     is_dynamic_candidate: false,
                                     package_or_module: rel_path.to_string(),
                                 });
+                                let params = extract_ts_params(fn_val, src);
+                                let shadowed = fn_val
+                                    .child_by_field_name("body")
+                                    .map(|b| collect_ts_local_bindings(b, src, &params))
+                                    .unwrap_or_else(|| params.iter().cloned().collect());
                                 if let Some(pnode) = fn_val.child_by_field_name("parameters") {
-                                    collect_ts_refs_and_bridges(pnode, src, line_offset, &id, refs, bridges);
+                                    collect_ts_refs_and_bridges(pnode, src, line_offset, &id, imported_bindings, &shadowed, refs, bridges);
                                 }
                                 if let Some(body) = fn_val.child_by_field_name("body") {
-                                    collect_ts_refs_and_bridges(body, src, line_offset, &id, refs, bridges);
-                                    let params = extract_ts_params(fn_val, src);
+                                    collect_ts_refs_and_bridges(body, src, line_offset, &id, imported_bindings, &shadowed, refs, bridges);
                                     ir_funcs.push(IrFunc {
                                         symbol_id: id,
                                         name,
@@ -385,11 +738,12 @@ fn walk_ts_nodes(
                                         package_or_module: rel_path.to_string(),
                                     });
                                     if let Some(mbody) = member.child_by_field_name("body") {
-                                        if let Some(pnode) = member.child_by_field_name("parameters") {
-                                            collect_ts_refs_and_bridges(pnode, src, line_offset, &mid, refs, bridges);
-                                        }
-                                        collect_ts_refs_and_bridges(mbody, src, line_offset, &mid, refs, bridges);
                                         let params = extract_ts_params(member, src);
+                                        let shadowed = collect_ts_local_bindings(mbody, src, &params);
+                                        if let Some(pnode) = member.child_by_field_name("parameters") {
+                                            collect_ts_refs_and_bridges(pnode, src, line_offset, &mid, imported_bindings, &shadowed, refs, bridges);
+                                        }
+                                        collect_ts_refs_and_bridges(mbody, src, line_offset, &mid, imported_bindings, &shadowed, refs, bridges);
                                         ir_funcs.push(IrFunc {
                                             symbol_id: mid,
                                             name: qname,
@@ -439,7 +793,8 @@ fn walk_ts_nodes(
                             confidence: Confidence::Heuristic,
                         });
                     }
-                    collect_ts_refs_and_bridges(child, src, line_offset, &id, refs, bridges);
+                    let empty_shadowed = HashSet::new();
+                    collect_ts_refs_and_bridges(child, src, line_offset, &id, imported_bindings, &empty_shadowed, refs, bridges);
                 }
             }
             _ => {}
@@ -464,11 +819,58 @@ fn extract_ts_params(node: Node<'_>, src: &str) -> Vec<String> {
     params
 }
 
+fn is_ts_value_identifier(n: Node<'_>) -> bool {
+    let mut anc = n.parent();
+    while let Some(a) = anc {
+        if matches!(
+            a.kind(),
+            "type_query"
+                | "type_annotation"
+                | "type_alias_declaration"
+                | "interface_declaration"
+                | "type_arguments"
+                | "type_parameters"
+        ) {
+            return false;
+        }
+        anc = a.parent();
+    }
+    let Some(parent) = n.parent() else {
+        return true;
+    };
+    match parent.kind() {
+        "import_clause"
+        | "import_specifier"
+        | "namespace_import"
+        | "required_parameter"
+        | "optional_parameter"
+        | "rest_pattern"
+        | "labeled_statement"
+        | "property_signature" => false,
+        "member_expression" => {
+            parent.child_by_field_name("property").map(|p| p.id()) != Some(n.id())
+        }
+        "call_expression" => {
+            parent.child_by_field_name("function").map(|f| f.id()) != Some(n.id())
+        }
+        "variable_declarator"
+        | "function_declaration"
+        | "class_declaration"
+        | "method_definition" => {
+            parent.child_by_field_name("name").map(|nm| nm.id()) != Some(n.id())
+        }
+        "pair" => parent.child_by_field_name("key").map(|k| k.id()) != Some(n.id()),
+        _ => true,
+    }
+}
+
 fn collect_ts_refs_and_bridges(
     node: Node<'_>,
     src: &str,
     line_offset: usize,
     from_id: &str,
+    imported_bindings: &HashMap<String, ImportedBinding>,
+    shadowed: &HashSet<String>,
     refs: &mut Vec<RawRef>,
     bridges: &mut Vec<BridgeHint>,
 ) {
@@ -480,10 +882,19 @@ fn collect_ts_refs_and_bridges(
                 if let Some(func) = n.child_by_field_name("function") {
                     match func.kind() {
                         "identifier" => {
+                            let ident = node_text(func, src);
+                            let (target_name, qualifier) = if !shadowed.contains(ident) {
+                                imported_bindings
+                                    .get(ident)
+                                    .map(|b| (b.target_name.clone(), b.resolved_file.clone()))
+                                    .unwrap_or_else(|| (ident.to_string(), None))
+                            } else {
+                                (ident.to_string(), None)
+                            };
                             refs.push(RawRef {
                                 from_symbol_id: from_id.to_string(),
-                                target_name: node_text(func, src).to_string(),
-                                qualifier: None,
+                                target_name,
+                                qualifier,
                                 kind: EdgeKind::Calls,
                                 line,
                             });
@@ -531,6 +942,36 @@ fn collect_ts_refs_and_bridges(
                         line,
                         confidence: Confidence::Heuristic,
                     });
+                }
+            }
+            "identifier" => {
+                let ident = node_text(n, src);
+                if !shadowed.contains(ident) {
+                    if let Some(binding) = imported_bindings.get(ident) {
+                        if is_ts_value_identifier(n) {
+                            refs.push(RawRef {
+                                from_symbol_id: from_id.to_string(),
+                                target_name: binding.target_name.clone(),
+                                qualifier: binding.resolved_file.clone(),
+                                kind: EdgeKind::Calls,
+                                line,
+                            });
+                        }
+                    }
+                }
+            }
+            "shorthand_property_identifier" => {
+                let ident = node_text(n, src);
+                if !shadowed.contains(ident) {
+                    if let Some(binding) = imported_bindings.get(ident) {
+                        refs.push(RawRef {
+                            from_symbol_id: from_id.to_string(),
+                            target_name: binding.target_name.clone(),
+                            qualifier: binding.resolved_file.clone(),
+                            kind: EdgeKind::Calls,
+                            line,
+                        });
+                    }
                 }
             }
             "type_identifier" => {
@@ -690,6 +1131,47 @@ pub fn lower_ts_node(node: Node<'_>, src: &str) -> IrNode {
             let val = node.named_child(0).map(|n| Box::new(lower_ts_node(n, src)));
             IrNode::Return(val)
         }
+        "throw_statement" => {
+            let val = node
+                .named_child(0)
+                .map(|n| lower_ts_node(n, src))
+                .unwrap_or(IrNode::Lit(LitClass::Null));
+            IrNode::PropagateErr(Box::new(val))
+        }
+        "try_statement" => {
+            let mut args = Vec::new();
+            if let Some(body) = node.child_by_field_name("body") {
+                args.push(lower_ts_node(body, src));
+            }
+            if let Some(handler) = node.child_by_field_name("handler") {
+                let mut catch_stmts = Vec::new();
+                if let Some(param) = handler.child_by_field_name("parameter") {
+                    catch_stmts.push(IrNode::Assign {
+                        dst: node_text(param, src).to_string(),
+                        val: Box::new(IrNode::Var("<catch>".into())),
+                    });
+                }
+                if let Some(cbody) = handler.child_by_field_name("body") {
+                    catch_stmts.push(lower_ts_node(cbody, src));
+                }
+                args.push(IrNode::Call {
+                    callee: "catch".into(),
+                    args: catch_stmts,
+                });
+            }
+            if let Some(finalizer) = node.child_by_field_name("finalizer") {
+                if let Some(fbody) = finalizer.child_by_field_name("body") {
+                    args.push(IrNode::Call {
+                        callee: "finally".into(),
+                        args: vec![lower_ts_node(fbody, src)],
+                    });
+                }
+            }
+            IrNode::Call {
+                callee: "try".into(),
+                args,
+            }
+        }
         "break_statement" => IrNode::Break,
         "continue_statement" => IrNode::Continue,
         "lexical_declaration" | "variable_declaration" => {
@@ -802,6 +1284,130 @@ pub fn lower_ts_node(node: Node<'_>, src: &str) -> IrNode {
             IrNode::Index {
                 obj: Box::new(obj),
                 idx: Box::new(idx),
+            }
+        }
+        "await_expression" => {
+            let inner = node
+                .named_child(0)
+                .map(|n| lower_ts_node(n, src))
+                .unwrap_or_else(|| IrNode::Opaque("await".into()));
+            IrNode::Call {
+                callee: "await".into(),
+                args: vec![inner],
+            }
+        }
+        "ternary_expression" => {
+            let cond = node
+                .child_by_field_name("condition")
+                .map(|c| lower_ts_node(c, src))
+                .unwrap_or_else(|| IrNode::Opaque("cond".into()));
+            let then_br = node
+                .child_by_field_name("consequence")
+                .map(|b| lower_ts_node(b, src))
+                .unwrap_or_else(|| IrNode::Seq(vec![]));
+            let else_br = node
+                .child_by_field_name("alternative")
+                .map(|b| Box::new(lower_ts_node(b, src)));
+            IrNode::Branch {
+                cond: Box::new(cond),
+                then_br: Box::new(then_br),
+                else_br,
+            }
+        }
+        "arrow_function" => {
+            let mut args = Vec::new();
+            if let Some(p) = node.child_by_field_name("parameter") {
+                args.push(IrNode::Assign {
+                    dst: node_text(p, src).to_string(),
+                    val: Box::new(IrNode::Lit(LitClass::Null)),
+                });
+            } else {
+                for p in extract_ts_params(node, src) {
+                    args.push(IrNode::Assign {
+                        dst: p,
+                        val: Box::new(IrNode::Lit(LitClass::Null)),
+                    });
+                }
+            }
+            if let Some(body) = node.child_by_field_name("body") {
+                args.push(lower_ts_node(body, src));
+            }
+            IrNode::Call {
+                callee: "<fn>".into(),
+                args,
+            }
+        }
+        "object" => {
+            let mut props = Vec::new();
+            let mut c = node.walk();
+            for ch in node.children(&mut c) {
+                if !ch.is_named() || ch.kind() == "comment" {
+                    continue;
+                }
+                match ch.kind() {
+                    "pair" => {
+                        let val = ch
+                            .child_by_field_name("value")
+                            .map(|v| lower_ts_node(v, src))
+                            .unwrap_or(IrNode::Lit(LitClass::Null));
+                        if let Some(key_node) = ch.child_by_field_name("key") {
+                            if key_node.kind() == "computed_property_name" {
+                                let mut kc = key_node.walk();
+                                let k_ir = key_node
+                                    .children(&mut kc)
+                                    .find(|n| n.is_named() && n.kind() != "comment")
+                                    .map(|e| lower_ts_node(e, src))
+                                    .unwrap_or_else(|| IrNode::Opaque("computed_key".into()));
+                                props.push(IrNode::Call {
+                                    callee: "<computed_pair>".into(),
+                                    args: vec![k_ir, val],
+                                });
+                            } else {
+                                props.push(IrNode::Member {
+                                    obj: Box::new(val),
+                                    field: strip_quotes(node_text(key_node, src)),
+                                });
+                            }
+                        } else {
+                            props.push(val);
+                        }
+                    }
+                    "shorthand_property_identifier" => {
+                        let name = node_text(ch, src).to_string();
+                        props.push(IrNode::Member {
+                            obj: Box::new(IrNode::Var(name.clone())),
+                            field: name,
+                        });
+                    }
+                    _ => props.push(lower_ts_node(ch, src)),
+                }
+            }
+            IrNode::Call {
+                callee: "<obj>".into(),
+                args: props,
+            }
+        }
+        "array" => {
+            let mut elems = Vec::new();
+            let mut c = node.walk();
+            for ch in node.children(&mut c) {
+                if ch.is_named() && ch.kind() != "comment" {
+                    elems.push(lower_ts_node(ch, src));
+                }
+            }
+            IrNode::Call {
+                callee: "<array>".into(),
+                args: elems,
+            }
+        }
+        "spread_element" => {
+            let inner = node
+                .named_child(0)
+                .map(|n| lower_ts_node(n, src))
+                .unwrap_or_else(|| IrNode::Opaque("spread".into()));
+            IrNode::Call {
+                callee: "<spread>".into(),
+                args: vec![inner],
             }
         }
         "parenthesized_expression" => node

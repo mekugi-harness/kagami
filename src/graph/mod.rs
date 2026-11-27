@@ -61,14 +61,24 @@ impl CodeGraph {
         Ok(Self::from_extracts(extracts))
     }
 
+    pub fn apply_test_paths(&mut self, test_paths: &globset::GlobSet) {
+        for sym in self.symbols.values_mut() {
+            if test_paths.is_match(&sym.file) {
+                sym.is_test = true;
+            }
+        }
+    }
+
     pub fn from_extracts(extracts: Vec<FileExtract>) -> Self {
         let mut symbols: HashMap<String, Symbol> = HashMap::new();
+        let mut known_files: HashSet<&str> = HashSet::new();
         let mut by_file_name: HashMap<(&str, &str), String> = HashMap::new();
         let mut by_pkg_name: HashMap<(Language, &str, &str), Vec<String>> = HashMap::new();
         let mut by_lang_name: HashMap<(Language, &str), Vec<String>> = HashMap::new();
         let mut by_lang_qname: HashMap<(Language, &str), Vec<String>> = HashMap::new();
 
         for ext in &extracts {
+            known_files.insert(ext.file.as_str());
             for sym in &ext.symbols {
                 symbols.insert(sym.id.clone(), sym.clone());
             }
@@ -117,6 +127,7 @@ impl CodeGraph {
 
         for ext in &extracts {
             let mut alias_map: HashMap<&str, &str> = HashMap::new();
+            let mut rel_import_paths: HashSet<String> = HashSet::new();
             for imp in &ext.imports {
                 if let Some((alias, path)) = imp.split_once('=') {
                     alias_map.insert(alias, path);
@@ -126,6 +137,16 @@ impl CodeGraph {
                         if let Some(prev) = imp.rsplit('/').nth(1) {
                             alias_map.insert(prev, imp.as_str());
                         }
+                    }
+                }
+                if matches!(
+                    ext.lang,
+                    Language::TypeScript | Language::JavaScript | Language::Svelte
+                ) {
+                    if let Some(resolved) =
+                        crate::lang::ts_js::resolve_relative_path(&ext.file, imp)
+                    {
+                        rel_import_paths.insert(resolved);
                     }
                 }
             }
@@ -138,6 +159,8 @@ impl CodeGraph {
                     ext,
                     r,
                     &alias_map,
+                    &rel_import_paths,
+                    &known_files,
                     &symbols,
                     &by_file_name,
                     &by_pkg_name,
@@ -192,6 +215,8 @@ fn resolve_ref(
     ext: &FileExtract,
     r: &crate::model::RawRef,
     alias_map: &HashMap<&str, &str>,
+    rel_import_paths: &HashSet<String>,
+    known_files: &HashSet<&str>,
     symbols: &HashMap<String, Symbol>,
     by_file_name: &HashMap<(&str, &str), String>,
     by_pkg_name: &HashMap<(Language, &str, &str), Vec<String>>,
@@ -212,14 +237,58 @@ fn resolve_ref(
 
     // 2. O(1) qualified match (Type.Method or Type::method)
     if let Some(ref qual) = r.qualifier {
-        // Exact file-path qualifier (relative Svelte component or <script module> import)
-        if r.kind == EdgeKind::TemplateRef || r.target_name == "<script:module>" {
-            if let Some(id) = by_file_name.get(&(qual.as_str(), r.target_name.as_str())) {
-                return vec![(id.clone(), Confidence::Resolved)];
+        // Exact file-path qualifier (relative Svelte component, <script module>, or TS/JS relative import)
+        if let Some(id) = by_file_name.get(&(qual.as_str(), r.target_name.as_str())) {
+            return vec![(id.clone(), Confidence::Resolved)];
+        }
+        if rel_import_paths.contains(qual.as_str()) {
+            // Select the first existing target module by path priority before looking up the binding
+            // so we never fall through to a lower-priority file (e.g. worker/index.ts when worker.ts exists).
+            let target_file = if known_files.contains(qual.as_str()) {
+                Some(qual.clone())
+            } else {
+                let mut candidates: Vec<String> = Vec::new();
+                // TS NodeNext/ESM imports often use .js/.jsx/.mjs/.cjs specifiers backed by .ts/.tsx sources
+                for (js_ext, ts_exts) in [
+                    (".js", &[ ".ts", ".tsx" ][..]),
+                    (".jsx", &[ ".tsx", ".ts" ][..]),
+                    (".mjs", &[ ".mts" ][..]),
+                    (".cjs", &[ ".cts" ][..]),
+                ] {
+                    if let Some(stem) = qual.strip_suffix(js_ext) {
+                        for ts_ext in ts_exts {
+                            candidates.push(format!("{}{}", stem, ts_ext));
+                        }
+                    }
+                }
+                for suffix in [
+                    ".ts",
+                    ".tsx",
+                    ".js",
+                    ".jsx",
+                    ".mjs",
+                    ".cjs",
+                    "/index.ts",
+                    "/index.tsx",
+                    "/index.js",
+                ] {
+                    candidates.push(format!("{}{}", qual, suffix));
+                }
+                candidates
+                    .into_iter()
+                    .find(|cand| known_files.contains(cand.as_str()))
+            };
+            if let Some(tf) = target_file {
+                if let Some(id) = by_file_name.get(&(tf.as_str(), r.target_name.as_str())) {
+                    return vec![(id.clone(), Confidence::Resolved)];
+                }
             }
-            if qual.ends_with(".svelte") {
-                return Vec::new();
-            }
+            return Vec::new();
+        }
+        if qual.ends_with(".svelte")
+            && (r.kind == EdgeKind::TemplateRef || r.target_name == "<script:module>")
+        {
+            return Vec::new();
         }
 
         for sep in [".", "::"] {
@@ -233,23 +302,7 @@ fn resolve_ref(
 
         // Package-qualified lookup (e.g. launch.Run(), composition.NativeRenderer())
         if let Some(imp_path) = alias_map.get(qual.as_str()).copied() {
-            let mut pkg_keys = Vec::new();
-            if let Some(last) = imp_path.rsplit('/').next() {
-                pkg_keys.push(last);
-                if last.starts_with('v') && last[1..].chars().all(|c| c.is_ascii_digit()) {
-                    if let Some(prev) = imp_path.rsplit('/').nth(1) {
-                        pkg_keys.push(prev);
-                    }
-                }
-            }
-            if !pkg_keys.contains(&qual.as_str()) {
-                pkg_keys.push(qual.as_str());
-            }
-            let imp_tail = imp_path
-                .split('/')
-                .skip(1) // drop domain/module prefix when present
-                .collect::<Vec<_>>()
-                .join("/");
+            let pkg_keys = pkg_keys_for_import(imp_path, Some(qual.as_str()));
             for pkg_key in pkg_keys {
                 if let Some(ids) = by_pkg_name.get(&(ext.lang, pkg_key, r.target_name.as_str())) {
                     let narrowed: Vec<String> = ids
@@ -262,14 +315,7 @@ fn resolve_ref(
                                         return false;
                                     }
                                     let dir = s.file.rsplit_once('/').map(|(d, _)| d).unwrap_or("");
-                                    if imp_path.contains('/') {
-                                        dir == imp_path
-                                            || (!imp_tail.is_empty() && (dir == imp_tail || dir.ends_with(&format!("/{}", imp_tail))))
-                                            || (!dir.is_empty() && imp_path.ends_with(&format!("/{}", dir)))
-                                            || (dir.is_empty() && imp_path.split('/').count() <= 3)
-                                    } else {
-                                        dir == imp_path
-                                    }
+                                    import_path_matches_dir(imp_path, dir)
                                 })
                                 .unwrap_or(false)
                         })
@@ -288,6 +334,7 @@ fn resolve_ref(
 
         // Non-package qualifier (receiver variable like c.Close()): prefer same-file method match first
         let mut results = Vec::new();
+        let mut found_method = false;
         // If qualifier is a same-file or same-package var/const (e.g. Go hooks.Run()),
         // link the var itself so callbacks registered in its initializer remain reachable.
         if let Some(id) = by_file_name.get(&(ext.file.as_str(), qual.as_str())) {
@@ -306,6 +353,59 @@ fn resolve_ref(
         if let Some(id) = by_file_name.get(&(ext.file.as_str(), r.target_name.as_str())) {
             if symbols.get(id).map(|s| s.kind == SymbolKind::Method).unwrap_or(false) {
                 results.push((id.clone(), Confidence::Resolved));
+                found_method = true;
+            }
+        }
+        // Fall back to combined same-package + imported-package methods when same-file lookup finds
+        // nothing, so an unrelated same-package method never shadows an imported receiver's method.
+        if !found_method {
+            let mut seen_methods: HashSet<String> = HashSet::new();
+            let mut candidate_methods: Vec<String> = Vec::new();
+            if !ext.package_or_module.is_empty() {
+                if let Some(ids) = by_pkg_name.get(&(ext.lang, ext.package_or_module.as_str(), r.target_name.as_str())) {
+                    for id in ids {
+                        if symbols.get(id).map(|s| s.kind == SymbolKind::Method).unwrap_or(false)
+                            && seen_methods.insert(id.clone())
+                        {
+                            candidate_methods.push(id.clone());
+                        }
+                    }
+                }
+            }
+            let mut seen_imps: HashSet<&str> = HashSet::new();
+            for &imp_path in alias_map.values() {
+                if !seen_imps.insert(imp_path) {
+                    continue;
+                }
+                for pkg_key in pkg_keys_for_import(imp_path, None) {
+                    if let Some(ids) = by_pkg_name.get(&(ext.lang, pkg_key, r.target_name.as_str())) {
+                        for id in ids {
+                            let is_matching_method = symbols
+                                .get(id)
+                                .map(|s| {
+                                    if s.kind != SymbolKind::Method {
+                                        return false;
+                                    }
+                                    let dir = s.file.rsplit_once('/').map(|(d, _)| d).unwrap_or("");
+                                    import_path_matches_dir(imp_path, dir)
+                                })
+                                .unwrap_or(false);
+                            if is_matching_method && seen_methods.insert(id.clone()) {
+                                candidate_methods.push(id.clone());
+                            }
+                        }
+                    }
+                }
+            }
+            if !candidate_methods.is_empty() && candidate_methods.len() <= 4 {
+                let conf = if candidate_methods.len() == 1 {
+                    Confidence::Resolved
+                } else {
+                    Confidence::Heuristic
+                };
+                for id in candidate_methods {
+                    results.push((id, conf));
+                }
             }
         }
         if !results.is_empty() {
@@ -323,6 +423,9 @@ fn resolve_ref(
     }
 
     // 4. Bounded global/import lookup (only when candidate set is small)
+    if r.target_name == "<default>" {
+        return Vec::new();
+    }
     if let Some(cands) = by_lang_name.get(&(ext.lang, r.target_name.as_str())) {
         if cands.len() == 1 {
             return vec![(cands[0].clone(), Confidence::Heuristic)];
@@ -359,4 +462,39 @@ fn resolve_ref(
     }
 
     Vec::new()
+}
+
+fn pkg_keys_for_import<'a>(imp_path: &'a str, extra: Option<&'a str>) -> Vec<&'a str> {
+    let mut pkg_keys = Vec::new();
+    if let Some(last) = imp_path.rsplit('/').next() {
+        pkg_keys.push(last);
+        if last.starts_with('v') && last[1..].chars().all(|c| c.is_ascii_digit()) {
+            if let Some(prev) = imp_path.rsplit('/').nth(1) {
+                pkg_keys.push(prev);
+            }
+        }
+    }
+    if let Some(q) = extra {
+        if !pkg_keys.contains(&q) {
+            pkg_keys.push(q);
+        }
+    }
+    pkg_keys
+}
+
+fn import_path_matches_dir(imp_path: &str, dir: &str) -> bool {
+    let imp_tail = imp_path
+        .split('/')
+        .skip(1) // drop domain/module prefix when present
+        .collect::<Vec<_>>()
+        .join("/");
+    if imp_path.contains('/') {
+        dir == imp_path
+            || (!imp_tail.is_empty()
+                && (dir == imp_tail || dir.ends_with(&format!("/{}", imp_tail))))
+            || (!dir.is_empty() && imp_path.ends_with(&format!("/{}", dir)))
+            || (dir.is_empty() && imp_path.split('/').count() <= 3)
+    } else {
+        dir == imp_path
+    }
 }
