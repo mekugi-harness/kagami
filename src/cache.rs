@@ -41,10 +41,26 @@ impl CacheStore {
 
     pub fn save(&self, data: &CacheData) {
         if let Some(parent) = self.path.parent() {
+            if let Ok(meta) = fs::symlink_metadata(parent) {
+                if meta.file_type().is_symlink() {
+                    return;
+                }
+            }
             let _ = fs::create_dir_all(parent);
         }
+        if let Ok(meta) = fs::symlink_metadata(&self.path) {
+            if meta.file_type().is_symlink() {
+                return;
+            }
+        }
         if let Ok(bytes) = serde_json::to_vec(data) {
-            let _ = fs::write(&self.path, bytes);
+            let tmp = self.path.with_extension("json.tmp");
+            if fs::symlink_metadata(&tmp).map(|m| m.file_type().is_symlink()).unwrap_or(false) {
+                return;
+            }
+            if fs::write(&tmp, bytes).is_ok() {
+                let _ = fs::rename(&tmp, &self.path);
+            }
         }
     }
 }

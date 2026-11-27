@@ -50,6 +50,42 @@ pub fn extract(
     let mut bridges = Vec::new();
     let mut ir_funcs = Vec::new();
 
+    // Collect module-scope (top-level) calls/expressions under a <module> entrypoint symbol
+    let mod_id = make_symbol_id(rel_path, "<module>", 1 + line_offset);
+    let mut has_top_level_exec = false;
+    {
+        let root = tree.root_node();
+        let mut rc = root.walk();
+        for ch in root.children(&mut rc) {
+            if matches!(
+                ch.kind(),
+                "expression_statement" | "if_statement" | "for_statement" | "for_in_statement" | "while_statement" | "try_statement"
+            ) {
+                has_top_level_exec = true;
+                collect_ts_refs_and_bridges(ch, src, line_offset, &mod_id, &mut refs, &mut bridges);
+            }
+        }
+    }
+    if has_top_level_exec {
+        symbols.push(Symbol {
+            id: mod_id,
+            name: "<module>".to_string(),
+            qualified_name: "<module>".to_string(),
+            kind: SymbolKind::Script,
+            lang,
+            file: rel_path.to_string(),
+            span: crate::model::Span {
+                start_line: 1 + line_offset,
+                end_line: src.lines().count().max(1) + line_offset,
+            },
+            visibility: Visibility::Public,
+            is_test: is_test_file,
+            is_entrypoint: true,
+            is_dynamic_candidate: false,
+            package_or_module: rel_path.to_string(),
+        });
+    }
+
     walk_ts_nodes(
         tree.root_node(),
         src,
@@ -674,15 +710,26 @@ pub fn lower_ts_node(node: Node<'_>, src: &str) -> IrNode {
 
 fn lower_ts_case_body(case_node: Node<'_>, src: &str) -> IrNode {
     let mut stmts = Vec::new();
+    let mut terminates = false;
     let mut c = case_node.walk();
     for ch in case_node.children(&mut c) {
-        if !ch.is_named() || ch.kind() == "comment" || ch.kind() == "break_statement" {
+        if !ch.is_named() || ch.kind() == "comment" {
             continue;
         }
         if case_node.child_by_field_name("value").map(|v| v.id()) == Some(ch.id()) {
             continue;
         }
+        if ch.kind() == "break_statement" {
+            terminates = true;
+            continue;
+        }
+        if matches!(ch.kind(), "return_statement" | "throw_statement") {
+            terminates = true;
+        }
         stmts.push(lower_ts_node(ch, src));
+    }
+    if !stmts.is_empty() && !terminates {
+        stmts.push(IrNode::Opaque("fallthrough".into()));
     }
     IrNode::Seq(stmts)
 }

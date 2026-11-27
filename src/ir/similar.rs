@@ -72,9 +72,10 @@ pub fn find_similar(funcs: &[IrFunc], opts: &SimilarOptions) -> Vec<SimilarPair>
 
     let mut candidate_pairs: HashSet<(usize, usize)> = HashSet::new();
 
-    let mut exact_buckets: HashMap<[u8; 32], Vec<usize>> = HashMap::new();
+    let mut exact_buckets: HashMap<(Option<Language>, [u8; 32]), Vec<usize>> = HashMap::new();
     for (idx, pf) in prepared.iter().enumerate() {
-        exact_buckets.entry(pf.exact_hash).or_default().push(idx);
+        let lang_key = if opts.cross_lang { None } else { Some(pf.func.lang) };
+        exact_buckets.entry((lang_key, pf.exact_hash)).or_default().push(idx);
     }
     for indices in exact_buckets.values() {
         let cap = indices.len().min(32);
@@ -86,12 +87,13 @@ pub fn find_similar(funcs: &[IrFunc], opts: &SimilarOptions) -> Vec<SimilarPair>
     }
 
     for band in 0..BANDS {
-        let mut buckets: HashMap<[u64; ROWS_PER_BAND], Vec<usize>> = HashMap::new();
+        let mut buckets: HashMap<(Option<Language>, [u64; ROWS_PER_BAND]), Vec<usize>> = HashMap::new();
         let offset = band * ROWS_PER_BAND;
         for (idx, pf) in prepared.iter().enumerate() {
             let mut key = [0u64; ROWS_PER_BAND];
             key.copy_from_slice(&pf.minhash[offset..offset + ROWS_PER_BAND]);
-            buckets.entry(key).or_default().push(idx);
+            let lang_key = if opts.cross_lang { None } else { Some(pf.func.lang) };
+            buckets.entry((lang_key, key)).or_default().push(idx);
         }
         for indices in buckets.values() {
             if indices.len() < 2 || indices.len() > 64 {

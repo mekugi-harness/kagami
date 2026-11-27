@@ -175,16 +175,19 @@ fn desugar_seq_patterns(items: Vec<IrNode>) -> Vec<IrNode> {
 }
 
 fn is_err_check(cond: &IrNode) -> bool {
+    let is_null_lit = |n: &IrNode| match n {
+        IrNode::Lit(LitClass::Null) => true,
+        IrNode::Lit(LitClass::Exact(s)) => matches!(s.as_str(), "nil" | "null" | "undefined" | "None"),
+        _ => false,
+    };
     match cond {
         IrNode::BinOp {
             op: OpClass::Neq,
             lhs,
             rhs,
         } => {
-            (matches!(lhs.as_ref(), IrNode::Var(v) if v == "err")
-                && matches!(rhs.as_ref(), IrNode::Lit(LitClass::Null)))
-                || (matches!(rhs.as_ref(), IrNode::Var(v) if v == "err")
-                    && matches!(lhs.as_ref(), IrNode::Lit(LitClass::Null)))
+            (matches!(lhs.as_ref(), IrNode::Var(v) if v == "err") && is_null_lit(rhs))
+                || (matches!(rhs.as_ref(), IrNode::Var(v) if v == "err") && is_null_lit(lhs))
         }
         _ => false,
     }
@@ -362,7 +365,11 @@ fn alpha_rename(node: IrNode, env: &mut AlphaEnv, opts: NormalizeOptions) -> IrN
             }
         }
         IrNode::Call { callee, args } => IrNode::Call {
-            callee,
+            callee: if env.map.contains_key(&callee) {
+                env.resolve(&callee)
+            } else {
+                callee
+            },
             args: args
                 .into_iter()
                 .map(|a| alpha_rename(a, env, opts))

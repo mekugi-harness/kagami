@@ -18,7 +18,8 @@ pub fn extract(rel_path: &str, src: &str, blake3_hex: String) -> Result<FileExtr
         .ok_or_else(|| anyhow::anyhow!("failed to parse Go file {}", rel_path))?;
 
     let is_test_file = rel_path.ends_with("_test.go");
-    let mut pkg = String::new();
+    let dir_prefix = rel_path.rsplit_once('/').map(|(d, _)| d).unwrap_or("");
+    let mut pkg = dir_prefix.to_string();
     let mut imports = Vec::new();
     let mut symbols = Vec::new();
     let mut refs = Vec::new();
@@ -31,7 +32,12 @@ pub fn extract(rel_path: &str, src: &str, blake3_hex: String) -> Result<FileExtr
         match child.kind() {
             "package_clause" => {
                 if let Some(id) = find_child_by_kind(child, "package_identifier") {
-                    pkg = node_text(id, src).to_string();
+                    let pname = node_text(id, src);
+                    pkg = if dir_prefix.is_empty() {
+                        pname.to_string()
+                    } else {
+                        format!("{}::{}", dir_prefix, pname)
+                    };
                 }
             }
             "import_declaration" => {
@@ -175,6 +181,8 @@ pub fn extract(rel_path: &str, src: &str, blake3_hex: String) -> Result<FileExtr
                             let name = node_text(name_node, src).to_string();
                             let span = node_span(spec, 0);
                             let id = make_symbol_id(rel_path, &name, span.start_line);
+                            let is_pkg_init_var = spec.kind() == "var_spec"
+                                && spec.child_by_field_name("value").is_some();
                             symbols.push(Symbol {
                                 id: id.clone(),
                                 name: name.clone(),
@@ -185,7 +193,7 @@ pub fn extract(rel_path: &str, src: &str, blake3_hex: String) -> Result<FileExtr
                                 span,
                                 visibility: go_visibility(&name),
                                 is_test: is_test_file,
-                                is_entrypoint: false,
+                                is_entrypoint: is_pkg_init_var,
                                 is_dynamic_candidate: false,
                                 package_or_module: pkg.clone(),
                             });
@@ -471,9 +479,22 @@ pub fn lower_go_node(node: Node<'_>, src: &str) -> IrNode {
                 .child_by_field_name("right")
                 .map(|n| lower_go_node(n, src))
                 .unwrap_or_else(|| IrNode::Opaque("rhs".into()));
+            let op_txt = node
+                .child_by_field_name("operator")
+                .map(|o| node_text(o, src).trim())
+                .unwrap_or("=");
+            let val = if let Some(base_op) = op_txt.strip_suffix('=').filter(|s| !s.is_empty() && *s != ":") {
+                IrNode::BinOp {
+                    op: map_binop(base_op),
+                    lhs: Box::new(IrNode::Var(lhs.clone())),
+                    rhs: Box::new(rhs),
+                }
+            } else {
+                rhs
+            };
             IrNode::Assign {
                 dst: lhs,
-                val: Box::new(rhs),
+                val: Box::new(val),
             }
         }
         "var_declaration" => {

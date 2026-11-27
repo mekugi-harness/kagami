@@ -64,7 +64,7 @@ pub fn render_dead(report: &DeadReport, fmt: Format, limit: usize) -> Result<Str
         Format::Md => {
             let mut out = String::new();
             out.push_str(&format!(
-                "## Dead Symbols: **{}** (unreferenced: {}, unreachable clusters: {}, total indexed symbols: {})\n\n",
+                "## Dead Symbols: **{}** (unreferenced: {}, unreachable from roots: {}, total indexed symbols: {})\n\n",
                 report.total_dead, report.unreferenced, report.unreachable_clusters, report.total_symbols
             ));
             if report.symbols.is_empty() {

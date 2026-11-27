@@ -48,10 +48,8 @@ impl CodeGraph {
             .collect();
 
         if use_cache {
-            let mut next_cache = CacheData {
-                version: PARSER_VERSION,
-                files: HashMap::with_capacity(extracts.len()),
-            };
+            let mut next_cache = prev_cache;
+            next_cache.version = PARSER_VERSION;
             for ext in &extracts {
                 next_cache.files.insert(ext.file.clone(), ext.clone());
             }
@@ -176,8 +174,10 @@ fn resolve_ref(
     by_lang_qname: &HashMap<(Language, &str), Vec<String>>,
 ) -> Vec<(String, Confidence)> {
     // 1. O(1) same-file match
-    if let Some(id) = by_file_name.get(&(ext.file.as_str(), r.target_name.as_str())) {
-        return vec![(id.clone(), Confidence::Resolved)];
+    if r.qualifier.is_none() {
+        if let Some(id) = by_file_name.get(&(ext.file.as_str(), r.target_name.as_str())) {
+            return vec![(id.clone(), Confidence::Resolved)];
+        }
     }
 
     // 2. O(1) qualified match (Type.Method or Type::method)

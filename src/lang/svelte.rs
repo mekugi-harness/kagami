@@ -41,6 +41,7 @@ pub fn extract(rel_path: &str, src: &str, blake3_hex: String) -> Result<FileExtr
     let mut refs = Vec::new();
     let mut bridges = Vec::new();
     let mut ir_funcs = Vec::new();
+    let mut comp_aliases: std::collections::HashMap<String, String> = std::collections::HashMap::new();
 
     // Extract all <script ...>...</script> blocks
     let mut search_pos = 0;
@@ -54,6 +55,21 @@ pub fn extract(rel_path: &str, src: &str, blake3_hex: String) -> Result<FileExtr
         let line_offset = src[..body_start].bytes().filter(|&b| b == b'\n').count();
         let script_src = &src[body_start..body_end];
         script_ranges.push((abs_open, body_end + "</script>".len()));
+        // Parse default Svelte component imports: import PrimaryButton from './Button.svelte'
+        for sline in script_src.lines() {
+            let t = sline.trim();
+            if let Some(rest) = t.strip_prefix("import ") {
+                if let Some((alias_part, path_part)) = rest.split_once(" from ") {
+                    let alias = alias_part.trim();
+                    let path = path_part.trim().trim_end_matches(';').trim_matches('"').trim_matches('\'');
+                    if !alias.contains('{') && path.ends_with(".svelte") {
+                        if let Some(stem) = Path::new(path).file_stem().and_then(|s| s.to_str()) {
+                            comp_aliases.insert(alias.to_string(), stem.to_string());
+                        }
+                    }
+                }
+            }
+        }
 
         if let Ok(sub) = ts_js::extract(rel_path, script_src, String::new(), Language::Svelte, line_offset) {
             imports.extend(sub.imports);
@@ -93,9 +109,10 @@ pub fn extract(rel_path: &str, src: &str, blake3_hex: String) -> Result<FileExtr
             }
             let tag = &src[start..end];
             if !tag.is_empty() {
+                let target = comp_aliases.get(tag).cloned().unwrap_or_else(|| tag.to_string());
                 refs.push(RawRef {
                     from_symbol_id: comp_id.clone(),
-                    target_name: tag.to_string(),
+                    target_name: target,
                     qualifier: None,
                     kind: EdgeKind::TemplateRef,
                     line: line_num,

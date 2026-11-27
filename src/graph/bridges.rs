@@ -9,7 +9,7 @@ pub fn materialize_bridges(
     edges: &mut Vec<Edge>,
 ) {
     // Group bridge hints by (BridgeKind, normalized key)
-    let mut groups: HashMap<(BridgeKind, String), Vec<(&BridgeHint, Language, String)>> =
+    let mut groups: HashMap<(BridgeKind, String), Vec<(BridgeHint, Language, String)>> =
         HashMap::new();
 
     for ext in extracts {
@@ -24,7 +24,7 @@ pub fn materialize_bridges(
             groups
                 .entry((hint.bridge_kind, norm_key))
                 .or_default()
-                .push((hint, ext.lang, ext.file.clone()));
+                .push((hint.clone(), ext.lang, ext.file.clone()));
         }
     }
 
@@ -32,37 +32,35 @@ pub fn materialize_bridges(
     for sym in symbols.values() {
         if sym.is_entrypoint && sym.name == "main" {
             if let Some(dir) = sym.file.rsplit_once('/').map(|(d, _)| d) {
-                // e.g. mekugi-tui/apps/mekugi/cmd/workspace/main.go -> key "mekugi-tui/apps/mekugi/cmd/workspace"
                 groups
                     .entry((BridgeKind::ExecTarget, dir.to_string()))
                     .or_default()
                     .push((
-                        Box::leak(Box::new(BridgeHint {
+                        BridgeHint {
                             from_symbol_id: sym.id.clone(),
                             bridge_kind: BridgeKind::ExecTarget,
                             key: dir.to_string(),
                             role: crate::model::BridgeRole::Producer,
                             line: sym.span.start_line,
                             confidence: Confidence::Resolved,
-                        })),
+                        },
                         sym.lang,
                         sym.file.clone(),
                     ));
-                // Also register leaf dir / binary name (e.g. "mekugi", "app-server")
                 if let Some(leaf) = dir.rsplit('/').next() {
                     if !matches!(leaf, "src" | "bin" | "cmd") {
                         groups
                             .entry((BridgeKind::ExecTarget, leaf.to_string()))
                             .or_default()
                             .push((
-                                Box::leak(Box::new(BridgeHint {
+                                BridgeHint {
                                     from_symbol_id: sym.id.clone(),
                                     bridge_kind: BridgeKind::ExecTarget,
                                     key: leaf.to_string(),
                                     role: crate::model::BridgeRole::Producer,
                                     line: sym.span.start_line,
                                     confidence: Confidence::Heuristic,
-                                })),
+                                },
                                 sym.lang,
                                 sym.file.clone(),
                             ));
@@ -104,9 +102,11 @@ pub fn materialize_bridges(
                 // Respect producer -> consumer direction when distinct
                 use crate::model::BridgeRole;
                 let dir_ok = match (ha.role, hb.role) {
-                    (BridgeRole::Consumer, BridgeRole::Producer) => true,
-                    (BridgeRole::Producer, BridgeRole::Consumer) => false,
-                    _ => true,
+                    (BridgeRole::Consumer, BridgeRole::Producer)
+                    | (BridgeRole::Consumer, BridgeRole::Both)
+                    | (BridgeRole::Both, BridgeRole::Producer)
+                    | (BridgeRole::Both, BridgeRole::Both) => true,
+                    _ => false,
                 };
                 if !dir_ok {
                     continue;
