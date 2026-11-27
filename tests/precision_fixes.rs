@@ -2987,3 +2987,390 @@ mod tests {
         );
     }
 }
+
+
+#[test]
+fn test_ts_js_function_value_refs_getters_and_lexical_shadowing() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    std::fs::create_dir_all(root.join("src/__tests__")).unwrap();
+
+    std::fs::write(
+        root.join("src/helpers.ts"),
+        r#"
+export function importedCallback(x: number): number {
+  return x + 1;
+}
+
+export function testOnlyProdFn(): number {
+  return 42;
+}
+
+export function testOnlyCallback(x: number): number {
+  return x * 2;
+}
+
+export function unrelatedFreeFn(): string {
+  return "never-called";
+}
+
+export class StateBox {
+  get preset(): string {
+    return "zen";
+  }
+
+  get unusedGetter(): string {
+    return "dead";
+  }
+}
+
+export class Delegate {
+  authorize(token: string): boolean {
+    return token.length > 0;
+  }
+
+  deadDelegate(): void {}
+}
+"#,
+    )
+    .unwrap();
+
+    std::fs::write(
+        root.join("src/main.ts"),
+        r#"
+import { importedCallback, StateBox, Delegate } from "./helpers";
+
+function onLinkClick(_e: Event) {}
+function mapItem(x: number) { return x * 2; }
+function filterItem(x: number) { return x > 0; }
+function eachItem(_x: number) {}
+function timerCb() {}
+function objValFn() {}
+function shorthandFn() {}
+function assignedFn() {}
+function returnedFn() {}
+function arrayFn() {}
+function deadShadowedParam() {}
+function deadShadowedBlock() {}
+function trulyDeadTsFn() {}
+
+class Wrapper {
+  private inner = new Delegate();
+  authorize(token: string): boolean {
+    return this.inner.authorize(token);
+  }
+}
+
+function getReturned() {
+  return returnedFn;
+}
+
+function runShadowCheck(deadShadowedParam: () => void) {
+  deadShadowedParam();
+  {
+    const deadShadowedBlock = () => {};
+    deadShadowedBlock();
+  }
+}
+
+function boot(node: HTMLElement, box: StateBox, obj: { unrelatedFreeFn: number }) {
+  node.addEventListener("click", onLinkClick);
+  node.removeEventListener("click", onLinkClick);
+  [1, 2, 3].map(mapItem).filter(filterItem).forEach(eachItem);
+  [1, 2].map(importedCallback);
+  setTimeout(timerCb, 10);
+  const handlers = { handler: objValFn, shorthandFn };
+  const ref = assignedFn;
+  const arr = [arrayFn];
+  const _ret = getReturned();
+  const _preset = box.preset;
+  const _prop = obj.unrelatedFreeFn;
+  const w = new Wrapper();
+  w.authorize("tok");
+  runShadowCheck(() => {});
+  void handlers;
+  void ref;
+  void arr;
+  void _ret;
+  void _preset;
+  void _prop;
+}
+
+boot(document.body, new StateBox(), { unrelatedFreeFn: 1 });
+"#,
+    )
+    .unwrap();
+
+    // Test-only callers MUST NOT keep production TS functions alive
+    std::fs::write(
+        root.join("src/helpers.test.ts"),
+        r#"
+import { testOnlyProdFn, testOnlyCallback } from "./helpers";
+testOnlyProdFn();
+[1, 2].map(testOnlyCallback);
+"#,
+    )
+    .unwrap();
+
+    std::fs::write(
+        root.join("src/__tests__/extra.spec.ts"),
+        r#"
+import { testOnlyProdFn } from "../helpers";
+testOnlyProdFn();
+"#,
+    )
+    .unwrap();
+
+    let ignores = KagamiConfig::default().build_ignore_globset().unwrap();
+    let files = discover_files(root, &ignores, None).unwrap();
+    let graph = CodeGraph::build(root, &files, false).unwrap();
+    let dead = analyze_dead(
+        &graph,
+        &DeadOptions {
+            scope: DeadScope::Prod,
+            langs: None,
+            allowlist: std::collections::HashSet::new(),
+            include_clusters: true,
+            path_filter: None,
+            min_confidence: Confidence::Heuristic,
+        },
+    );
+
+    let is_dead = |file_suffix: &str, sym: &str| {
+        dead.symbols
+            .iter()
+            .any(|s| s.file.ends_with(file_suffix) && s.symbol == sym)
+    };
+
+    for (file, sym) in [
+        ("src/main.ts", "onLinkClick"),
+        ("src/main.ts", "mapItem"),
+        ("src/main.ts", "filterItem"),
+        ("src/main.ts", "eachItem"),
+        ("src/main.ts", "timerCb"),
+        ("src/main.ts", "objValFn"),
+        ("src/main.ts", "shorthandFn"),
+        ("src/main.ts", "assignedFn"),
+        ("src/main.ts", "returnedFn"),
+        ("src/main.ts", "arrayFn"),
+        ("src/helpers.ts", "importedCallback"),
+        ("src/helpers.ts", "StateBox.preset"),
+        ("src/helpers.ts", "Delegate.authorize"),
+    ] {
+        assert!(
+            !is_dead(file, sym),
+            "Expected {file}::{sym} to be live; dead={:?}",
+            dead.symbols
+        );
+    }
+
+    for (file, sym) in [
+        ("src/main.ts", "deadShadowedParam"),
+        ("src/main.ts", "deadShadowedBlock"),
+        ("src/main.ts", "trulyDeadTsFn"),
+        ("src/helpers.ts", "testOnlyProdFn"),
+        ("src/helpers.ts", "testOnlyCallback"),
+        ("src/helpers.ts", "unrelatedFreeFn"),
+        ("src/helpers.ts", "StateBox.unusedGetter"),
+        ("src/helpers.ts", "Delegate.deadDelegate"),
+    ] {
+        assert!(
+            is_dead(file, sym),
+            "Expected {file}::{sym} to remain dead; dead={:?}",
+            dead.symbols
+        );
+    }
+}
+
+#[test]
+fn test_svelte5_templates_bind_this_barrels_and_routes() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    std::fs::create_dir_all(root.join("src/lib/ui/card")).unwrap();
+    std::fs::create_dir_all(root.join("src/routes")).unwrap();
+
+    std::fs::write(
+        root.join("src/lib/actions.ts"),
+        r#"
+export function followBottom(_node: HTMLElement) {}
+export function atomicInput(_node: HTMLElement, _get: () => unknown) {}
+export function fadeAnim(_node: HTMLElement) {}
+export function formatLabel(s: string) { return s.trim(); }
+export function testOnlyHelper() { return 1; }
+"#,
+    )
+    .unwrap();
+
+    std::fs::write(
+        root.join("src/lib/ui/card/card.svelte"),
+        r#"<script lang="ts">
+  export function cardLiveHelper() {}
+  cardLiveHelper();
+</script>
+<div><slot /></div>
+"#,
+    )
+    .unwrap();
+
+    std::fs::write(
+        root.join("src/lib/ui/card/card-unused.svelte"),
+        r#"<script lang="ts">
+  export function neverUsed() {}
+</script>
+<div>unused</div>
+"#,
+    )
+    .unwrap();
+
+    std::fs::write(
+        root.join("src/lib/ui/card/index.ts"),
+        r#"
+import Root from "./card.svelte";
+import Unused from "./card-unused.svelte";
+export { Root, Root as Card, Unused };
+"#,
+    )
+    .unwrap();
+
+    std::fs::write(
+        root.join("src/lib/Attachments.svelte"),
+        r#"<script lang="ts">
+  export function pick() {}
+  export function addRef(_x: string) {}
+  export function unusedExport() {}
+  function removeItem(_id: string) {}
+  function deadSvelteFn() {}
+</script>
+<button onclick={() => removeItem("a")}>Remove</button>
+"#,
+    )
+    .unwrap();
+
+    std::fs::write(
+        root.join("src/routes/+page.svelte"),
+        r#"<script lang="ts">
+  import Attachments from "$lib/Attachments.svelte";
+  import * as Card from "$lib/ui/card";
+  import { followBottom, atomicInput, fadeAnim, formatLabel } from "$lib/actions";
+
+  let tray = $state<ReturnType<typeof Attachments>>();
+  let items = ["a", "b"];
+  let live = false;
+
+  const fences = (_h: string) => (_node: HTMLElement) => {};
+  const measureHook = (_node: HTMLElement) => {};
+  function thought(t: string) { return t; }
+  function keyFor(x: string) { return x; }
+  function computeConst(x: string) { return x.toUpperCase(); }
+  function renderHtml() { return "<b>hi</b>"; }
+  function onKeyDown(_e: KeyboardEvent) {}
+  function commentedOutFn() {}
+
+  function pushRef() {
+    tray?.addRef("x");
+  }
+  pushRef();
+</script>
+
+<!-- {@attach commentedOutFn} -->
+<Card.Root heading={live ? "Thinking" : thought("hi")} aria-label="Item {formatLabel('x')}">
+  <div {@attach fences("html")} {@attach measureHook} use:followBottom use:atomicInput={() => ({ items })} transition:fadeAnim|global {onKeyDown}>
+    {@html renderHtml()}
+    {#each items as item (keyFor(item))}
+      {@const upper = computeConst(item)}
+      <span>{upper}</span>
+    {/each}
+  </div>
+  <Attachments bind:this={tray} />
+  <button onclick={() => tray?.pick()}>Pick</button>
+</Card.Root>
+
+<style>
+  .unused { color: red; }
+</style>
+"#,
+    )
+    .unwrap();
+
+    std::fs::write(
+        root.join("src/routes/+page.ts"),
+        r#"
+export const load = () => ({ ok: true });
+function deadRouteHelper() {}
+"#,
+    )
+    .unwrap();
+
+    std::fs::write(
+        root.join("src/lib/actions.test.ts"),
+        r#"
+import { testOnlyHelper } from "./actions";
+testOnlyHelper();
+"#,
+    )
+    .unwrap();
+
+    let ignores = KagamiConfig::default().build_ignore_globset().unwrap();
+    let files = discover_files(root, &ignores, None).unwrap();
+    let graph = CodeGraph::build(root, &files, false).unwrap();
+    let dead = analyze_dead(
+        &graph,
+        &DeadOptions {
+            scope: DeadScope::Prod,
+            langs: None,
+            allowlist: std::collections::HashSet::new(),
+            include_clusters: true,
+            path_filter: None,
+            min_confidence: Confidence::Heuristic,
+        },
+    );
+
+    let is_dead = |file_suffix: &str, sym: &str| {
+        dead.symbols
+            .iter()
+            .any(|s| s.file.ends_with(file_suffix) && s.symbol == sym)
+    };
+
+    for (file, sym) in [
+        ("src/lib/Attachments.svelte", "Attachments"),
+        ("src/lib/Attachments.svelte", "pick"),
+        ("src/lib/Attachments.svelte", "addRef"),
+        ("src/lib/Attachments.svelte", "removeItem"),
+        ("src/lib/ui/card/card.svelte", "card"),
+        ("src/lib/ui/card/card.svelte", "cardLiveHelper"),
+        ("src/lib/actions.ts", "followBottom"),
+        ("src/lib/actions.ts", "atomicInput"),
+        ("src/lib/actions.ts", "fadeAnim"),
+        ("src/lib/actions.ts", "formatLabel"),
+        ("src/routes/+page.svelte", "fences"),
+        ("src/routes/+page.svelte", "measureHook"),
+        ("src/routes/+page.svelte", "thought"),
+        ("src/routes/+page.svelte", "keyFor"),
+        ("src/routes/+page.svelte", "computeConst"),
+        ("src/routes/+page.svelte", "renderHtml"),
+        ("src/routes/+page.svelte", "onKeyDown"),
+        ("src/routes/+page.ts", "load"),
+    ] {
+        assert!(
+            !is_dead(file, sym),
+            "Expected {file}::{sym} to be live; dead={:?}",
+            dead.symbols
+        );
+    }
+
+    for (file, sym) in [
+        ("src/lib/Attachments.svelte", "unusedExport"),
+        ("src/lib/Attachments.svelte", "deadSvelteFn"),
+        ("src/lib/ui/card/card-unused.svelte", "card-unused"),
+        ("src/lib/ui/card/card-unused.svelte", "neverUsed"),
+        ("src/routes/+page.svelte", "commentedOutFn"),
+        ("src/routes/+page.ts", "deadRouteHelper"),
+        ("src/lib/actions.ts", "testOnlyHelper"),
+    ] {
+        assert!(
+            is_dead(file, sym),
+            "Expected {file}::{sym} to remain dead; dead={:?}",
+            dead.symbols
+        );
+    }
+}
