@@ -247,7 +247,21 @@ fn resolve_ref(
             let target_file = if known_files.contains(qual.as_str()) {
                 Some(qual.clone())
             } else {
-                [
+                let mut candidates: Vec<String> = Vec::new();
+                // TS NodeNext/ESM imports often use .js/.jsx/.mjs/.cjs specifiers backed by .ts/.tsx sources
+                for (js_ext, ts_exts) in [
+                    (".js", &[ ".ts", ".tsx" ][..]),
+                    (".jsx", &[ ".tsx", ".ts" ][..]),
+                    (".mjs", &[ ".mts", ".ts" ][..]),
+                    (".cjs", &[ ".cts", ".ts" ][..]),
+                ] {
+                    if let Some(stem) = qual.strip_suffix(js_ext) {
+                        for ts_ext in ts_exts {
+                            candidates.push(format!("{}{}", stem, ts_ext));
+                        }
+                    }
+                }
+                for suffix in [
                     ".ts",
                     ".tsx",
                     ".js",
@@ -257,10 +271,12 @@ fn resolve_ref(
                     "/index.ts",
                     "/index.tsx",
                     "/index.js",
-                ]
-                .iter()
-                .map(|suffix| format!("{}{}", qual, suffix))
-                .find(|cand| known_files.contains(cand.as_str()))
+                ] {
+                    candidates.push(format!("{}{}", qual, suffix));
+                }
+                candidates
+                    .into_iter()
+                    .find(|cand| known_files.contains(cand.as_str()))
             };
             if let Some(tf) = target_file {
                 if let Some(id) = by_file_name.get(&(tf.as_str(), r.target_name.as_str())) {
@@ -407,6 +423,9 @@ fn resolve_ref(
     }
 
     // 4. Bounded global/import lookup (only when candidate set is small)
+    if r.target_name == "<default>" {
+        return Vec::new();
+    }
     if let Some(cands) = by_lang_name.get(&(ext.lang, r.target_name.as_str())) {
         if cands.len() == 1 {
             return vec![(cands[0].clone(), Confidence::Heuristic)];

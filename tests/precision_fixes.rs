@@ -276,3 +276,39 @@ fn test_review_fixes_default_export_shadowing_typeof_and_computed_key() {
     let es2 = lang::extract_file("s2.ts", Language::TypeScript, s2, "s2".into()).unwrap();
     assert!(pair_similarity(&es1.ir_funcs[0], &es2.ir_funcs[0], false) < 1.0);
 }
+
+#[test]
+fn test_review_fixes_js_specifier_default_list_and_external_default() {
+    let dir = TempDir::new().unwrap();
+    let root = dir.path();
+    fs::create_dir_all(root.join("src")).unwrap();
+
+    fs::write(root.join("src/esm.ts"), "export function esmRun() {}\n").unwrap();
+    fs::write(root.join("src/list_def.ts"), "function listRun() {}\nexport { listRun as default };\n").unwrap();
+    fs::write(root.join("src/wrapped.ts"), "function wrappedRun() {}\nexport default (wrappedRun);\n").unwrap();
+    fs::write(root.join("src/unused_def.ts"), "export default function unusedLegacy() {}\n").unwrap();
+    fs::write(
+        root.join("src/main.ts"),
+        "import extPkg from \"external-pkg\";\nimport { esmRun } from \"./esm.js\";\nimport listFn from \"./list_def\";\nimport wrappedFn from \"./wrapped\";\nextPkg();\nesmRun();\nlistFn();\nwrappedFn();\n",
+    ).unwrap();
+
+    let ignores = KagamiConfig::default().build_ignore_globset().unwrap();
+    let files = discover_files(root, &ignores, None).unwrap();
+    let graph = CodeGraph::build(root, &files, false).unwrap();
+    let dead = analyze_dead(
+        &graph,
+        &DeadOptions {
+            scope: DeadScope::Prod,
+            langs: None,
+            allowlist: Default::default(),
+            include_clusters: true,
+            path_filter: None,
+            min_confidence: Confidence::Heuristic,
+        },
+    );
+    let has = |file: &str, sym: &str| dead.symbols.iter().any(|s| s.file == file && s.symbol == sym);
+    assert!(!has("src/esm.ts", "esmRun"), "./esm.js specifier must resolve to src/esm.ts");
+    assert!(!has("src/list_def.ts", "listRun"), "export {{ listRun as default }} must keep listRun alive");
+    assert!(!has("src/wrapped.ts", "wrappedRun"), "export default (wrappedRun) must keep wrappedRun alive");
+    assert!(has("src/unused_def.ts", "unusedLegacy"), "external default import must not keep unrelated local default export alive");
+}

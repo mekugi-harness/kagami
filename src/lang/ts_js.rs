@@ -254,22 +254,24 @@ fn collect_ts_imported_bindings(
                 match part.kind() {
                     "identifier" => {
                         let local = node_text(part, src).to_string();
-                        let target_name = if path.ends_with(".svelte") {
-                            Path::new(&path)
-                                .file_stem()
-                                .and_then(|s| s.to_str())
-                                .unwrap_or(&local)
-                                .to_string()
-                        } else {
-                            "<default>".to_string()
-                        };
-                        bindings.insert(
-                            local,
-                            ImportedBinding {
-                                target_name,
-                                resolved_file: resolved_file.clone(),
-                            },
-                        );
+                        if resolved_file.is_some() {
+                            let target_name = if path.ends_with(".svelte") {
+                                Path::new(&path)
+                                    .file_stem()
+                                    .and_then(|s| s.to_str())
+                                    .unwrap_or(&local)
+                                    .to_string()
+                            } else {
+                                "<default>".to_string()
+                            };
+                            bindings.insert(
+                                local,
+                                ImportedBinding {
+                                    target_name,
+                                    resolved_file: resolved_file.clone(),
+                                },
+                            );
+                        }
                     }
                     "named_imports" => {
                         let mut nc = part.walk();
@@ -443,7 +445,7 @@ fn walk_ts_nodes(
                         kind: SymbolKind::Script,
                         lang,
                         file: rel_path.to_string(),
-                        span,
+                        span: crate::model::Span { start_line: 0, end_line: 0 },
                         visibility: Visibility::Public,
                         is_test: is_test_file,
                         is_entrypoint: false,
@@ -460,7 +462,14 @@ fn walk_ts_nodes(
                             kind: EdgeKind::Calls,
                             line: span.start_line,
                         });
-                    } else if let Some(val) = child.child_by_field_name("value") {
+                    } else if let Some(mut val) = child.child_by_field_name("value") {
+                        while val.kind() == "parenthesized_expression" {
+                            if let Some(inner) = val.named_child(0) {
+                                val = inner;
+                            } else {
+                                break;
+                            }
+                        }
                         let empty_shadowed = HashSet::new();
                         if val.kind() == "identifier" {
                             let ident = node_text(val, src);
@@ -486,6 +495,53 @@ fn walk_ts_nodes(
                                 refs,
                                 bridges,
                             );
+                        }
+                    }
+                } else {
+                    // Handle export { localFn as default };
+                    let mut ec = child.walk();
+                    for clause in child.children(&mut ec) {
+                        if clause.kind() != "export_clause" {
+                            continue;
+                        }
+                        let mut sc = clause.walk();
+                        for spec in clause.children(&mut sc) {
+                            if spec.kind() != "export_specifier" {
+                                continue;
+                            }
+                            let alias = spec.child_by_field_name("alias").map(|a| node_text(a, src));
+                            if alias == Some("default") {
+                                if let Some(orig) = spec.child_by_field_name("name") {
+                                    let span = node_span(child, line_offset);
+                                    let def_id = make_symbol_id(rel_path, "<default>", span.start_line);
+                                    symbols.push(Symbol {
+                                        id: def_id.clone(),
+                                        name: "<default>".to_string(),
+                                        qualified_name: "<default>".to_string(),
+                                        kind: SymbolKind::Script,
+                                        lang,
+                                        file: rel_path.to_string(),
+                                        span: crate::model::Span { start_line: 0, end_line: 0 },
+                                        visibility: Visibility::Public,
+                                        is_test: is_test_file,
+                                        is_entrypoint: false,
+                                        is_dynamic_candidate: false,
+                                        package_or_module: rel_path.to_string(),
+                                    });
+                                    let ident = node_text(orig, src);
+                                    let (target_name, qualifier) = imported_bindings
+                                        .get(ident)
+                                        .map(|b| (b.target_name.clone(), b.resolved_file.clone()))
+                                        .unwrap_or_else(|| (ident.to_string(), None));
+                                    refs.push(RawRef {
+                                        from_symbol_id: def_id,
+                                        target_name,
+                                        qualifier,
+                                        kind: EdgeKind::Calls,
+                                        line: span.start_line,
+                                    });
+                                }
+                            }
                         }
                     }
                 }
@@ -1239,8 +1295,10 @@ pub fn lower_ts_node(node: Node<'_>, src: &str) -> IrNode {
                             .unwrap_or(IrNode::Lit(LitClass::Null));
                         if let Some(key_node) = ch.child_by_field_name("key") {
                             if key_node.kind() == "computed_property_name" {
+                                let mut kc = key_node.walk();
                                 let k_ir = key_node
-                                    .named_child(0)
+                                    .children(&mut kc)
+                                    .find(|n| n.is_named() && n.kind() != "comment")
                                     .map(|e| lower_ts_node(e, src))
                                     .unwrap_or_else(|| IrNode::Opaque("computed_key".into()));
                                 props.push(IrNode::Call {
