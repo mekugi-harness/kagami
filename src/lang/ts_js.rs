@@ -60,18 +60,25 @@ pub fn extract(
             match ch.kind() {
                 "import_statement" => {
                     // Static import of a relative .svelte file executes its <script module> block
-                    if let Some(s) = ch.child_by_field_name("source") {
-                        let path = strip_quotes(node_text(s, src));
-                        if path.ends_with(".svelte") {
-                            if let Some(resolved_file) = resolve_relative_path(rel_path, &path) {
-                                has_top_level_exec = true;
-                                refs.push(RawRef {
-                                    from_symbol_id: mod_id.clone(),
-                                    target_name: "<script:module>".to_string(),
-                                    qualifier: Some(resolved_file),
-                                    kind: EdgeKind::Calls,
-                                    line: ch.start_position().row + 1 + line_offset,
-                                });
+                    // (skip erased whole-declaration type-only imports: import type ...)
+                    let is_type_only = {
+                        let mut ic = ch.walk();
+                        ch.children(&mut ic).any(|k| k.kind() == "type")
+                    };
+                    if !is_type_only {
+                        if let Some(s) = ch.child_by_field_name("source") {
+                            let path = strip_quotes(node_text(s, src));
+                            if path.ends_with(".svelte") {
+                                if let Some(resolved_file) = resolve_relative_path(rel_path, &path) {
+                                    has_top_level_exec = true;
+                                    refs.push(RawRef {
+                                        from_symbol_id: mod_id.clone(),
+                                        target_name: "<script:module>".to_string(),
+                                        qualifier: Some(resolved_file),
+                                        kind: EdgeKind::Calls,
+                                        line: ch.start_position().row + 1 + line_offset,
+                                    });
+                                }
                             }
                         }
                     }

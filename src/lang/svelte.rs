@@ -80,11 +80,16 @@ pub fn extract(rel_path: &str, src: &str, blake3_hex: String) -> Result<FileExtr
         }
 
         if let Ok(mut sub) = ts_js::extract(rel_path, script_src, String::new(), Language::Svelte, line_offset) {
+            let mut renamed_mod_id: Option<(String, String)> = None;
             for sym in &mut sub.symbols {
                 if sym.kind == SymbolKind::Script && sym.name == "<module>" {
                     if is_module_script {
+                        let old_id = sym.id.clone();
+                        let new_id = make_symbol_id(rel_path, "<script:module>", sym.span.start_line);
+                        sym.id = new_id.clone();
                         sym.name = "<script:module>".to_string();
                         sym.qualified_name = "<script:module>".to_string();
+                        renamed_mod_id = Some((old_id, new_id));
                     }
                     refs.push(RawRef {
                         from_symbol_id: comp_id.clone(),
@@ -93,6 +98,18 @@ pub fn extract(rel_path: &str, src: &str, blake3_hex: String) -> Result<FileExtr
                         kind: EdgeKind::Calls,
                         line: sym.span.start_line,
                     });
+                }
+            }
+            if let Some((old_id, new_id)) = renamed_mod_id {
+                for r in &mut sub.refs {
+                    if r.from_symbol_id == old_id {
+                        r.from_symbol_id = new_id.clone();
+                    }
+                }
+                for b in &mut sub.bridges {
+                    if b.from_symbol_id == old_id {
+                        b.from_symbol_id = new_id.clone();
+                    }
                 }
             }
             imports.extend(sub.imports);
