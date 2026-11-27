@@ -2442,6 +2442,7 @@ pub use backend::start as run;
 pub struct MadeWorker;
 impl MadeWorker {
     pub fn do_work(&self) {}
+    pub fn inline_work(&self) {}
 }
 pub fn make_worker() -> MadeWorker {
     MadeWorker
@@ -2527,15 +2528,26 @@ macro_rules! outer_m {
 }
 fn nested_macro_helper() {}
 
-use inner_m as aliased_m;
+macro_rules! alias_target_m {
+    () => {
+        aliased_macro_helper()
+    };
+}
+fn aliased_macro_helper() {}
+use alias_target_m as aliased_m;
+
+fn root_reimport_helper() {}
 
 mod inline_tools {
     use crate::factory::MadeWorker as LocalWorker;
     use self::inline_helper as inline_alias;
+    use super::root_reimport_helper;
+    use self::root_reimport_helper as reimport_alias;
     fn inline_helper() {}
     pub fn run_inline(w: LocalWorker) {
         inline_alias();
-        w.do_work();
+        reimport_alias();
+        w.inline_work();
     }
 }
 
@@ -2569,11 +2581,14 @@ fn main() {
         ("app/src/unix.rs", "init"),
         ("app/src/portable.rs", "init"),
         ("app/src/factory.rs", "MadeWorker::do_work"),
+        ("app/src/factory.rs", "MadeWorker::inline_work"),
         ("app/src/main.rs", "Output::finish"),
         ("app/src/main.rs", "Failure::report"),
         ("app/src/main.rs", "collide"),
         ("app/src/main.rs", "macro_called_helper"),
         ("app/src/main.rs", "nested_macro_helper"),
+        ("app/src/main.rs", "aliased_macro_helper"),
+        ("app/src/main.rs", "root_reimport_helper"),
         ("app/src/main.rs", "inline_helper"),
     ] {
         assert!(

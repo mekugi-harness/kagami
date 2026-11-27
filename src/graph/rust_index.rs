@@ -554,6 +554,35 @@ impl<'a> RustTypeIndex<'a> {
                     && (u.mod_scope == caller_scope || u.mod_scope.is_empty())
                     && let Some((mod_path, target_sym)) = u.target_path.rsplit_once("::")
                 {
+                    if mod_path == "super" && !u.mod_scope.is_empty() {
+                        let parent_scope =
+                            u.mod_scope.rsplit_once("::").map(|(p, _)| p).unwrap_or("");
+                        if let Some(ids) = self.file_non_method_syms.get(&(owner_file, target_sym))
+                        {
+                            let hits: Vec<&String> = ids
+                                .iter()
+                                .filter(|id| {
+                                    self.symbol_mod_scopes
+                                        .get(id.as_str())
+                                        .map(String::as_str)
+                                        .unwrap_or("")
+                                        == parent_scope
+                                        && symbols.get(*id).is_some_and(|s| {
+                                            matches!(
+                                                s.kind,
+                                                SymbolKind::Struct
+                                                    | SymbolKind::Enum
+                                                    | SymbolKind::Type
+                                                    | SymbolKind::Trait
+                                            )
+                                        })
+                                })
+                                .collect();
+                            if hits.len() == 1 {
+                                return Some(hits[0].clone());
+                            }
+                        }
+                    }
                     let mut hits = Vec::new();
                     let mut visited = HashSet::new();
                     self.resolve_mod_path_into(
@@ -1055,6 +1084,7 @@ impl<'a> RustTypeIndex<'a> {
                         format!("{}{}", target_sym, macro_suffix)
                     };
                     if mod_path == "self" && !caller_scope.is_empty() {
+                        let before = out.len();
                         if let Some(ids) = self
                             .file_non_method_syms
                             .get(&(caller_file, target_sym_full.as_str()))
@@ -1067,6 +1097,64 @@ impl<'a> RustTypeIndex<'a> {
                                     })
                                 {
                                     push_unique(&mut out, id.clone());
+                                }
+                            }
+                        }
+                        // Also follow same-scope reimports (e.g. use super::helper; use self::helper as alias;).
+                        if out.len() == before {
+                            for u2 in uses {
+                                if u2.local_name == target_sym
+                                    && u2.mod_scope == caller_scope
+                                    && (!u2.is_test || caller_is_test)
+                                    && u2.target_path != u.target_path
+                                    && let Some((mp2, ts2)) = u2.target_path.rsplit_once("::")
+                                {
+                                    if mp2 == "super" {
+                                        let parent_scope = caller_scope
+                                            .rsplit_once("::")
+                                            .map(|(p, _)| p)
+                                            .unwrap_or("");
+                                        let ts2_full = if macro_suffix.is_empty() {
+                                            ts2.to_string()
+                                        } else {
+                                            format!("{}{}", ts2, macro_suffix)
+                                        };
+                                        if let Some(ids) = self
+                                            .file_non_method_syms
+                                            .get(&(caller_file, ts2_full.as_str()))
+                                        {
+                                            for id in ids {
+                                                let sc = self
+                                                    .symbol_mod_scopes
+                                                    .get(id.as_str())
+                                                    .map(String::as_str)
+                                                    .unwrap_or("");
+                                                if sc == parent_scope
+                                                    && symbols.get(id).is_some_and(|s| {
+                                                        matches!(
+                                                            s.kind,
+                                                            SymbolKind::Function
+                                                                | SymbolKind::Const
+                                                        ) && (!s.is_test || caller_is_test)
+                                                    })
+                                                {
+                                                    push_unique(&mut out, id.clone());
+                                                }
+                                            }
+                                        }
+                                    } else {
+                                        let mut visited = HashSet::new();
+                                        self.resolve_mod_path_into(
+                                            caller_file,
+                                            mp2,
+                                            ts2,
+                                            false,
+                                            symbols,
+                                            0,
+                                            &mut visited,
+                                            &mut out,
+                                        );
+                                    }
                                 }
                             }
                         }

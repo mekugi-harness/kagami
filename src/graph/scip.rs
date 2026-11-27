@@ -184,6 +184,31 @@ fn scip_symbol_matches_name(scip_sym: &str, name: &str) -> bool {
     terminal == expected_name
 }
 
+#[cfg(test)]
+mod tests {
+    use super::scip_symbol_matches_name;
+
+    #[test]
+    fn test_scip_macro_vs_function_namespace() {
+        assert!(scip_symbol_matches_name(
+            "rust-analyzer cargo app 0.1.0 dispatch!",
+            "dispatch!"
+        ));
+        assert!(!scip_symbol_matches_name(
+            "rust-analyzer cargo app 0.1.0 dispatch!",
+            "dispatch"
+        ));
+        assert!(!scip_symbol_matches_name(
+            "rust-analyzer cargo app 0.1.0 dispatch().",
+            "dispatch!"
+        ));
+        assert!(scip_symbol_matches_name(
+            "rust-analyzer cargo app 0.1.0 dispatch().",
+            "dispatch"
+        ));
+    }
+}
+
 /// Apply a SCIP index overlay onto an existing CodeGraph, adding or upgrading edges to Confidence::Exact.
 pub fn apply_scip_overlay(graph: &mut CodeGraph, index: &ScipIndex, analysis_root: &Path) -> usize {
     let mut by_file_syms: HashMap<&str, Vec<(usize, usize, String, String)>> = HashMap::new();
