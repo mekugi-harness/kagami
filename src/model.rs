@@ -190,6 +190,9 @@ pub struct RustUseItem {
     pub local_name: String,
     /// Target path (e.g. "force_terminate_process", "auth::connect", "crate::foo::bar").
     pub target_path: String,
+    /// Inline module path where this `use` item was declared (empty for file root).
+    #[serde(default)]
+    pub mod_scope: String,
     #[serde(default)]
     pub is_pub: bool,
     #[serde(default)]
@@ -235,6 +238,9 @@ pub struct FileExtract {
     /// Structured Rust `use` items (aliases, imports, and `pub use` re-exports).
     #[serde(default)]
     pub rust_uses: Vec<RustUseItem>,
+    /// Symbol ID -> inline module path where the symbol was defined (non-empty only inside inline `mod`).
+    #[serde(default)]
+    pub symbol_mod_scopes: HashMap<String, String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

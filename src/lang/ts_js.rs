@@ -203,6 +203,7 @@ pub fn extract(
         cfg_gated_symbols: std::collections::HashMap::new(),
         type_aliases: std::collections::HashMap::new(),
         rust_uses: Vec::new(),
+        symbol_mod_scopes: std::collections::HashMap::new(),
     })
 }
 

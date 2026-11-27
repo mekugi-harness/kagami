@@ -7,11 +7,21 @@ use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::path::Path;
 
+#[derive(Debug, Clone)]
+pub struct CargoCrateInfo {
+    /// Directory containing the crate's root module (e.g. "codex-rs/app-server-daemon/src").
+    pub src_dir: String,
+    /// Normalized library entry file path relative to repo root (e.g. "codex-rs/app-server-daemon/src/lib.rs").
+    pub lib_file: String,
+}
+
 /// Discover Rust crate names from Cargo.toml files ([lib].name and [package].name)
-/// and map each Rust crate identifier (with '-' replaced by '_') to its crate source root
-/// directory relative to `root` (e.g. "codex_app_server_daemon" -> "codex-rs/app-server-daemon/src").
-pub fn discover_cargo_crates(root: &Path, extracts: &[FileExtract]) -> HashMap<String, String> {
-    let mut crate_roots: HashMap<String, String> = HashMap::new();
+/// and map each Rust crate identifier (with '-' replaced by '_') to its crate root info.
+pub fn discover_cargo_crates(
+    root: &Path,
+    extracts: &[FileExtract],
+) -> HashMap<String, CargoCrateInfo> {
+    let mut crate_roots: HashMap<String, CargoCrateInfo> = HashMap::new();
     let mut checked_dirs: HashSet<String> = HashSet::new();
     let mut parsed_manifests: HashSet<String> = HashSet::new();
 
@@ -52,7 +62,15 @@ pub fn discover_cargo_crates(root: &Path, extracts: &[FileExtract]) -> HashMap<S
                         .and_then(|t| t.get("path"))
                         .and_then(|v| v.as_str())
                         .unwrap_or("src/lib.rs");
-                    let lib_dir = lib_path
+                    let clean_lib_path = lib_path.trim_start_matches("./").trim_matches('/');
+                    let lib_file = if dir.is_empty() {
+                        clean_lib_path.to_string()
+                    } else if clean_lib_path.is_empty() {
+                        format!("{}/src/lib.rs", dir)
+                    } else {
+                        format!("{}/{}", dir, clean_lib_path)
+                    };
+                    let lib_dir = clean_lib_path
                         .rsplit_once('/')
                         .map(|(d, _)| d.trim_matches('/'))
                         .unwrap_or("");
@@ -62,11 +80,15 @@ pub fn discover_cargo_crates(root: &Path, extracts: &[FileExtract]) -> HashMap<S
                         (false, true) => dir.clone(),
                         (false, false) => format!("{}/{}", dir, lib_dir),
                     };
+                    let info = CargoCrateInfo {
+                        src_dir: src_root,
+                        lib_file,
+                    };
                     if let Some(ln) = lib_name {
-                        crate_roots.insert(ln.replace('-', "_"), src_root.clone());
+                        crate_roots.insert(ln.replace('-', "_"), info.clone());
                     }
                     if let Some(pn) = pkg_name {
-                        crate_roots.entry(pn.replace('-', "_")).or_insert(src_root);
+                        crate_roots.entry(pn.replace('-', "_")).or_insert(info);
                     }
                     // Stop at the nearest package manifest.
                     break;
@@ -88,10 +110,11 @@ pub fn discover_cargo_crates(root: &Path, extracts: &[FileExtract]) -> HashMap<S
 pub struct RustTypeIndex<'a> {
     file_imports: HashMap<&'a str, &'a [String]>,
     known_files: HashSet<&'a str>,
-    crate_roots: HashMap<String, String>,
+    crate_roots: HashMap<String, CargoCrateInfo>,
     file_to_crate_root: HashMap<&'a str, String>,
     crate_root_to_idents: HashMap<String, Vec<String>>,
     type_aliases: HashMap<String, String>,
+    symbol_mod_scopes: HashMap<String, String>,
     file_non_method_syms: HashMap<(&'a str, &'a str), Vec<String>>,
     file_pub_uses: HashMap<&'a str, Vec<&'a RustUseItem>>,
     file_all_uses: HashMap<&'a str, Vec<&'a RustUseItem>>,
@@ -116,11 +139,12 @@ impl<'a> RustTypeIndex<'a> {
     pub fn build(
         extracts: &'a [FileExtract],
         symbols: &HashMap<String, Symbol>,
-        crate_roots: HashMap<String, String>,
+        crate_roots: HashMap<String, CargoCrateInfo>,
     ) -> Self {
         let mut file_imports: HashMap<&'a str, &'a [String]> = HashMap::new();
         let mut known_files: HashSet<&'a str> = HashSet::new();
         let mut type_aliases: HashMap<String, String> = HashMap::new();
+        let mut symbol_mod_scopes: HashMap<String, String> = HashMap::new();
         let mut file_non_method_syms: HashMap<(&'a str, &'a str), Vec<String>> = HashMap::new();
         let mut file_pub_uses: HashMap<&'a str, Vec<&'a RustUseItem>> = HashMap::new();
         let mut file_all_uses: HashMap<&'a str, Vec<&'a RustUseItem>> = HashMap::new();
@@ -147,9 +171,12 @@ impl<'a> RustTypeIndex<'a> {
             for (k, v) in &ext.type_aliases {
                 type_aliases.insert(k.clone(), v.clone());
             }
+            for (k, v) in &ext.symbol_mod_scopes {
+                symbol_mod_scopes.insert(k.clone(), v.clone());
+            }
             for u in &ext.rust_uses {
                 file_all_uses.entry(ext.file.as_str()).or_default().push(u);
-                if u.is_pub && !u.is_test {
+                if u.is_pub && !u.is_test && u.mod_scope.is_empty() {
                     file_pub_uses.entry(ext.file.as_str()).or_default().push(u);
                 }
             }
@@ -214,16 +241,17 @@ impl<'a> RustTypeIndex<'a> {
         }
 
         let mut crate_root_to_idents: HashMap<String, Vec<String>> = HashMap::new();
-        for (ident, root_dir) in &crate_roots {
+        for (ident, info) in &crate_roots {
             crate_root_to_idents
-                .entry(root_dir.clone())
+                .entry(info.src_dir.clone())
                 .or_default()
                 .push(ident.clone());
         }
         let mut file_to_crate_root: HashMap<&'a str, String> = HashMap::new();
         for &file in &known_files {
             let mut best: Option<&str> = None;
-            for root_dir in crate_roots.values() {
+            for info in crate_roots.values() {
+                let root_dir = &info.src_dir;
                 let matches = if root_dir.is_empty() {
                     true
                 } else {
@@ -249,6 +277,7 @@ impl<'a> RustTypeIndex<'a> {
             file_to_crate_root,
             crate_root_to_idents,
             type_aliases,
+            symbol_mod_scopes,
             file_non_method_syms,
             file_pub_uses,
             file_all_uses,
@@ -411,7 +440,27 @@ impl<'a> RustTypeIndex<'a> {
     ) -> Option<String> {
         let tid =
             self.resolve_type_raw(owner_file, owner_pkg, owner_imports, type_name, symbols)?;
-        let (unwrapped, extra_depth) = self.unwrap_type_alias(tid.clone(), symbols);
+        let (unwrapped, extra_depth) = self.unwrap_type_alias(tid.clone(), symbols, true);
+        if extra_depth == 0 {
+            Some(unwrapped)
+        } else {
+            Some(tid)
+        }
+    }
+
+    /// Resolve a type name for associated function calls (e.g. `Alias::new()`),
+    /// following only direct type aliases without flattening smart-pointer wrappers like `Arc<T>`.
+    pub fn resolve_direct_type(
+        &self,
+        owner_file: &str,
+        owner_pkg: &str,
+        owner_imports: &[String],
+        type_name: &str,
+        symbols: &HashMap<String, Symbol>,
+    ) -> Option<String> {
+        let tid =
+            self.resolve_type_raw(owner_file, owner_pkg, owner_imports, type_name, symbols)?;
+        let (unwrapped, extra_depth) = self.unwrap_type_alias(tid.clone(), symbols, false);
         if extra_depth == 0 {
             Some(unwrapped)
         } else {
@@ -490,6 +539,7 @@ impl<'a> RustTypeIndex<'a> {
             for u in uses {
                 if u.local_name == type_name
                     && !u.is_test
+                    && u.mod_scope.is_empty()
                     && let Some((mod_path, target_sym)) = u.target_path.rsplit_once("::")
                 {
                     let mut hits = Vec::new();
@@ -533,6 +583,7 @@ impl<'a> RustTypeIndex<'a> {
         &self,
         start_id: String,
         symbols: &HashMap<String, Symbol>,
+        follow_wrappers: bool,
     ) -> (String, usize) {
         let mut curr_id = start_id;
         let mut extra_depth = 0usize;
@@ -541,6 +592,13 @@ impl<'a> RustTypeIndex<'a> {
             let Some(raw_target) = self.type_aliases.get(&curr_id) else {
                 break;
             };
+            let (is_wrapper, target_clean) = match raw_target.strip_prefix('*') {
+                Some(rest) => (true, rest),
+                None => (false, raw_target.as_str()),
+            };
+            if is_wrapper && !follow_wrappers {
+                break;
+            }
             let Some(sym) = symbols.get(&curr_id) else {
                 break;
             };
@@ -549,11 +607,14 @@ impl<'a> RustTypeIndex<'a> {
                 .get(sym.file.as_str())
                 .copied()
                 .unwrap_or(&[]);
-            let mut target_ty = raw_target.as_str();
+            let mut target_ty = target_clean;
             let mut d = 0usize;
             while let Some(rest) = target_ty.strip_prefix("[]") {
                 d += 1;
                 target_ty = rest;
+            }
+            if d > 0 && !follow_wrappers {
+                break;
             }
             let Some(next_id) =
                 self.resolve_type_raw(&sym.file, &sym.package_or_module, imps, target_ty, symbols)
@@ -650,7 +711,7 @@ impl<'a> RustTypeIndex<'a> {
             raw_type = rest;
         }
         let tid = self.resolve_type_raw(owner_file, owner_pkg, owner_imports, raw_type, symbols)?;
-        let (unwrapped, extra_depth) = self.unwrap_type_alias(tid, symbols);
+        let (unwrapped, extra_depth) = self.unwrap_type_alias(tid, symbols, true);
         Some((unwrapped, depth + extra_depth))
     }
 
@@ -751,8 +812,16 @@ impl<'a> RustTypeIndex<'a> {
             }
             return out;
         }
-        if let Some(crate_root) = self.crate_roots.get(first) {
-            self.push_module_candidates(crate_root, &segs[1..], &mut out);
+        if let Some(crate_info) = self.crate_roots.get(first) {
+            if segs.len() == 1 {
+                if self.known_files.contains(crate_info.lib_file.as_str())
+                    && !out.contains(&crate_info.lib_file)
+                {
+                    out.push(crate_info.lib_file.clone());
+                }
+            } else {
+                self.push_module_candidates(&crate_info.src_dir, &segs[1..], &mut out);
+            }
             return out;
         }
         // Relative to current module directory, submodule directory (if foo.rs), or crate root.
@@ -822,9 +891,14 @@ impl<'a> RustTypeIndex<'a> {
             let hits: Vec<String> = ids
                 .iter()
                 .filter(|id| {
-                    symbols
-                        .get(*id)
-                        .is_some_and(|s| !s.is_test && kind_matches(s))
+                    symbols.get(*id).is_some_and(|s| {
+                        !s.is_test
+                            && kind_matches(s)
+                            && self
+                                .symbol_mod_scopes
+                                .get(id.as_str())
+                                .is_none_or(|m| m.is_empty())
+                    })
                 })
                 .cloned()
                 .collect();
@@ -891,18 +965,34 @@ impl<'a> RustTypeIndex<'a> {
     pub fn resolve_bare_call(
         &self,
         caller_file: &str,
+        caller_id: &str,
         target_name: &str,
         caller_is_test: bool,
         symbols: &HashMap<String, Symbol>,
     ) -> Vec<(String, Confidence)> {
         let mut out: Vec<String> = Vec::new();
+        let caller_scope = self
+            .symbol_mod_scopes
+            .get(caller_id)
+            .map(String::as_str)
+            .unwrap_or("");
+        let sym_in_scope = |id: &str| -> bool {
+            let sym_scope = self
+                .symbol_mod_scopes
+                .get(id)
+                .map(String::as_str)
+                .unwrap_or("");
+            sym_scope == caller_scope
+        };
 
         if let Some(ids) = self.file_non_method_syms.get(&(caller_file, target_name)) {
             for id in ids {
-                if symbols.get(id).is_some_and(|s| {
-                    matches!(s.kind, SymbolKind::Function | SymbolKind::Const)
-                        && (!s.is_test || caller_is_test)
-                }) {
+                if sym_in_scope(id)
+                    && symbols.get(id).is_some_and(|s| {
+                        matches!(s.kind, SymbolKind::Function | SymbolKind::Const)
+                            && (!s.is_test || caller_is_test)
+                    })
+                {
                     push_unique(&mut out, id.clone());
                 }
             }
@@ -910,7 +1000,10 @@ impl<'a> RustTypeIndex<'a> {
 
         if let Some(uses) = self.file_all_uses.get(caller_file) {
             for u in uses {
-                if u.local_name != target_name || (u.is_test && !caller_is_test) {
+                if u.local_name != target_name
+                    || u.mod_scope != caller_scope
+                    || (u.is_test && !caller_is_test)
+                {
                     continue;
                 }
                 if let Some((mod_path, target_sym)) = u.target_path.rsplit_once("::") {
@@ -931,10 +1024,12 @@ impl<'a> RustTypeIndex<'a> {
                         .get(&(caller_file, u.target_path.as_str()))
                 {
                     for id in ids {
-                        if symbols.get(id).is_some_and(|s| {
-                            matches!(s.kind, SymbolKind::Function | SymbolKind::Const)
-                                && (!s.is_test || caller_is_test)
-                        }) {
+                        if sym_in_scope(id)
+                            && symbols.get(id).is_some_and(|s| {
+                                matches!(s.kind, SymbolKind::Function | SymbolKind::Const)
+                                    && (!s.is_test || caller_is_test)
+                            })
+                        {
                             push_unique(&mut out, id.clone());
                         }
                     }
@@ -942,7 +1037,10 @@ impl<'a> RustTypeIndex<'a> {
             }
             if out.is_empty() {
                 for u in uses {
-                    if u.local_name != "*" || (u.is_test && !caller_is_test) {
+                    if u.local_name != "*"
+                        || u.mod_scope != caller_scope
+                        || (u.is_test && !caller_is_test)
+                    {
                         continue;
                     }
                     let mut visited = HashSet::new();
@@ -971,6 +1069,7 @@ impl<'a> RustTypeIndex<'a> {
     pub fn resolve_qualified_path(
         &self,
         caller_file: &str,
+        caller_id: &str,
         qual: &str,
         target_name: &str,
         caller_is_test: bool,
@@ -980,11 +1079,19 @@ impl<'a> RustTypeIndex<'a> {
         if raw_segs.is_empty() {
             return Vec::new();
         }
+        let caller_scope = self
+            .symbol_mod_scopes
+            .get(caller_id)
+            .map(String::as_str)
+            .unwrap_or("");
 
-        let mut candidate_paths: Vec<Vec<&str>> = Vec::new();
+        let mut alias_paths: Vec<Vec<&str>> = Vec::new();
         if let Some(uses) = self.file_all_uses.get(caller_file) {
             for u in uses {
-                if u.local_name == raw_segs[0] && (!u.is_test || caller_is_test) {
+                if u.local_name == raw_segs[0]
+                    && u.mod_scope == caller_scope
+                    && (!u.is_test || caller_is_test)
+                {
                     let mut expanded: Vec<&str> = u
                         .target_path
                         .split("::")
@@ -992,15 +1099,16 @@ impl<'a> RustTypeIndex<'a> {
                         .collect();
                     expanded.extend_from_slice(&raw_segs[1..]);
                     if !expanded.is_empty() {
-                        candidate_paths.push(expanded);
+                        alias_paths.push(expanded);
                     }
                 }
             }
         }
-        candidate_paths.push(raw_segs);
 
         let mut out: Vec<String> = Vec::new();
-        for segs in candidate_paths {
+        // Collect matches across ALL matching alias expansions in the caller's scope
+        // (e.g. mutually exclusive `#[cfg(unix)]` / `#[cfg(not(unix))]` module aliases).
+        for segs in alias_paths {
             let mut visited = HashSet::new();
             for mf in self.resolve_module_files(caller_file, &segs) {
                 for hit in
@@ -1009,8 +1117,16 @@ impl<'a> RustTypeIndex<'a> {
                     push_unique(&mut out, hit);
                 }
             }
-            if !out.is_empty() {
-                break;
+        }
+        // Fall back to the raw qualifier path only if no alias expansion resolved.
+        if out.is_empty() {
+            let mut visited = HashSet::new();
+            for mf in self.resolve_module_files(caller_file, &raw_segs) {
+                for hit in
+                    self.resolve_symbol_in_module(&mf, target_name, false, symbols, 0, &mut visited)
+                {
+                    push_unique(&mut out, hit);
+                }
             }
         }
 
@@ -1070,6 +1186,26 @@ impl<'a> RustTypeIndex<'a> {
         method_name: &str,
         caller_is_test: bool,
     ) -> Vec<String> {
+        self.lookup_methods_on_type_inner(type_id, method_name, caller_is_test, true)
+    }
+
+    /// Direct associated-function lookup on a concrete type (no Deref traversal).
+    pub fn lookup_direct_methods_on_type(
+        &self,
+        type_id: &str,
+        method_name: &str,
+        caller_is_test: bool,
+    ) -> Vec<String> {
+        self.lookup_methods_on_type_inner(type_id, method_name, caller_is_test, false)
+    }
+
+    fn lookup_methods_on_type_inner(
+        &self,
+        type_id: &str,
+        method_name: &str,
+        caller_is_test: bool,
+        follow_deref: bool,
+    ) -> Vec<String> {
         let mut visited: HashSet<String> = HashSet::new();
         let mut queue: std::collections::VecDeque<(String, usize)> =
             std::collections::VecDeque::from([(type_id.to_string(), 0usize)]);
@@ -1102,7 +1238,7 @@ impl<'a> RustTypeIndex<'a> {
             {
                 return ids.clone();
             }
-            if let Some(targets) = self.deref_target_ids.get(&curr_id) {
+            if follow_deref && let Some(targets) = self.deref_target_ids.get(&curr_id) {
                 for tid in targets {
                     queue.push_back((tid.clone(), depth + 1));
                 }
@@ -1115,6 +1251,7 @@ impl<'a> RustTypeIndex<'a> {
     fn resolve_func_call(
         &self,
         ext: &FileExtract,
+        caller_id: &str,
         qualifier: Option<&str>,
         name: &str,
         result_index: usize,
@@ -1162,18 +1299,55 @@ impl<'a> RustTypeIndex<'a> {
                     return Some((tid, 0));
                 }
             }
+            if q.chars().next().is_some_and(|c| c.is_ascii_lowercase()) {
+                let hits =
+                    self.resolve_qualified_path(&ext.file, caller_id, q, name, false, symbols);
+                if let Some((fn_id, _)) = hits.first()
+                    && let Some(fn_sym) = symbols.get(fn_id)
+                    && let Some(ret_ty) = self
+                        .func_return_types
+                        .get(fn_id)
+                        .and_then(|v| v.get(result_index))
+                        .filter(|s| !s.is_empty())
+                {
+                    let imps = self
+                        .file_imports
+                        .get(fn_sym.file.as_str())
+                        .copied()
+                        .unwrap_or(&[]);
+                    return self.resolve_type_with_slices(
+                        &fn_sym.file,
+                        &fn_sym.package_or_module,
+                        imps,
+                        ret_ty,
+                        symbols,
+                    );
+                }
+            }
             return None;
         }
 
-        let fn_id = by_file_name
-            .get(&(ext.file.as_str(), name))
-            .filter(|id| {
+        let fn_id = self
+            .resolve_bare_call(&ext.file, caller_id, name, false, symbols)
+            .into_iter()
+            .map(|(id, _)| id)
+            .find(|id| {
                 symbols
-                    .get(*id)
+                    .get(id)
                     .map(|s| s.kind == SymbolKind::Function)
                     .unwrap_or(false)
             })
-            .cloned()
+            .or_else(|| {
+                by_file_name
+                    .get(&(ext.file.as_str(), name))
+                    .filter(|id| {
+                        symbols
+                            .get(*id)
+                            .map(|s| s.kind == SymbolKind::Function)
+                            .unwrap_or(false)
+                    })
+                    .cloned()
+            })
             .or_else(|| {
                 by_pkg_name
                     .get(&(Language::Rust, ext.package_or_module.as_str(), name))
@@ -1210,6 +1384,7 @@ impl<'a> RustTypeIndex<'a> {
     pub fn resolve_receiver_chain(
         &self,
         ext: &FileExtract,
+        caller_id: &str,
         chain: &[ReceiverStep],
         by_file_name: &HashMap<(&str, &str), String>,
         by_pkg_name: &HashMap<(Language, &str, &str), Vec<String>>,
@@ -1231,6 +1406,7 @@ impl<'a> RustTypeIndex<'a> {
                 result_index,
             } => self.resolve_func_call(
                 ext,
+                caller_id,
                 qualifier.as_deref(),
                 name,
                 *result_index,

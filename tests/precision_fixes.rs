@@ -2382,3 +2382,184 @@ fn main() {
         );
     }
 }
+
+#[test]
+fn test_rust_batch2_review_edge_cases() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    fs::create_dir_all(root.join("crates/custom-lib/src")).unwrap();
+    fs::create_dir_all(root.join("crates/app/src")).unwrap();
+
+    // Custom [lib].path = "src/api.rs" + sibling src/main.rs
+    fs::write(
+        root.join("crates/custom-lib/Cargo.toml"),
+        r#"
+[package]
+name = "custom-lib"
+version = "0.1.0"
+
+[lib]
+name = "custom_lib"
+path = "src/api.rs"
+"#,
+    )
+    .unwrap();
+    fs::write(
+        root.join("crates/custom-lib/src/api.rs"),
+        r#"
+pub mod backend;
+pub use backend::start as run;
+"#,
+    )
+    .unwrap();
+    fs::write(
+        root.join("crates/custom-lib/src/backend.rs"),
+        "pub fn start() {}\n",
+    )
+    .unwrap();
+    fs::write(
+        root.join("crates/custom-lib/src/main.rs"),
+        "fn run() {}\nfn main() {}\n",
+    )
+    .unwrap();
+
+    fs::write(
+        root.join("crates/app/Cargo.toml"),
+        "[package]\nname = \"app\"\nversion = \"0.1.0\"\n",
+    )
+    .unwrap();
+    fs::write(root.join("crates/app/src/spare.rs"), "pub fn run() {}\n").unwrap();
+    fs::write(root.join("crates/app/src/real.rs"), "pub fn run() {}\n").unwrap();
+    fs::write(root.join("crates/app/src/unix.rs"), "pub fn init() {}\n").unwrap();
+    fs::write(
+        root.join("crates/app/src/portable.rs"),
+        "pub fn init() {}\n",
+    )
+    .unwrap();
+    fs::write(
+        root.join("crates/app/src/factory.rs"),
+        r#"
+pub struct MadeWorker;
+impl MadeWorker {
+    pub fn do_work(&self) {}
+}
+pub fn make_worker() -> MadeWorker {
+    MadeWorker
+}
+"#,
+    )
+    .unwrap();
+    fs::write(
+        root.join("crates/app/src/main.rs"),
+        r#"
+use std::sync::Arc;
+mod factory;
+mod portable;
+mod real;
+mod spare;
+mod unix;
+
+mod unused_inline {
+    use crate::spare as backend;
+    fn dead_inline() {
+        backend::run();
+    }
+}
+
+use crate::factory::make_worker;
+use crate::real as backend;
+
+#[cfg(unix)]
+use crate::unix as platform;
+#[cfg(not(unix))]
+use crate::portable as platform;
+
+struct Output;
+impl Output {
+    fn finish(&self) {}
+}
+struct Failure;
+impl Failure {
+    fn report(&self) {}
+}
+
+fn compute() -> Result<Output, Failure> {
+    Ok(Output)
+}
+
+struct InnerWorker;
+impl InnerWorker {
+    fn new() -> Self {
+        Self
+    }
+}
+type SharedWorker = Arc<InnerWorker>;
+
+fn collide() {}
+macro_rules! collide {
+    () => {
+        macro_only_helper()
+    };
+}
+fn macro_only_helper() {}
+
+fn collide_m() {}
+macro_rules! collide_m {
+    () => {
+        macro_called_helper()
+    };
+}
+fn macro_called_helper() {}
+
+fn main() {
+    custom_lib::run();
+    backend::run();
+    platform::init();
+    make_worker().do_work();
+    let _ = compute().map_or_else(|err| err.report(), |ok| ok.finish());
+    let _w = SharedWorker::new(InnerWorker);
+    collide();
+    collide_m!();
+}
+"#,
+    )
+    .unwrap();
+
+    let dead = analyze_rust_dead(root);
+    let is_dead_in = |file_suffix: &str, sym: &str| {
+        dead.symbols
+            .iter()
+            .any(|s| s.file.ends_with(file_suffix) && s.symbol == sym)
+    };
+
+    for (file, sym) in [
+        ("custom-lib/src/backend.rs", "start"),
+        ("app/src/real.rs", "run"),
+        ("app/src/unix.rs", "init"),
+        ("app/src/portable.rs", "init"),
+        ("app/src/factory.rs", "MadeWorker::do_work"),
+        ("app/src/main.rs", "Output::finish"),
+        ("app/src/main.rs", "Failure::report"),
+        ("app/src/main.rs", "collide"),
+        ("app/src/main.rs", "macro_called_helper"),
+    ] {
+        assert!(
+            !is_dead_in(file, sym),
+            "Expected {file}::{sym} to be live; dead={:?}",
+            dead.symbols
+        );
+    }
+    for (file, sym) in [
+        ("custom-lib/src/main.rs", "run"),
+        ("app/src/spare.rs", "run"),
+        ("app/src/main.rs", "InnerWorker::new"),
+        ("app/src/main.rs", "macro_only_helper"),
+        ("app/src/main.rs", "collide_m"),
+    ] {
+        assert!(
+            is_dead_in(file, sym),
+            "Expected {file}::{sym} to remain dead; dead={:?}",
+            dead.symbols
+        );
+    }
+}

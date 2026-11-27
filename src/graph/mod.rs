@@ -6,7 +6,7 @@ pub mod scip;
 
 use crate::cache::{CacheData, CacheStore, PARSER_VERSION};
 use crate::graph::rust_index::{
-    RustTypeIndex, discover_cargo_crates, materialize_rust_trait_and_macro_edges,
+    CargoCrateInfo, RustTypeIndex, discover_cargo_crates, materialize_rust_trait_and_macro_edges,
     resolve_rust_module_qualified,
 };
 use crate::lang;
@@ -93,7 +93,7 @@ impl CodeGraph {
 
     pub fn from_extracts_with_crates(
         extracts: Vec<FileExtract>,
-        crate_roots: HashMap<String, String>,
+        crate_roots: HashMap<String, CargoCrateInfo>,
     ) -> Self {
         let mut symbols: HashMap<String, Symbol> = HashMap::new();
         let mut known_files: HashSet<&str> = HashSet::new();
@@ -1169,8 +1169,14 @@ fn resolve_ref(
     // 0c. Precise Rust receiver/field/method-return chain resolution
     if ext.lang == Language::Rust
         && let Some(ref chain) = r.receiver_chain
-        && let Some((target_type_id, 0)) =
-            rust_index.resolve_receiver_chain(ext, chain, by_file_name, by_pkg_name, symbols)
+        && let Some((target_type_id, 0)) = rust_index.resolve_receiver_chain(
+            ext,
+            &r.from_symbol_id,
+            chain,
+            by_file_name,
+            by_pkg_name,
+            symbols,
+        )
     {
         let caller_is_test = symbols
             .get(&r.from_symbol_id)
@@ -1212,8 +1218,13 @@ fn resolve_ref(
                 .get(&r.from_symbol_id)
                 .map(|s| s.is_test)
                 .unwrap_or(false);
-            let bare =
-                rust_index.resolve_bare_call(&ext.file, &r.target_name, caller_is_test, symbols);
+            let bare = rust_index.resolve_bare_call(
+                &ext.file,
+                &r.from_symbol_id,
+                &r.target_name,
+                caller_is_test,
+                symbols,
+            );
             if !bare.is_empty() {
                 return bare;
             }
@@ -1299,11 +1310,8 @@ fn resolve_ref(
         // Rust associated call through a type alias (e.g. TypeAlias::new())
         if ext.lang == Language::Rust
             && r.kind == EdgeKind::Calls
-            && qual
-                .chars()
-                .next()
-                .is_some_and(|c| c.is_ascii_uppercase())
-            && let Some(tid) = rust_index.resolve_type(
+            && qual.chars().next().is_some_and(|c| c.is_ascii_uppercase())
+            && let Some(tid) = rust_index.resolve_direct_type(
                 &ext.file,
                 &ext.package_or_module,
                 &ext.imports,
@@ -1315,21 +1323,16 @@ fn resolve_ref(
                 .get(&r.from_symbol_id)
                 .map(|s| s.is_test)
                 .unwrap_or(false);
-            let methods = rust_index.lookup_methods_on_type(&tid, &r.target_name, caller_is_test);
-            if !methods.is_empty() {
-                return methods
-                    .into_iter()
-                    .map(|id| (id, Confidence::Resolved))
-                    .collect();
-            }
+            let methods =
+                rust_index.lookup_direct_methods_on_type(&tid, &r.target_name, caller_is_test);
+            return methods
+                .into_iter()
+                .map(|id| (id, Confidence::Resolved))
+                .collect();
         }
 
         // Rust module-qualified function/const calls (e.g. auth::connect, reducer::helper)
-        if ext.lang == Language::Rust
-            && qual
-                .chars()
-                .next()
-                .is_some_and(|c| c.is_ascii_lowercase())
+        if ext.lang == Language::Rust && qual.chars().next().is_some_and(|c| c.is_ascii_lowercase())
         {
             let caller_is_test = symbols
                 .get(&r.from_symbol_id)
@@ -1337,6 +1340,7 @@ fn resolve_ref(
                 .unwrap_or(false);
             let path_matches = rust_index.resolve_qualified_path(
                 &ext.file,
+                &r.from_symbol_id,
                 qual,
                 &r.target_name,
                 caller_is_test,

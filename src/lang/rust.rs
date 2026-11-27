@@ -29,6 +29,7 @@ struct RustExtractCtx<'a> {
     cfg_gated_symbols: HashMap<String, String>,
     type_aliases: HashMap<String, String>,
     rust_uses: Vec<RustUseItem>,
+    symbol_mod_scopes: HashMap<String, String>,
 }
 
 /// Lexical scope stack for Rust local variables and inferred receiver chains.
@@ -108,6 +109,7 @@ pub fn extract(rel_path: &str, src: &str, blake3_hex: String) -> Result<FileExtr
         cfg_gated_symbols: HashMap::new(),
         type_aliases: HashMap::new(),
         rust_uses: Vec::new(),
+        symbol_mod_scopes: HashMap::new(),
     };
 
     let mut top_methods = Vec::new();
@@ -140,6 +142,7 @@ pub fn extract(rel_path: &str, src: &str, blake3_hex: String) -> Result<FileExtr
         cfg_gated_symbols: ctx.cfg_gated_symbols,
         type_aliases: ctx.type_aliases,
         rust_uses: ctx.rust_uses,
+        symbol_mod_scopes: ctx.symbol_mod_scopes,
         package_or_module: pkg,
     })
 }
@@ -474,7 +477,15 @@ fn walk_rust_items(
                 let is_pub = rust_visibility(child, ctx.src) == Visibility::Public;
                 let is_test = in_test_mod || has_test_attr;
                 if let Some(arg) = child.child_by_field_name("argument") {
-                    extract_rust_use_items(arg, ctx.src, "", is_pub, is_test, &mut ctx.rust_uses);
+                    extract_rust_use_items(
+                        arg,
+                        ctx.src,
+                        "",
+                        mod_path,
+                        is_pub,
+                        is_test,
+                        &mut ctx.rust_uses,
+                    );
                 }
             }
             "mod_item" => {
@@ -585,14 +596,18 @@ fn walk_rust_items(
             }
             "macro_definition" => {
                 if let Some(name_node) = child.child_by_field_name("name") {
-                    let name = node_text(name_node, ctx.src).to_string();
+                    let macro_sym_name = format!("{}!", node_text(name_node, ctx.src));
                     let span = node_span(child, 0);
-                    let id = make_symbol_id(ctx.rel_path, &name, span.start_line);
+                    let id = make_symbol_id(ctx.rel_path, &macro_sym_name, span.start_line);
                     let is_test = in_test_mod || has_test_attr;
+                    if !mod_path.is_empty() {
+                        ctx.symbol_mod_scopes
+                            .insert(id.clone(), mod_path.to_string());
+                    }
                     ctx.symbols.push(Symbol {
                         id: id.clone(),
-                        name: name.clone(),
-                        qualified_name: name,
+                        name: macro_sym_name.clone(),
+                        qualified_name: macro_sym_name,
                         kind: SymbolKind::Const,
                         lang: Language::Rust,
                         file: ctx.rel_path.to_string(),
@@ -633,7 +648,7 @@ fn walk_rust_items(
                     if !mname.is_empty() {
                         ctx.impl_macros.push((
                             ty.to_string(),
-                            mname.to_string(),
+                            format!("{}!", mname),
                             child.start_position().row + 1,
                         ));
                     }
@@ -650,6 +665,10 @@ fn walk_rust_items(
                         let span = node_span(child, 0);
                         let id = make_symbol_id(ctx.rel_path, &qname, span.start_line);
                         let is_test = in_test_mod || has_test_attr;
+                        if !mod_path.is_empty() {
+                            ctx.symbol_mod_scopes
+                                .insert(id.clone(), mod_path.to_string());
+                        }
                         ctx.symbols.push(Symbol {
                             id: id.clone(),
                             name,
@@ -702,6 +721,10 @@ fn walk_rust_items(
                     let is_test = in_test_mod || has_test_attr;
                     let is_cfg = (in_cfg_item || has_cfg_attr) && !is_test;
                     let is_entrypoint = name == "main" || has_export_attr;
+                    if !mod_path.is_empty() {
+                        ctx.symbol_mod_scopes
+                            .insert(id.clone(), mod_path.to_string());
+                    }
                     if is_cfg {
                         ctx.cfg_gated_symbols
                             .insert(id.clone(), mod_path.to_string());
@@ -803,6 +826,10 @@ fn walk_rust_items(
                         _ => SymbolKind::Type,
                     };
                     let is_test = in_test_mod || has_test_attr;
+                    if !mod_path.is_empty() {
+                        ctx.symbol_mod_scopes
+                            .insert(id.clone(), mod_path.to_string());
+                    }
                     ctx.symbols.push(Symbol {
                         id: id.clone(),
                         name: name.clone(),
@@ -850,9 +877,16 @@ fn walk_rust_items(
                     } else if kind == SymbolKind::Type
                         && let Some(rhs) = child.child_by_field_name("type")
                     {
-                        let norm = normalize_rust_type_text(node_text(rhs, ctx.src), impl_type);
+                        let raw_rhs = node_text(rhs, ctx.src);
+                        let norm = normalize_rust_type_text(raw_rhs, impl_type);
                         if !norm.is_empty() && norm != name {
-                            ctx.type_aliases.insert(id.clone(), norm);
+                            let wrapped = rust_type_is_wrapper(raw_rhs);
+                            let stored = if wrapped && !norm.starts_with("[]") {
+                                format!("*{}", norm)
+                            } else {
+                                norm
+                            };
+                            ctx.type_aliases.insert(id.clone(), stored);
                         }
                     }
                     collect_type_refs(
@@ -1753,7 +1787,7 @@ fn walk_rust_expr(
             env.pop_scope();
         }
         "call_expression" => {
-            let mut closure_param_hint: Option<Vec<ReceiverStep>> = None;
+            let mut closure_param_hint: Option<(usize, Vec<ReceiverStep>)> = None;
             if let Some(raw_func) = node.child_by_field_name("function") {
                 let func = if raw_func.kind() == "generic_function" {
                     if let Some(targs) = raw_func.child_by_field_name("type_arguments") {
@@ -1832,9 +1866,15 @@ fn walk_rust_expr(
                 }
             }
             if let Some(args) = node.child_by_field_name("arguments") {
-                if closure_param_hint.is_some() {
+                if let Some((target_arg_idx, hint_chain)) = closure_param_hint {
                     let mut ac = args.walk();
+                    let mut named_idx = 0usize;
                     for arg in args.children(&mut ac) {
+                        if !arg.is_named() {
+                            continue;
+                        }
+                        let idx = named_idx;
+                        named_idx += 1;
                         if arg.kind() == "closure_expression" {
                             walk_rust_closure(
                                 arg,
@@ -1844,7 +1884,11 @@ fn walk_rust_expr(
                                 env,
                                 refs,
                                 bridges,
-                                closure_param_hint.clone(),
+                                if idx == target_arg_idx {
+                                    Some(hint_chain.clone())
+                                } else {
+                                    None
+                                },
                             );
                         } else {
                             walk_rust_expr(arg, src, from_id, impl_type, env, refs, bridges);
@@ -1862,7 +1906,7 @@ fn walk_rust_expr(
                 if !mname.is_empty() {
                     refs.push(RawRef {
                         from_symbol_id: from_id.to_string(),
-                        target_name: mname.to_string(),
+                        target_name: format!("{}!", mname),
                         qualifier: None,
                         kind: EdgeKind::Calls,
                         line,
@@ -2027,10 +2071,65 @@ fn join_rust_use_path(prefix: &str, tail: &str) -> String {
     }
 }
 
+fn rust_type_is_wrapper(raw: &str) -> bool {
+    let s = strip_rust_type_prefixes(raw);
+    if s.starts_with('[') && s.ends_with(']') {
+        return true;
+    }
+    let base = s.split('<').next().unwrap_or(s).trim();
+    let short_base = base.rsplit("::").next().unwrap_or(base).trim();
+    let has_generic_args = s.contains('<');
+    has_generic_args
+        && (matches!(
+            short_base,
+            "Arc"
+                | "Rc"
+                | "Box"
+                | "Pin"
+                | "Mutex"
+                | "RwLock"
+                | "RefCell"
+                | "Cell"
+                | "OnceLock"
+                | "OnceCell"
+                | "LazyLock"
+                | "Option"
+                | "Result"
+                | "MutexGuard"
+                | "RwLockReadGuard"
+                | "RwLockWriteGuard"
+                | "OwnedMutexGuard"
+                | "MappedMutexGuard"
+                | "Ref"
+                | "RefMut"
+                | "ArcSwap"
+                | "ArcSwapOption"
+                | "Cow"
+                | "ManuallyDrop"
+                | "MaybeUninit"
+                | "NonNull"
+                | "BoxFuture"
+                | "LocalBoxFuture"
+                | "Vec"
+                | "VecDeque"
+                | "HashSet"
+                | "BTreeSet"
+                | "IndexSet"
+                | "BinaryHeap"
+                | "LinkedList"
+                | "SmallVec"
+                | "HashMap"
+                | "BTreeMap"
+                | "IndexMap"
+                | "DashMap"
+        ) || short_base.ends_with("Result"))
+}
+
 fn extract_rust_use_items(
     node: Node<'_>,
     src: &str,
     prefix: &str,
+    mod_scope: &str,
     is_pub: bool,
     is_test: bool,
     out: &mut Vec<RustUseItem>,
@@ -2045,6 +2144,7 @@ fn extract_rust_use_items(
                     out.push(RustUseItem {
                         local_name: local.to_string(),
                         target_path: prefix.to_string(),
+                        mod_scope: mod_scope.to_string(),
                         is_pub,
                         is_test,
                     });
@@ -2054,6 +2154,7 @@ fn extract_rust_use_items(
                 out.push(RustUseItem {
                     local_name: name.to_string(),
                     target_path: full,
+                    mod_scope: mod_scope.to_string(),
                     is_pub,
                     is_test,
                 });
@@ -2067,6 +2168,7 @@ fn extract_rust_use_items(
                     out.push(RustUseItem {
                         local_name: local.to_string(),
                         target_path: full,
+                        mod_scope: mod_scope.to_string(),
                         is_pub,
                         is_test,
                     });
@@ -2094,6 +2196,7 @@ fn extract_rust_use_items(
                 out.push(RustUseItem {
                     local_name: alias.to_string(),
                     target_path: full,
+                    mod_scope: mod_scope.to_string(),
                     is_pub,
                     is_test,
                 });
@@ -2113,6 +2216,7 @@ fn extract_rust_use_items(
                 out.push(RustUseItem {
                     local_name: "*".to_string(),
                     target_path: full,
+                    mod_scope: mod_scope.to_string(),
                     is_pub,
                     is_test,
                 });
@@ -2125,14 +2229,14 @@ fn extract_rust_use_items(
                 .unwrap_or_default();
             let next_prefix = join_rust_use_path(prefix, &sub);
             if let Some(list) = node.child_by_field_name("list") {
-                extract_rust_use_items(list, src, &next_prefix, is_pub, is_test, out);
+                extract_rust_use_items(list, src, &next_prefix, mod_scope, is_pub, is_test, out);
             }
         }
         "use_list" => {
             let mut c = node.walk();
             for ch in node.children(&mut c) {
                 if ch.is_named() {
-                    extract_rust_use_items(ch, src, prefix, is_pub, is_test, out);
+                    extract_rust_use_items(ch, src, prefix, mod_scope, is_pub, is_test, out);
                 }
             }
         }
@@ -2143,7 +2247,7 @@ fn extract_rust_use_items(
 fn infer_closure_param_hint(
     recv_chain: &[ReceiverStep],
     method: &str,
-) -> Option<Vec<ReceiverStep>> {
+) -> Option<(usize, Vec<ReceiverStep>)> {
     if matches!(
         method,
         "any"
@@ -2167,7 +2271,7 @@ fn infer_closure_param_hint(
     ) {
         let mut ch = recv_chain.to_vec();
         ch.push(ReceiverStep::Elem);
-        return Some(ch);
+        return Some((0, ch));
     }
     if matches!(method, "map" | "inspect") {
         let looks_like_iter = recv_chain.last().is_some_and(|step| {
@@ -2196,13 +2300,14 @@ fn infer_closure_param_hint(
         if looks_like_iter {
             ch.push(ReceiverStep::Elem);
         }
-        return Some(ch);
+        return Some((0, ch));
     }
-    if matches!(
-        method,
-        "and_then" | "is_some_and" | "is_ok_and" | "map_or" | "map_or_else"
-    ) {
-        return Some(recv_chain.to_vec());
+    if matches!(method, "and_then" | "is_some_and" | "is_ok_and") {
+        return Some((0, recv_chain.to_vec()));
+    }
+    if matches!(method, "map_or" | "map_or_else") {
+        // Arg 0 is the default value / error callback (E); arg 1 is the Ok/Some mapper (T).
+        return Some((1, recv_chain.to_vec()));
     }
     None
 }
