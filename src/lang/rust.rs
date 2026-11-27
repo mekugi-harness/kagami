@@ -8,6 +8,7 @@ use crate::model::{
     Symbol, SymbolKind, Visibility,
 };
 use anyhow::Result;
+use std::collections::HashMap;
 use tree_sitter::{Node, Parser};
 
 pub fn extract(rel_path: &str, src: &str, blake3_hex: String) -> Result<FileExtract> {
@@ -123,7 +124,7 @@ fn walk_rust_items(
                         rel_path,
                         pkg,
                         ty.as_deref(),
-                        in_test_mod,
+                        in_test_mod || has_test_attr,
                         in_trait_impl || is_trait_impl,
                         imports,
                         symbols,
@@ -164,8 +165,9 @@ fn walk_rust_items(
                         package_or_module: pkg.to_string(),
                     });
                     if let Some(body) = child.child_by_field_name("body") {
-                        collect_rust_refs_and_bridges(body, src, &id, refs, bridges);
                         let params = extract_rust_params(child, src);
+                        let locals = collect_rust_locals(body, src, &params);
+                        collect_rust_refs_and_bridges(body, src, &id, &locals, refs, bridges);
                         let ir_body = lower_rust_node(body, src);
                         ir_funcs.push(IrFunc {
                             symbol_id: id,
@@ -214,7 +216,8 @@ fn walk_rust_items(
                             confidence: Confidence::Heuristic,
                         });
                     }
-                    collect_rust_refs_and_bridges(child, src, &id, refs, bridges);
+                    let empty_locals = HashMap::new();
+                    collect_rust_refs_and_bridges(child, src, &id, &empty_locals, refs, bridges);
                 }
             }
             _ => {}
@@ -252,10 +255,35 @@ fn extract_rust_params(node: Node<'_>, src: &str) -> Vec<String> {
     params
 }
 
+fn collect_rust_locals(body: Node<'_>, src: &str, params: &[String]) -> HashMap<String, usize> {
+    let mut locals: HashMap<String, usize> = params.iter().map(|p| (p.clone(), 0usize)).collect();
+    let mut stack = vec![body];
+    while let Some(n) = stack.pop() {
+        if n.kind() == "let_declaration" {
+            let pos = n.start_byte();
+            if let Some(pat) = n.child_by_field_name("pattern") {
+                let name = node_text(pat, src).trim().trim_start_matches("mut ").trim();
+                if !name.is_empty() && name != "_" {
+                    locals
+                        .entry(name.to_string())
+                        .and_modify(|e| *e = (*e).min(pos))
+                        .or_insert(pos);
+                }
+            }
+        }
+        let mut c = n.walk();
+        for ch in n.children(&mut c) {
+            stack.push(ch);
+        }
+    }
+    locals
+}
+
 fn collect_rust_refs_and_bridges(
     node: Node<'_>,
     src: &str,
     from_id: &str,
+    locals: &HashMap<String, usize>,
     refs: &mut Vec<RawRef>,
     bridges: &mut Vec<BridgeHint>,
 ) {
@@ -343,6 +371,44 @@ fn collect_rust_refs_and_bridges(
                         line,
                         confidence: Confidence::Heuristic,
                     });
+                }
+            }
+            "field_initializer" => {
+                if let Some(val) = n.child_by_field_name("value") {
+                    match val.kind() {
+                        "identifier" => {
+                            let target = node_text(val, src);
+                            let shadowed = locals.get(target).map(|&p| p < val.start_byte()).unwrap_or(false);
+                            if !shadowed {
+                                refs.push(RawRef {
+                                    from_symbol_id: from_id.to_string(),
+                                    target_name: target.to_string(),
+                                    qualifier: None,
+                                    kind: EdgeKind::Calls,
+                                    line,
+                                });
+                            }
+                        }
+                        "scoped_identifier" => {
+                            let ftxt = node_text(val, src);
+                            let parts: Vec<&str> = ftxt.split("::").collect();
+                            if let Some(last) = parts.last() {
+                                let qual = if parts.len() >= 2 {
+                                    Some(parts[parts.len() - 2].to_string())
+                                } else {
+                                    None
+                                };
+                                refs.push(RawRef {
+                                    from_symbol_id: from_id.to_string(),
+                                    target_name: (*last).to_string(),
+                                    qualifier: qual,
+                                    kind: EdgeKind::Calls,
+                                    line,
+                                });
+                            }
+                        }
+                        _ => {}
+                    }
                 }
             }
             "type_identifier" => {
