@@ -755,8 +755,10 @@ func (d *ContentDialog) Key()   { d.Dialog.Key() }
 func (d *ContentDialog) Mouse() { d.Dialog.Mouse() }
 
 type Item struct{}
-func (i *Item) Render() { itemRenderHelper() }
-func itemRenderHelper() {}
+func (i *Item) RenderIndexed() { itemIndexedHelper() }
+func (i *Item) RenderRanged()  { itemRangedHelper() }
+func itemIndexedHelper() {}
+func itemRangedHelper()  {}
 
 type Transcript struct{}
 func (t *Transcript) Render() { transcriptRenderHelper() }
@@ -773,9 +775,9 @@ func (m *Main) Update() {
 }
 func (m *Main) Render() {
 	m.BTW.Render()
-	m.Items[0].Render()
+	m.Items[0].RenderIndexed()
 	for _, it := range m.Items {
-		it.Render()
+		it.RenderRanged()
 	}
 }
 
@@ -887,7 +889,11 @@ func main() {
         graph.edges.iter().any(|e| {
             e.kind == kagami::model::EdgeKind::Calls
                 && e.confidence == Confidence::Resolved
-                && graph.symbols.get(&e.from).map(|s| s.qualified_name.as_str()) == Some(from_qname)
+                && graph
+                    .symbols
+                    .get(&e.from)
+                    .map(|s| s.qualified_name.as_str())
+                    == Some(from_qname)
                 && graph.symbols.get(&e.to).map(|s| s.qualified_name.as_str()) == Some(to_qname)
         })
     };
@@ -896,7 +902,8 @@ func main() {
         ("Main.Update", "BTWDock.Update"),
         ("Main.Update", "Menu.Update"),
         ("Main.Render", "BTWDock.Render"),
-        ("Main.Render", "Item.Render"),
+        ("Main.Render", "Item.RenderIndexed"),
+        ("Main.Render", "Item.RenderRanged"),
         ("FrameInput.Handle", "ContentDialog.Key"),
         ("FrameInput.Handle", "ContentDialog.Mouse"),
         ("FrameInput.Handle", "BTWDock.Key"),
@@ -930,8 +937,10 @@ func main() {
         "dialogMouseHelper",
         "Main.Update",
         "Main.Render",
-        "Item.Render",
-        "itemRenderHelper",
+        "Item.RenderIndexed",
+        "Item.RenderRanged",
+        "itemIndexedHelper",
+        "itemRangedHelper",
         "Transcript.Render",
         "transcriptRenderHelper",
     ] {
@@ -952,6 +961,181 @@ func main() {
         assert!(
             is_dead(dead_sym),
             "Expected truly unused {dead_sym} to remain dead; dead={:?}",
+            dead.symbols
+        );
+    }
+}
+
+#[test]
+fn test_go_receiver_chain_review_edge_cases() {
+    let dir = TempDir::new().unwrap();
+    let root = dir.path();
+    fs::create_dir_all(root.join("internal/cases")).unwrap();
+    fs::create_dir_all(root.join("cmd/app")).unwrap();
+
+    fs::write(root.join("go.mod"), "module demo\n\ngo 1.24\n").unwrap();
+
+    fs::write(
+        root.join("internal/cases/cases.go"),
+        r#"package cases
+
+import "time"
+
+// 1. var _, worker = pair() must preserve result index 1 for worker
+type First struct{}
+func (f *First) Run() {}
+
+type Second struct{}
+func (s *Second) Run() {}
+
+func pair() (*First, *Second) { return &First{}, &Second{} }
+
+// 2. Shadowed factory parameter must not resolve to package build()
+type OldTarget struct{}
+func (o *OldTarget) Exec() {}
+
+func build() *OldTarget { return &OldTarget{} }
+
+func useShadowedFactory(build func() any) {
+	_ = build()
+}
+
+// 3. Shadowing local with unsupported type must mask outer receiver type
+type OuterWorker struct{}
+func (w *OuterWorker) Work() {}
+
+type OuterCfg struct {
+	Worker *OuterWorker
+}
+
+func useShadowedCfg(cfg *OuterCfg) {
+	_ = cfg
+	fn := func(cfg struct{ Worker int }) {
+		_ = cfg.Worker
+	}
+	fn(struct{ Worker int }{})
+}
+
+// 4. Explicit anonymous interface var must not lock to initializer's concrete type
+func useAnonIface() {
+	var runner interface{ Ping() } = ImplA{}
+	runner = ImplB{}
+	runner.Ping()
+}
+
+// 5. Blank field _ time.Time must not act as an external embed
+type BlankHolder struct {
+	_ time.Time
+}
+func (b *BlankHolder) UnusedReload() {}
+
+// 6. Callable field shadowing promoted method must block Base.Make
+type BaseFactory struct{}
+func (b *BaseFactory) Make() *First { return &First{} }
+
+type WrapperFactory struct {
+	BaseFactory
+	Make func() *Second
+}
+
+func RunAll() {
+	var _, worker = pair()
+	worker.Run()
+	useShadowedFactory(func() any { return nil })
+	useShadowedCfg(&OuterCfg{})
+	useAnonIface()
+	_ = &BlankHolder{}
+	w := &WrapperFactory{}
+	_ = w.Make()
+}
+"#,
+    )
+    .unwrap();
+
+    fs::write(
+        root.join("internal/cases/impls.go"),
+        r#"package cases
+
+type ImplA struct{}
+func (a ImplA) Ping() {}
+
+type ImplB struct{}
+func (b ImplB) Ping() {}
+"#,
+    )
+    .unwrap();
+
+    fs::write(
+        root.join("internal/cases/cases_test.go"),
+        r#"package cases
+
+func (s *Second) TestHelperMethod() {}
+
+func TestCallsHelper() {
+	s := &Second{}
+	s.TestHelperMethod()
+}
+"#,
+    )
+    .unwrap();
+
+    fs::write(
+        root.join("cmd/app/main.go"),
+        r#"package main
+
+import "demo/internal/cases"
+
+func main() {
+	cases.RunAll()
+}
+"#,
+    )
+    .unwrap();
+
+    let ignores = KagamiConfig::default().build_ignore_globset().unwrap();
+    let files = discover_files(root, &ignores, None).unwrap();
+    let graph = CodeGraph::build(root, &files, false).unwrap();
+    let dead = analyze_dead(
+        &graph,
+        &DeadOptions {
+            scope: DeadScope::Prod,
+            langs: None,
+            allowlist: Default::default(),
+            include_clusters: true,
+            path_filter: None,
+            min_confidence: Confidence::Heuristic,
+        },
+    );
+    let is_dead = |sym: &str| dead.symbols.iter().any(|s| s.symbol == sym);
+    let has_resolved_call = |from_qname: &str, to_qname: &str| {
+        graph.edges.iter().any(|e| {
+            e.kind == kagami::model::EdgeKind::Calls
+                && e.confidence == Confidence::Resolved
+                && graph
+                    .symbols
+                    .get(&e.from)
+                    .map(|s| s.qualified_name.as_str())
+                    == Some(from_qname)
+                && graph.symbols.get(&e.to).map(|s| s.qualified_name.as_str()) == Some(to_qname)
+        })
+    };
+
+    assert!(has_resolved_call("RunAll", "Second.Run"));
+    assert!(!has_resolved_call("RunAll", "First.Run"));
+    assert!(!has_resolved_call("RunAll", "BaseFactory.Make"));
+    assert!(!has_resolved_call("useAnonIface", "ImplA.Ping"));
+    assert!(has_resolved_call("TestCallsHelper", "Second.TestHelperMethod"));
+
+    for dead_sym in [
+        "First.Run",
+        "OldTarget.Exec",
+        "OuterWorker.Work",
+        "BlankHolder.UnusedReload",
+        "BaseFactory.Make",
+    ] {
+        assert!(
+            is_dead(dead_sym),
+            "Expected {dead_sym} to remain dead; dead={:?}",
             dead.symbols
         );
     }

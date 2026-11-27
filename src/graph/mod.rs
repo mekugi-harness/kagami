@@ -6,8 +6,7 @@ pub mod scip;
 use crate::cache::{CacheData, CacheStore, PARSER_VERSION};
 use crate::lang;
 use crate::model::{
-    Confidence, Edge, EdgeKind, FileExtract, Language, ReceiverStep, Symbol, SymbolKind,
-    Visibility,
+    Confidence, Edge, EdgeKind, FileExtract, Language, ReceiverStep, Symbol, SymbolKind, Visibility,
 };
 use crate::walker::DiscoveredFile;
 use anyhow::Result;
@@ -375,6 +374,7 @@ struct GoTypeIndex<'a> {
     file_aliases: HashMap<&'a str, HashMap<&'a str, &'a str>>,
     go_types_by_pkg_name: HashMap<(&'a str, &'a str), String>,
     go_methods_by_type: HashMap<String, HashMap<String, String>>,
+    go_test_methods_by_type: HashMap<String, HashMap<String, String>>,
     raw_embeds: HashMap<String, Vec<String>>,
     raw_struct_fields: HashMap<String, HashMap<String, String>>,
     func_return_types: HashMap<String, Vec<String>>,
@@ -391,6 +391,7 @@ impl<'a> GoTypeIndex<'a> {
         let mut file_aliases: HashMap<&'a str, HashMap<&'a str, &'a str>> = HashMap::new();
         let mut go_types_by_pkg_name: HashMap<(&'a str, &'a str), String> = HashMap::new();
         let mut go_methods_by_type: HashMap<String, HashMap<String, String>> = HashMap::new();
+        let mut go_test_methods_by_type: HashMap<String, HashMap<String, String>> = HashMap::new();
         let mut raw_iface_methods: HashMap<String, Vec<String>> = HashMap::new();
         let mut raw_embeds: HashMap<String, Vec<String>> = HashMap::new();
         let mut raw_struct_fields: HashMap<String, HashMap<String, String>> = HashMap::new();
@@ -435,6 +436,10 @@ impl<'a> GoTypeIndex<'a> {
             {
                 let type_is_test = symbols.get(type_id).map(|s| s.is_test).unwrap_or(false);
                 if sym.is_test && !type_is_test {
+                    go_test_methods_by_type
+                        .entry(type_id.clone())
+                        .or_default()
+                        .insert(sym.name.clone(), sym.id.clone());
                     continue;
                 }
                 go_methods_by_type
@@ -550,6 +555,13 @@ impl<'a> GoTypeIndex<'a> {
                         );
                     }
                 }
+                // Struct fields share Go's selector namespace with methods, so a field at
+                // shallower or equal embedding depth shadows any deeper promoted method.
+                if let Some(fields) = raw_struct_fields.get(&curr_id) {
+                    for f_name in fields.keys() {
+                        merge_promoted(&mut eff, f_name, depth, PromotedMethod::Ambiguous);
+                    }
+                }
                 if let (Some(owner), Some(embeds)) =
                     (symbols.get(&curr_id), raw_embeds.get(&curr_id))
                 {
@@ -596,6 +608,7 @@ impl<'a> GoTypeIndex<'a> {
             file_aliases,
             go_types_by_pkg_name,
             go_methods_by_type,
+            go_test_methods_by_type,
             raw_embeds,
             raw_struct_fields,
             func_return_types,
@@ -660,23 +673,24 @@ impl<'a> GoTypeIndex<'a> {
                 .get(&curr_id)
                 .and_then(|fields| fields.get(field_name))
             {
-                if let Some(resolved) = self.resolve_type_with_slices(
-                    &owner.file,
-                    &owner.package_or_module,
-                    raw_field_ty,
-                    by_pkg_name,
-                    symbols,
-                ) {
-                    match best_depth {
-                        None => {
-                            best_depth = Some(depth);
-                            best_target = Some(resolved);
-                        }
-                        Some(bd) if depth == bd && best_target.as_ref() != Some(&resolved) => {
-                            ambiguous = true;
-                        }
-                        _ => {}
+                let resolved = (!raw_field_ty.is_empty()).then(|| {
+                    self.resolve_type_with_slices(
+                        &owner.file,
+                        &owner.package_or_module,
+                        raw_field_ty,
+                        by_pkg_name,
+                        symbols,
+                    )
+                }).flatten();
+                match best_depth {
+                    None => {
+                        best_depth = Some(depth);
+                        best_target = resolved;
                     }
+                    Some(bd) if depth == bd && best_target != resolved => {
+                        ambiguous = true;
+                    }
+                    _ => {}
                 }
                 continue;
             }
@@ -1072,6 +1086,14 @@ fn resolve_ref(
             if let Some(method_id) = method_opt {
                 results.push((method_id.clone(), Confidence::Resolved));
             }
+            return results;
+        }
+        if let Some(test_method_id) = go_index
+            .go_test_methods_by_type
+            .get(&target_type_id)
+            .and_then(|m| m.get(&r.target_name))
+        {
+            results.push((test_method_id.clone(), Confidence::Resolved));
             return results;
         }
         if symbols

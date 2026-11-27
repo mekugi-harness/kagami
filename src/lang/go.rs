@@ -654,7 +654,7 @@ fn extract_struct_fields_and_embeds(
                 }
             }
         }
-        if names.is_empty() {
+        if ch.child_by_field_name("name").is_none() {
             if let Some(embed) = extract_embedded_type_name(ty, src) {
                 let field_name = embed.rsplit('.').next().unwrap_or(&embed).to_string();
                 if !field_name.is_empty() {
@@ -662,7 +662,10 @@ fn extract_struct_fields_and_embeds(
                 }
                 embeds.push(embed);
             }
-        } else if let Some(field_ty) = extract_go_type_name(ty, src) {
+        } else {
+            // Record field presence even when its type is unsupported (e.g. func/anon struct)
+            // so shallower fields still shadow deeper promoted methods in Go's selector namespace.
+            let field_ty = extract_go_type_name(ty, src).unwrap_or_default();
             for fname in names {
                 field_map.insert(fname, field_ty.clone());
             }
@@ -896,7 +899,7 @@ fn collect_go_locals(
 struct GoLocalEnv<'a> {
     pkg_aliases: &'a HashSet<String>,
     pkg_var_types: &'a HashMap<String, Vec<ReceiverStep>>,
-    locals: HashMap<String, Vec<(usize, usize, Vec<ReceiverStep>)>>,
+    locals: HashMap<String, Vec<(usize, usize, Option<Vec<ReceiverStep>>)>>,
 }
 
 impl<'a> GoLocalEnv<'a> {
@@ -912,9 +915,23 @@ impl<'a> GoLocalEnv<'a> {
     }
 
     fn bind(&mut self, name: String, start: usize, end: usize, chain: Vec<ReceiverStep>) {
-        if !name.is_empty() && name != "_" && !chain.is_empty() && chain.len() <= MAX_RECEIVER_CHAIN_LEN
-        {
-            self.locals.entry(name).or_default().push((start, end, chain));
+        let opt_chain = (!chain.is_empty() && chain.len() <= MAX_RECEIVER_CHAIN_LEN).then_some(chain);
+        self.bind_opt(name, start, end, opt_chain);
+    }
+
+    fn bind_opt(
+        &mut self,
+        name: String,
+        start: usize,
+        end: usize,
+        chain: Option<Vec<ReceiverStep>>,
+    ) {
+        if !name.is_empty() && name != "_" {
+            let valid = chain.filter(|c| !c.is_empty() && c.len() <= MAX_RECEIVER_CHAIN_LEN);
+            self.locals
+                .entry(name)
+                .or_default()
+                .push((start, end, valid));
         }
     }
 
@@ -925,7 +942,7 @@ impl<'a> GoLocalEnv<'a> {
                 .filter(|(s, e, _)| pos >= *s && pos < *e)
                 .min_by_key(|(s, e, _)| (e.saturating_sub(*s), usize::MAX - *s))
         {
-            return Some(chain.as_slice());
+            return chain.as_deref();
         }
         self.pkg_var_types.get(name).map(|v| v.as_slice())
     }
@@ -946,31 +963,26 @@ impl<'a> GoLocalEnv<'a> {
         for ch in param_list.children(&mut c) {
             match ch.kind() {
                 "parameter_declaration" => {
-                    let Some(ty) = ch
+                    let chain = ch
                         .child_by_field_name("type")
                         .and_then(|t| extract_go_type_name(t, src))
-                    else {
-                        continue;
-                    };
+                        .map(|ty| vec![ReceiverStep::Type(ty)]);
                     let mut pc = ch.walk();
                     for sub in ch.children(&mut pc) {
                         if sub.kind() == "identifier" {
                             let name = node_text(sub, src).trim().to_string();
-                            self.bind(name, start, end, vec![ReceiverStep::Type(ty.clone())]);
+                            self.bind_opt(name, start, end, chain.clone());
                         }
                     }
                 }
                 "variadic_parameter_declaration" => {
-                    let Some(ty) = ch
+                    let chain = ch
                         .child_by_field_name("type")
                         .and_then(|t| extract_go_type_name(t, src))
-                    else {
-                        continue;
-                    };
-                    let slice_ty = format!("[]{}", ty);
+                        .map(|ty| vec![ReceiverStep::Type(format!("[]{}", ty))]);
                     if let Some(name_node) = ch.child_by_field_name("name") {
                         let name = node_text(name_node, src).trim().to_string();
-                        self.bind(name, start, end, vec![ReceiverStep::Type(slice_ty)]);
+                        self.bind_opt(name, start, end, chain);
                     }
                 }
                 _ => {}
@@ -1010,16 +1022,20 @@ impl<'a> GoLocalEnv<'a> {
                 let start = node.end_byte();
                 let end = enclosing_scope_end(node, body_end);
                 let names = collect_spec_names(node, src);
-                if let Some(ty) = node
-                    .child_by_field_name("type")
-                    .and_then(|t| extract_go_type_name(t, src))
-                {
+                if let Some(ty_node) = node.child_by_field_name("type") {
+                    // Explicit type annotation present: never fall back to initializer's concrete type.
+                    let chain = extract_go_type_name(ty_node, src)
+                        .map(|ty| vec![ReceiverStep::Type(ty)]);
                     for name in names {
-                        self.bind(name, start, end, vec![ReceiverStep::Type(ty.clone())]);
+                        self.bind_opt(name, start, end, chain.clone());
                     }
                 } else if let Some(val) = node.child_by_field_name("value") {
                     let rhs_exprs = collect_expr_list(val);
                     self.bind_paired(&names, &rhs_exprs, src, start, end);
+                } else {
+                    for name in names {
+                        self.bind_opt(name, start, end, None);
+                    }
                 }
             }
             "range_clause" => {
@@ -1028,16 +1044,19 @@ impl<'a> GoLocalEnv<'a> {
                     node.child_by_field_name("right"),
                 ) {
                     let lhs_names = collect_lhs_identifiers(lhs, src);
-                    if lhs_names.len() >= 2
-                        && !lhs_names[1].is_empty()
-                        && lhs_names[1] != "_"
-                        && let Some(mut chain) = resolve_expr_chain(rhs, 0, src, self)
-                        && chain.len() < MAX_RECEIVER_CHAIN_LEN
-                    {
-                        chain.push(ReceiverStep::Elem);
-                        let start = node.end_byte();
-                        let end = enclosing_scope_end(node, body_end);
-                        self.bind(lhs_names[1].clone(), start, end, chain);
+                    let start = node.end_byte();
+                    let end = enclosing_scope_end(node, body_end);
+                    if let Some(first) = lhs_names.first() {
+                        self.bind_opt(first.clone(), start, end, None);
+                    }
+                    if let Some(second) = lhs_names.get(1) {
+                        let elem_chain = resolve_expr_chain(rhs, 0, src, self).and_then(|mut c| {
+                            (c.len() < MAX_RECEIVER_CHAIN_LEN).then(|| {
+                                c.push(ReceiverStep::Elem);
+                                c
+                            })
+                        });
+                        self.bind_opt(second.clone(), start, end, elem_chain);
                     }
                 }
             }
@@ -1065,16 +1084,18 @@ impl<'a> GoLocalEnv<'a> {
     ) {
         if rhs_exprs.len() == lhs_names.len() {
             for (name, &expr) in lhs_names.iter().zip(rhs_exprs.iter()) {
-                if let Some(chain) = resolve_expr_chain(expr, 0, src, self) {
-                    self.bind(name.clone(), start, end, chain);
-                }
+                let chain = resolve_expr_chain(expr, 0, src, self);
+                self.bind_opt(name.clone(), start, end, chain);
             }
         } else if rhs_exprs.len() == 1 {
             let expr = rhs_exprs[0];
             for (idx, name) in lhs_names.iter().enumerate() {
-                if let Some(chain) = resolve_expr_chain(expr, idx, src, self) {
-                    self.bind(name.clone(), start, end, chain);
-                }
+                let chain = resolve_expr_chain(expr, idx, src, self);
+                self.bind_opt(name.clone(), start, end, chain);
+            }
+        } else {
+            for name in lhs_names {
+                self.bind_opt(name.clone(), start, end, None);
             }
         }
     }
@@ -1125,7 +1146,7 @@ fn collect_spec_names(spec: Node<'_>, src: &str) -> Vec<String> {
             && spec.child_by_field_name("value").map(|v| v.id()) != Some(ch.id())
         {
             let t = node_text(ch, src).trim();
-            if !t.is_empty() && t != "_" {
+            if !t.is_empty() {
                 names.push(t.to_string());
             }
         }
@@ -1140,24 +1161,29 @@ fn bind_var_spec_to_map(
     out: &mut HashMap<String, Vec<ReceiverStep>>,
 ) {
     let names = collect_spec_names(spec, src);
-    if let Some(ty) = spec
-        .child_by_field_name("type")
-        .and_then(|t| extract_go_type_name(t, src))
-    {
-        for name in names {
-            out.insert(name, vec![ReceiverStep::Type(ty.clone())]);
+    if let Some(ty_node) = spec.child_by_field_name("type") {
+        if let Some(ty) = extract_go_type_name(ty_node, src) {
+            for name in names {
+                if name != "_" {
+                    out.insert(name, vec![ReceiverStep::Type(ty.clone())]);
+                }
+            }
         }
     } else if let Some(val) = spec.child_by_field_name("value") {
         let rhs_exprs = collect_expr_list(val);
         if rhs_exprs.len() == names.len() {
             for (name, &expr) in names.iter().zip(rhs_exprs.iter()) {
-                if let Some(chain) = resolve_expr_chain(expr, 0, src, env) {
+                if name != "_"
+                    && let Some(chain) = resolve_expr_chain(expr, 0, src, env)
+                {
                     out.insert(name.clone(), chain);
                 }
             }
         } else if rhs_exprs.len() == 1 {
             for (idx, name) in names.iter().enumerate() {
-                if let Some(chain) = resolve_expr_chain(rhs_exprs[0], idx, src, env) {
+                if name != "_"
+                    && let Some(chain) = resolve_expr_chain(rhs_exprs[0], idx, src, env)
+                {
                     out.insert(name.clone(), chain);
                 }
             }
@@ -1253,6 +1279,9 @@ fn resolve_expr_chain(
             match func.kind() {
                 "identifier" => {
                     let fname = node_text(func, src).trim();
+                    if env.is_local_at(fname, func.start_byte()) {
+                        return None;
+                    }
                     if (fname == "new" || fname == "make") && result_index == 0 {
                         let args = expr.child_by_field_name("arguments")?;
                         let first_arg = args.named_child(0)?;
