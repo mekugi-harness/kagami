@@ -1,6 +1,7 @@
 pub mod blast;
 pub mod bridges;
 pub mod dead;
+pub mod scip;
 
 use crate::cache::{CacheData, CacheStore, PARSER_VERSION};
 use crate::lang;
@@ -76,8 +77,12 @@ impl CodeGraph {
 
         for ext in &extracts {
             for sym in &ext.symbols {
-                by_file_name.entry((ext.file.as_str(), sym.name.as_str())).or_insert_with(|| sym.id.clone());
-                by_file_name.entry((ext.file.as_str(), sym.qualified_name.as_str())).or_insert_with(|| sym.id.clone());
+                by_file_name
+                    .entry((ext.file.as_str(), sym.name.as_str()))
+                    .or_insert_with(|| sym.id.clone());
+                by_file_name
+                    .entry((ext.file.as_str(), sym.qualified_name.as_str()))
+                    .or_insert_with(|| sym.id.clone());
                 if !sym.package_or_module.is_empty() {
                     by_pkg_name
                         .entry((sym.lang, sym.package_or_module.as_str(), sym.name.as_str()))
@@ -110,6 +115,16 @@ impl CodeGraph {
         let mut seen: HashSet<(String, String, EdgeKind)> = HashSet::new();
 
         for ext in &extracts {
+            // Precompute import alias -> import path map for this file
+            let mut alias_map: HashMap<&str, &str> = HashMap::new();
+            for imp in &ext.imports {
+                if let Some((alias, path)) = imp.split_once('=') {
+                    alias_map.insert(alias, path);
+                } else if let Some(last) = imp.rsplit('/').next() {
+                    alias_map.insert(last, imp.as_str());
+                }
+            }
+
             for r in &ext.refs {
                 if !symbols.contains_key(&r.from_symbol_id) {
                     continue;
@@ -117,6 +132,7 @@ impl CodeGraph {
                 let resolved = resolve_ref(
                     ext,
                     r,
+                    &alias_map,
                     &symbols,
                     &by_file_name,
                     &by_pkg_name,
@@ -166,21 +182,25 @@ impl CodeGraph {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn resolve_ref(
     ext: &FileExtract,
     r: &crate::model::RawRef,
+    alias_map: &HashMap<&str, &str>,
     symbols: &HashMap<String, Symbol>,
     by_file_name: &HashMap<(&str, &str), String>,
     by_pkg_name: &HashMap<(Language, &str, &str), Vec<String>>,
     by_lang_name: &HashMap<(Language, &str), Vec<String>>,
     by_lang_qname: &HashMap<(Language, &str), Vec<String>>,
 ) -> Vec<(String, Confidence)> {
-    // 1. O(1) same-file match
-    if let Some(id) = by_file_name.get(&(ext.file.as_str(), r.target_name.as_str())) {
-        return vec![(id.clone(), Confidence::Resolved)];
+    // 1. O(1) same-file match (only when unqualified, or qualifier refers to self/receiver)
+    if r.qualifier.is_none() {
+        if let Some(id) = by_file_name.get(&(ext.file.as_str(), r.target_name.as_str())) {
+            return vec![(id.clone(), Confidence::Resolved)];
+        }
     }
 
-    // 2. O(1) qualified match (Type.Method or Type::method)
+    // 2. O(1) qualified match: Type.Method / Type::method, then imported package/module
     if let Some(ref qual) = r.qualifier {
         for sep in [".", "::"] {
             let q = format!("{}{}{}", qual, sep, r.target_name);
@@ -188,6 +208,46 @@ fn resolve_ref(
                 if ids.len() <= 3 {
                     return ids.iter().map(|id| (id.clone(), Confidence::Resolved)).collect();
                 }
+            }
+        }
+
+        // Package-qualified lookup (e.g. launch.Run(), composition.NativeRenderer(), headless.ReadPrompt())
+        let imported_path = alias_map.get(qual.as_str()).copied();
+        let pkg_key = imported_path
+            .and_then(|p| p.rsplit('/').next())
+            .unwrap_or(qual.as_str());
+
+        if let Some(ids) = by_pkg_name.get(&(ext.lang, pkg_key, r.target_name.as_str())) {
+            if let Some(imp_path) = imported_path {
+                // Disambiguate using the imported path suffix (e.g. "internal/launch")
+                let suffix = imp_path
+                    .split('/')
+                    .rev()
+                    .take(2)
+                    .collect::<Vec<_>>()
+                    .into_iter()
+                    .rev()
+                    .collect::<Vec<_>>()
+                    .join("/");
+                let narrowed: Vec<String> = ids
+                    .iter()
+                    .filter(|id| {
+                        symbols
+                            .get(*id)
+                            .map(|s| s.file.contains(&suffix) || s.file.contains(imp_path))
+                            .unwrap_or(false)
+                    })
+                    .cloned()
+                    .collect();
+                if !narrowed.is_empty() && narrowed.len() <= 4 {
+                    return narrowed
+                        .into_iter()
+                        .map(|id| (id, Confidence::Resolved))
+                        .collect();
+                }
+            }
+            if ids.len() <= 4 {
+                return ids.iter().map(|id| (id.clone(), Confidence::Resolved)).collect();
             }
         }
     }
@@ -201,7 +261,7 @@ fn resolve_ref(
         }
     }
 
-    // 4. Bounded global/import lookup (only when candidate set is small)
+    // 4. Bounded global/import lookup
     if let Some(cands) = by_lang_name.get(&(ext.lang, r.target_name.as_str())) {
         if cands.len() == 1 {
             return vec![(cands[0].clone(), Confidence::Heuristic)];
@@ -214,7 +274,8 @@ fn resolve_ref(
                         .get(*id)
                         .map(|s| {
                             ext.imports.iter().any(|imp| {
-                                let clean = imp.trim_start_matches("./").trim_start_matches("../");
+                                let raw_p = imp.split_once('=').map(|(_, p)| p).unwrap_or(imp.as_str());
+                                let clean = raw_p.trim_start_matches("./").trim_start_matches("../");
                                 !clean.is_empty() && (s.file.contains(clean) || s.package_or_module.contains(clean))
                             })
                         })

@@ -3,6 +3,7 @@ use clap::{Parser, Subcommand, ValueEnum};
 use kagami::config::{build_path_filter, load_allowlist, KagamiConfig};
 use kagami::graph::blast::{analyze_blast_radius, BlastOptions, Direction};
 use kagami::graph::dead::{analyze_dead, DeadOptions, DeadScope};
+use kagami::graph::scip::{apply_scip_overlay, load_scip_file};
 use kagami::graph::CodeGraph;
 use kagami::ir::similar::{find_similar, SimilarOptions};
 use kagami::model::Language;
@@ -29,6 +30,10 @@ struct Cli {
     /// Disable incremental cache (.kagami/cache.json)
     #[arg(long, global = true)]
     no_cache: bool,
+
+    /// Optional SCIP index file(s) (.scip or .scip.json) for compiler-exact edge precision
+    #[arg(long = "scip", global = true)]
+    scip_files: Vec<PathBuf>,
 
     /// Output format
     #[arg(long, global = true, value_enum, default_value = "md")]
@@ -167,7 +172,11 @@ fn main() -> Result<()> {
         } => {
             // Always index whole repo for blast-radius so cross-file/cross-lang callers are visible
             let files = discover_files(&root, &extra_ignores, path_filter.as_ref())?;
-            let graph = CodeGraph::build(&root, &files, !cli.no_cache)?;
+            let mut graph = CodeGraph::build(&root, &files, !cli.no_cache)?;
+            for scip_path in &cli.scip_files {
+                let idx = load_scip_file(scip_path)?;
+                apply_scip_overlay(&mut graph, &idx);
+            }
             let report = analyze_blast_radius(
                 &graph,
                 &file_path,
@@ -191,7 +200,11 @@ fn main() -> Result<()> {
         } => {
             // Index whole repo so callers outside --path still keep symbols alive
             let files = discover_files(&root, &extra_ignores, None)?;
-            let graph = CodeGraph::build(&root, &files, !cli.no_cache)?;
+            let mut graph = CodeGraph::build(&root, &files, !cli.no_cache)?;
+            for scip_path in &cli.scip_files {
+                let idx = load_scip_file(scip_path)?;
+                apply_scip_overlay(&mut graph, &idx);
+            }
             let langs = lang.map(|l| {
                 l.split(',')
                     .filter_map(Language::parse)

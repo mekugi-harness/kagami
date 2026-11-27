@@ -37,6 +37,7 @@ pub fn extract(rel_path: &str, src: &str, blake3_hex: String) -> Result<FileExtr
         &pkg,
         None,
         is_test_file,
+        false,
         &mut imports,
         &mut symbols,
         &mut refs,
@@ -65,6 +66,7 @@ fn walk_rust_items(
     pkg: &str,
     impl_type: Option<&str>,
     in_test_mod: bool,
+    in_trait_impl: bool,
     imports: &mut Vec<String>,
     symbols: &mut Vec<Symbol>,
     refs: &mut Vec<RawRef>,
@@ -100,6 +102,7 @@ fn walk_rust_items(
                         pkg,
                         impl_type,
                         sub_test,
+                        in_trait_impl,
                         imports,
                         symbols,
                         refs,
@@ -120,7 +123,8 @@ fn walk_rust_items(
                         rel_path,
                         pkg,
                         ty.as_deref(),
-                        in_test_mod || is_trait_impl, // trait impl methods are dynamic candidates
+                        in_test_mod,
+                        in_trait_impl || is_trait_impl,
                         imports,
                         symbols,
                         refs,
@@ -156,7 +160,7 @@ fn walk_rust_items(
                         visibility: vis,
                         is_test,
                         is_entrypoint,
-                        is_dynamic_candidate: impl_type.is_some() && vis == Visibility::Public,
+                        is_dynamic_candidate: in_trait_impl || (impl_type.is_some() && vis == Visibility::Public),
                         package_or_module: pkg.to_string(),
                     });
                     if let Some(body) = child.child_by_field_name("body") {
@@ -339,6 +343,19 @@ fn collect_rust_refs_and_bridges(
                         line,
                         confidence: Confidence::Heuristic,
                     });
+                }
+            }
+            "field_initializer" => {
+                if let Some(val) = n.child_by_field_name("value") {
+                    if val.kind() == "identifier" {
+                        refs.push(RawRef {
+                            from_symbol_id: from_id.to_string(),
+                            target_name: node_text(val, src).to_string(),
+                            qualifier: None,
+                            kind: EdgeKind::Calls,
+                            line,
+                        });
+                    }
                 }
             }
             "type_identifier" => {

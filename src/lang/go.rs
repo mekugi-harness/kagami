@@ -232,8 +232,18 @@ fn find_child_by_kind<'a>(node: Node<'a>, kind: &str) -> Option<Node<'a>> {
 fn collect_imports(node: Node<'_>, src: &str, imports: &mut Vec<String>) {
     let mut stack = vec![node];
     while let Some(n) = stack.pop() {
-        if n.kind() == "interpreted_string_literal" {
-            imports.push(strip_quotes(node_text(n, src)));
+        if n.kind() == "import_spec" {
+            let alias = n.child_by_field_name("name").map(|a| node_text(a, src).trim().to_string());
+            if let Some(path_node) = n.child_by_field_name("path") {
+                let path = strip_quotes(node_text(path_node, src));
+                if let Some(a) = alias {
+                    if a != "_" && a != "." {
+                        imports.push(format!("{}={}", a, path));
+                        continue;
+                    }
+                }
+                imports.push(path);
+            }
         } else {
             let mut c = n.walk();
             for ch in n.children(&mut c) {
@@ -354,6 +364,80 @@ fn collect_refs_and_bridges(
                         line: n.start_position().row + 1,
                         confidence: Confidence::Heuristic,
                     });
+                }
+            }
+            "keyed_element" => {
+                let mut kc = n.walk();
+                let named: Vec<_> = n.children(&mut kc).filter(|ch| ch.is_named()).collect();
+                if let Some(val_elem) = named.last() {
+                    let val = if val_elem.kind() == "literal_element" {
+                        val_elem.named_child(0).unwrap_or(*val_elem)
+                    } else {
+                        *val_elem
+                    };
+                    let line = val.start_position().row + 1;
+                    match val.kind() {
+                        "identifier" => {
+                            let target = node_text(val, src);
+                            if !matches!(target, "true" | "false" | "nil" | "iota") {
+                                refs.push(RawRef {
+                                    from_symbol_id: from_id.to_string(),
+                                    target_name: target.to_string(),
+                                    qualifier: None,
+                                    kind: EdgeKind::Calls,
+                                    line,
+                                });
+                            }
+                        }
+                        "selector_expression" => {
+                            let operand = val.child_by_field_name("operand").map(|o| node_text(o, src).to_string());
+                            let field = val.child_by_field_name("field").map(|f| node_text(f, src).to_string());
+                            if let Some(target) = field {
+                                refs.push(RawRef {
+                                    from_symbol_id: from_id.to_string(),
+                                    target_name: target,
+                                    qualifier: operand,
+                                    kind: EdgeKind::Calls,
+                                    line,
+                                });
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+            }
+            "argument_list" => {
+                let mut ac = n.walk();
+                for ch in n.children(&mut ac) {
+                    let line = ch.start_position().row + 1;
+                    match ch.kind() {
+                        "identifier" => {
+                            let target = node_text(ch, src);
+                            if !matches!(target, "true" | "false" | "nil" | "err" | "ctx" | "i" | "k" | "v") {
+                                refs.push(RawRef {
+                                    from_symbol_id: from_id.to_string(),
+                                    target_name: target.to_string(),
+                                    qualifier: None,
+                                    kind: EdgeKind::Calls,
+                                    line,
+                                });
+                            }
+                        }
+                        "selector_expression" => {
+                            let operand = ch.child_by_field_name("operand").map(|o| node_text(o, src).to_string());
+                            let field = ch.child_by_field_name("field").map(|f| node_text(f, src).to_string());
+                            if let Some(target) = field {
+                                refs.push(RawRef {
+                                    from_symbol_id: from_id.to_string(),
+                                    target_name: target,
+                                    qualifier: operand,
+                                    kind: EdgeKind::Calls,
+                                    line,
+                                });
+                            }
+                        }
+                        _ => {}
+                    }
                 }
             }
             "type_identifier" => {
