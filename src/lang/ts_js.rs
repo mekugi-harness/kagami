@@ -112,13 +112,21 @@ fn extract_ts_annotated_or_new_target(
     node: Node<'_>,
     src: &str,
     ctx: &TsRefContext,
+    prefer_value: bool,
 ) -> Option<ClassFieldTarget> {
-    node.child_by_field_name("value")
-        .and_then(|v| extract_ts_new_expr_target(v, src, ctx))
-        .or_else(|| {
-            node.child_by_field_name("type")
-                .and_then(|t| extract_ts_type_target(t, src, ctx))
-        })
+    let from_type = || {
+        node.child_by_field_name("type")
+            .and_then(|t| extract_ts_type_target(t, src, ctx))
+    };
+    let from_value = || {
+        node.child_by_field_name("value")
+            .and_then(|v| extract_ts_new_expr_target(v, src, ctx))
+    };
+    if prefer_value {
+        from_value().or_else(from_type)
+    } else {
+        from_type().or_else(from_value)
+    }
 }
 
 fn is_nullish_ts_type(node: Node<'_>, src: &str) -> bool {
@@ -240,7 +248,7 @@ fn extract_ts_class_fields(
                 ) {
                     continue;
                 }
-                if let Some(target) = extract_ts_annotated_or_new_target(member, src, ctx) {
+                if let Some(target) = extract_ts_annotated_or_new_target(member, src, ctx, true) {
                     let field_name = node_text(name_node, src).to_string();
                     if has_child_kind(member, "static") {
                         static_fields.insert(field_name, target);
@@ -277,7 +285,7 @@ fn extract_ts_class_fields(
                 if pat.kind() != "identifier" {
                     continue;
                 }
-                if let Some(target) = extract_ts_annotated_or_new_target(param, src, ctx) {
+                if let Some(target) = extract_ts_annotated_or_new_target(param, src, ctx, false) {
                     let param_name = node_text(pat, src).to_string();
                     ctor_param_types.insert(param_name.clone(), target.clone());
                     let is_param_prop = {

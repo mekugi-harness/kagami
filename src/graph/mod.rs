@@ -1135,8 +1135,8 @@ fn resolve_ts_module_file(qual: &str, known_files: &HashSet<&str>) -> Option<Str
 struct TsClassIndex {
     /// Class symbol ID -> (resolved_base_file, base_class_name)
     class_bases: HashMap<String, (String, String)>,
-    /// Re-export / default-export Script symbol ID -> (resolved_target_file, target_name)
-    reexports: HashMap<String, (String, String)>,
+    /// Re-export / default-export Script symbol ID -> unambiguous (resolved_target_file, target_name)
+    reexports: HashMap<String, Option<(String, String)>>,
 }
 
 impl TsClassIndex {
@@ -1146,7 +1146,7 @@ impl TsClassIndex {
         symbols: &HashMap<String, Symbol>,
     ) -> Self {
         let mut class_bases = HashMap::new();
-        let mut reexports = HashMap::new();
+        let mut reexports: HashMap<String, Option<(String, String)>> = HashMap::new();
 
         for ext in extracts {
             if !matches!(
@@ -1173,22 +1173,25 @@ impl TsClassIndex {
                 if from_sym.kind != SymbolKind::Script || from_sym.name == "<module>" {
                     continue;
                 }
-                if r.qualifier.is_none()
+                let target = if r.qualifier.is_none()
                     && let Some(target_sym) = symbols.get(&r.target_name)
                 {
-                    reexports.insert(
-                        from_sym.id.clone(),
-                        (target_sym.file.clone(), target_sym.name.clone()),
-                    );
+                    Some((target_sym.file.clone(), target_sym.name.clone()))
                 } else if let Some(ref qual) = r.qualifier {
-                    if let Some(tf) = resolve_ts_module_file(qual, known_files) {
-                        reexports.insert(from_sym.id.clone(), (tf, r.target_name.clone()));
-                    }
+                    resolve_ts_module_file(qual, known_files)
+                        .map(|tf| (tf, r.target_name.clone()))
                 } else {
-                    reexports.insert(
-                        from_sym.id.clone(),
-                        (ext.file.clone(), r.target_name.clone()),
-                    );
+                    Some((ext.file.clone(), r.target_name.clone()))
+                };
+                if let Some(target) = target {
+                    reexports
+                        .entry(from_sym.id.clone())
+                        .and_modify(|existing| {
+                            if existing.as_ref() != Some(&target) {
+                                *existing = None;
+                            }
+                        })
+                        .or_insert(Some(target));
                 }
             }
         }
@@ -1207,7 +1210,7 @@ impl TsClassIndex {
         symbols: &HashMap<String, Symbol>,
     ) -> (String, String) {
         let mut visited = HashSet::new();
-        for _ in 0..6 {
+        loop {
             let Some(sym_id) = by_file_name.get(&(file.as_str(), name.as_str())) else {
                 break;
             };
@@ -1220,7 +1223,7 @@ impl TsClassIndex {
             if !is_script {
                 break;
             }
-            if let Some((next_file, next_name)) = self.reexports.get(sym_id) {
+            if let Some(Some((next_file, next_name))) = self.reexports.get(sym_id) {
                 file = next_file.clone();
                 name = next_name.clone();
             } else {
@@ -1245,7 +1248,7 @@ impl TsClassIndex {
             symbols,
         );
         let mut visited_classes = HashSet::new();
-        for _ in 0..8 {
+        loop {
             let qname = format!("{}.{}", curr_class, method);
             if let Some(mid) = by_file_name.get(&(curr_file.as_str(), qname.as_str())) {
                 return Some(mid.clone());
@@ -1262,7 +1265,6 @@ impl TsClassIndex {
             (curr_file, curr_class) =
                 self.follow_aliases(base_file.clone(), base_name.clone(), by_file_name, symbols);
         }
-        None
     }
 }
 

@@ -4055,6 +4055,32 @@ new Consumer().run();
     let ignores = KagamiConfig::default().build_ignore_globset().unwrap();
     let files = discover_files(root, &ignores, None).unwrap();
     let graph = CodeGraph::build(root, &files, false).unwrap();
+    for (from_q, to_q) in [
+        ("Consumer.run", "BaseWorker.baseRun"),
+        ("Consumer.run", "SubWorker.overriddenRun"),
+        ("Consumer.run", "FastWorker.work"),
+        ("Consumer.run", "RealWorker.serve"),
+        ("Consumer.run", "NullishFirstSvc.ping"),
+        ("Consumer.run", "DefaultExportedSvc.handle"),
+        ("Consumer.run", "RealAliasedSvc.invoke"),
+        ("Consumer.run", "Consumer.makeBase"),
+    ] {
+        let has_edge = graph.edges.iter().any(|e| {
+            graph
+                .symbols
+                .get(&e.from)
+                .is_some_and(|s| s.qualified_name == from_q)
+                && graph
+                    .symbols
+                    .get(&e.to)
+                    .is_some_and(|s| s.qualified_name == to_q)
+                && e.confidence == Confidence::Resolved
+        });
+        assert!(
+            has_edge,
+            "Expected {from_q} -> {to_q} at Confidence::Resolved"
+        );
+    }
     let dead = analyze_dead(
         &graph,
         &DeadOptions {
