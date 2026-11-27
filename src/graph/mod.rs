@@ -71,12 +71,14 @@ impl CodeGraph {
 
     pub fn from_extracts(extracts: Vec<FileExtract>) -> Self {
         let mut symbols: HashMap<String, Symbol> = HashMap::new();
+        let mut known_files: HashSet<&str> = HashSet::new();
         let mut by_file_name: HashMap<(&str, &str), String> = HashMap::new();
         let mut by_pkg_name: HashMap<(Language, &str, &str), Vec<String>> = HashMap::new();
         let mut by_lang_name: HashMap<(Language, &str), Vec<String>> = HashMap::new();
         let mut by_lang_qname: HashMap<(Language, &str), Vec<String>> = HashMap::new();
 
         for ext in &extracts {
+            known_files.insert(ext.file.as_str());
             for sym in &ext.symbols {
                 symbols.insert(sym.id.clone(), sym.clone());
             }
@@ -158,6 +160,7 @@ impl CodeGraph {
                     r,
                     &alias_map,
                     &rel_import_paths,
+                    &known_files,
                     &symbols,
                     &by_file_name,
                     &by_pkg_name,
@@ -213,6 +216,7 @@ fn resolve_ref(
     r: &crate::model::RawRef,
     alias_map: &HashMap<&str, &str>,
     rel_import_paths: &HashSet<String>,
+    known_files: &HashSet<&str>,
     symbols: &HashMap<String, Symbol>,
     by_file_name: &HashMap<(&str, &str), String>,
     by_pkg_name: &HashMap<(Language, &str, &str), Vec<String>>,
@@ -238,25 +242,32 @@ fn resolve_ref(
             return vec![(id.clone(), Confidence::Resolved)];
         }
         if rel_import_paths.contains(qual.as_str()) {
-            for suffix in [
-                ".ts",
-                ".tsx",
-                ".js",
-                ".jsx",
-                ".mjs",
-                ".cjs",
-                "/index.ts",
-                "/index.tsx",
-                "/index.js",
-            ] {
-                let cand_file = format!("{}{}", qual, suffix);
-                if let Some(id) = by_file_name.get(&(cand_file.as_str(), r.target_name.as_str())) {
+            // Select the first existing target module by path priority before looking up the binding
+            // so we never fall through to a lower-priority file (e.g. worker/index.ts when worker.ts exists).
+            let target_file = if known_files.contains(qual.as_str()) {
+                Some(qual.clone())
+            } else {
+                [
+                    ".ts",
+                    ".tsx",
+                    ".js",
+                    ".jsx",
+                    ".mjs",
+                    ".cjs",
+                    "/index.ts",
+                    "/index.tsx",
+                    "/index.js",
+                ]
+                .iter()
+                .map(|suffix| format!("{}{}", qual, suffix))
+                .find(|cand| known_files.contains(cand.as_str()))
+            };
+            if let Some(tf) = target_file {
+                if let Some(id) = by_file_name.get(&(tf.as_str(), r.target_name.as_str())) {
                     return vec![(id.clone(), Confidence::Resolved)];
                 }
             }
-            if qual.ends_with(".svelte") {
-                return Vec::new();
-            }
+            return Vec::new();
         }
         if qual.ends_with(".svelte")
             && (r.kind == EdgeKind::TemplateRef || r.target_name == "<script:module>")
@@ -329,28 +340,23 @@ fn resolve_ref(
                 found_method = true;
             }
         }
-        // Fall back to same-package methods when same-file lookup finds nothing
-        if !found_method && !ext.package_or_module.is_empty() {
-            if let Some(ids) = by_pkg_name.get(&(ext.lang, ext.package_or_module.as_str(), r.target_name.as_str())) {
-                let pkg_methods: Vec<String> = ids
-                    .iter()
-                    .filter(|id| symbols.get(*id).map(|s| s.kind == SymbolKind::Method).unwrap_or(false))
-                    .cloned()
-                    .collect();
-                if !pkg_methods.is_empty() && pkg_methods.len() <= 4 {
-                    for id in pkg_methods {
-                        results.push((id, Confidence::Resolved));
+        // Fall back to combined same-package + imported-package methods when same-file lookup finds
+        // nothing, so an unrelated same-package method never shadows an imported receiver's method.
+        if !found_method {
+            let mut seen_methods: HashSet<String> = HashSet::new();
+            let mut candidate_methods: Vec<String> = Vec::new();
+            if !ext.package_or_module.is_empty() {
+                if let Some(ids) = by_pkg_name.get(&(ext.lang, ext.package_or_module.as_str(), r.target_name.as_str())) {
+                    for id in ids {
+                        if symbols.get(id).map(|s| s.kind == SymbolKind::Method).unwrap_or(false)
+                            && seen_methods.insert(id.clone())
+                        {
+                            candidate_methods.push(id.clone());
+                        }
                     }
-                    found_method = true;
                 }
             }
-        }
-        // Fall back to imported-package methods for cross-package receiver-variable calls
-        // (e.g. SelectionHints.ActionAt(...) where SelectionHints is a receiver var, not a package alias)
-        if !found_method && !alias_map.is_empty() {
             let mut seen_imps: HashSet<&str> = HashSet::new();
-            let mut seen_methods: HashSet<String> = HashSet::new();
-            let mut imported_methods: Vec<String> = Vec::new();
             for &imp_path in alias_map.values() {
                 if !seen_imps.insert(imp_path) {
                     continue;
@@ -369,15 +375,20 @@ fn resolve_ref(
                                 })
                                 .unwrap_or(false);
                             if is_matching_method && seen_methods.insert(id.clone()) {
-                                imported_methods.push(id.clone());
+                                candidate_methods.push(id.clone());
                             }
                         }
                     }
                 }
             }
-            if !imported_methods.is_empty() && imported_methods.len() <= 4 {
-                for id in imported_methods {
-                    results.push((id, Confidence::Resolved));
+            if !candidate_methods.is_empty() && candidate_methods.len() <= 4 {
+                let conf = if candidate_methods.len() == 1 {
+                    Confidence::Resolved
+                } else {
+                    Confidence::Heuristic
+                };
+                for id in candidate_methods {
+                    results.push((id, conf));
                 }
             }
         }

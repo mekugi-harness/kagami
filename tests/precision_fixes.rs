@@ -217,3 +217,62 @@ fn test_ts_richer_ir_lowering_and_equivalence() {
     let score = pair_similarity(&ext_a.ir_funcs[0], &ext_b.ir_funcs[0], false);
     assert!(score >= 0.95, "expected high similarity for equivalent TS funcs, got {}", score);
 }
+
+#[test]
+fn test_review_fixes_default_export_shadowing_typeof_and_computed_key() {
+    let dir = TempDir::new().unwrap();
+    let root = dir.path();
+    fs::create_dir_all(root.join("src/worker")).unwrap();
+
+    // Renamed default export + shadowed parameter + typeof type query + module path priority
+    fs::write(
+        root.join("src/worker.ts"),
+        "export default function initialize() {}\nexport { run } from \"./impl\";\n",
+    ).unwrap();
+    fs::write(
+        root.join("src/worker/index.ts"),
+        "export function run() {}\n",
+    ).unwrap();
+    let tag_open = concat!("<", "script lang=\"ts\">");
+    let tag_close = concat!("</", "script>");
+    fs::write(
+        root.join("src/UnusedComp.svelte"),
+        format!("{}\nfunction unusedWork() {{}}\n{}\n<div>No</div>\n", tag_open, tag_close),
+    ).unwrap();
+    fs::write(
+        root.join("src/main.ts"),
+        "import start from \"./worker\";\nimport { run as launch } from \"./worker\";\nimport UnusedComp from \"./UnusedComp.svelte\";\ntype CompType = typeof UnusedComp;\nfunction preview(UnusedComp: unknown) { return UnusedComp; }\nstart();\nlaunch();\npreview(null);\n",
+    ).unwrap();
+
+    let ignores = KagamiConfig::default().build_ignore_globset().unwrap();
+    let files = discover_files(root, &ignores, None).unwrap();
+    let graph = CodeGraph::build(root, &files, false).unwrap();
+    let dead = analyze_dead(
+        &graph,
+        &DeadOptions {
+            scope: DeadScope::Prod,
+            langs: None,
+            allowlist: Default::default(),
+            include_clusters: true,
+            path_filter: None,
+            min_confidence: Confidence::Heuristic,
+        },
+    );
+    let has = |file: &str, sym: &str| dead.symbols.iter().any(|s| s.file == file && s.symbol == sym);
+    assert!(!has("src/worker.ts", "initialize"), "renamed default import start() must keep initialize alive");
+    assert!(has("src/UnusedComp.svelte", "UnusedComp"), "typeof and shadowed param must not keep UnusedComp alive");
+    assert!(has("src/worker/index.ts", "run"), "import from ./worker must not falsely link worker/index.ts when worker.ts exists");
+
+    // Computed object key rename equivalence + spread vs non-spread distinction
+    let c1 = "function f1(k: string, v: number) { return { [k]: v }; }\n";
+    let c2 = "function f2(key: string, val: number) { return { [key]: val }; }\n";
+    let ec1 = lang::extract_file("c1.ts", Language::TypeScript, c1, "c1".into()).unwrap();
+    let ec2 = lang::extract_file("c2.ts", Language::TypeScript, c2, "c2".into()).unwrap();
+    assert!(pair_similarity(&ec1.ir_funcs[0], &ec2.ir_funcs[0], false) >= 0.99);
+
+    let s1 = "function g1(xs: number[]) { return send(...xs); }\n";
+    let s2 = "function g2(xs: number[]) { return send(xs); }\n";
+    let es1 = lang::extract_file("s1.ts", Language::TypeScript, s1, "s1".into()).unwrap();
+    let es2 = lang::extract_file("s2.ts", Language::TypeScript, s2, "s2".into()).unwrap();
+    assert!(pair_similarity(&es1.ir_funcs[0], &es2.ir_funcs[0], false) < 1.0);
+}
