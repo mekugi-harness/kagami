@@ -131,6 +131,7 @@ pub struct RustTypeIndex<'a> {
     /// Wrapper type ID -> already-resolved Deref target type IDs (resolved in impl Deref scope).
     deref_target_ids: HashMap<String, Vec<String>>,
     func_return_types: HashMap<String, Vec<String>>,
+    func_callback_params: HashMap<String, Vec<(usize, usize, String)>>,
     pub trait_methods: HashMap<String, HashSet<String>>,
     cfg_sibling_groups: HashMap<String, Vec<String>>,
 }
@@ -158,6 +159,7 @@ impl<'a> RustTypeIndex<'a> {
         let mut raw_deref_by_name: HashMap<(&'a str, &'a str, String), Vec<String>> =
             HashMap::new();
         let mut func_return_types: HashMap<String, Vec<String>> = HashMap::new();
+        let mut func_callback_params: HashMap<String, Vec<(usize, usize, String)>> = HashMap::new();
         let mut trait_methods: HashMap<String, HashSet<String>> = HashMap::new();
         let mut trait_method_ids: HashSet<&str> = HashSet::new();
         let mut cfg_gated_scopes: HashMap<&str, &str> = HashMap::new();
@@ -191,6 +193,9 @@ impl<'a> RustTypeIndex<'a> {
             }
             for (k, v) in &ext.func_return_types {
                 func_return_types.insert(k.clone(), v.clone());
+            }
+            for (k, v) in &ext.func_callback_params {
+                func_callback_params.insert(k.clone(), v.clone());
             }
             for (k, v) in &ext.interface_methods {
                 trait_methods.insert(k.clone(), v.iter().cloned().collect());
@@ -293,6 +298,7 @@ impl<'a> RustTypeIndex<'a> {
             raw_struct_fields,
             deref_target_ids: HashMap::new(),
             func_return_types,
+            func_callback_params,
             trait_methods,
             cfg_sibling_groups: HashMap::new(),
         };
@@ -547,60 +553,10 @@ impl<'a> RustTypeIndex<'a> {
         {
             return Some(id.clone());
         }
-        if let Some(uses) = self.file_all_uses.get(owner_file) {
-            for u in uses {
-                if u.local_name == type_name
-                    && !u.is_test
-                    && (u.mod_scope == caller_scope || u.mod_scope.is_empty())
-                    && let Some((mod_path, target_sym)) = u.target_path.rsplit_once("::")
-                {
-                    if mod_path == "super" && !u.mod_scope.is_empty() {
-                        let parent_scope =
-                            u.mod_scope.rsplit_once("::").map(|(p, _)| p).unwrap_or("");
-                        if let Some(ids) = self.file_non_method_syms.get(&(owner_file, target_sym))
-                        {
-                            let hits: Vec<&String> = ids
-                                .iter()
-                                .filter(|id| {
-                                    self.symbol_mod_scopes
-                                        .get(id.as_str())
-                                        .map(String::as_str)
-                                        .unwrap_or("")
-                                        == parent_scope
-                                        && symbols.get(*id).is_some_and(|s| {
-                                            !s.is_test
-                                                && matches!(
-                                                    s.kind,
-                                                    SymbolKind::Struct
-                                                        | SymbolKind::Enum
-                                                        | SymbolKind::Type
-                                                        | SymbolKind::Trait
-                                                )
-                                        })
-                                })
-                                .collect();
-                            if hits.len() == 1 {
-                                return Some(hits[0].clone());
-                            }
-                        }
-                    }
-                    let mut hits = Vec::new();
-                    let mut visited = HashSet::new();
-                    self.resolve_mod_path_into(
-                        owner_file,
-                        mod_path,
-                        target_sym,
-                        true,
-                        symbols,
-                        0,
-                        &mut visited,
-                        &mut hits,
-                    );
-                    if hits.len() == 1 {
-                        return Some(hits.remove(0));
-                    }
-                }
-            }
+        if let Some(id) =
+            self.resolve_imported_type_in_scope(owner_file, type_name, caller_scope, true, symbols)
+        {
+            return Some(id);
         }
         let cands = self.types_by_name.get(type_name)?;
         if cands.len() == 1 {
@@ -619,6 +575,90 @@ impl<'a> RustTypeIndex<'a> {
             return Some(matched[0].clone());
         }
         None
+    }
+
+    fn resolve_imported_type_in_scope(
+        &self,
+        owner_file: &str,
+        type_name: &str,
+        caller_scope: &str,
+        include_root_uses: bool,
+        symbols: &HashMap<String, Symbol>,
+    ) -> Option<String> {
+        let uses = self.file_all_uses.get(owner_file)?;
+        let mut scoped_resolved: Vec<String> = Vec::new();
+        let mut root_resolved: Vec<String> = Vec::new();
+        for u in uses {
+            let is_exact = u.mod_scope == caller_scope;
+            let is_root_fallback =
+                include_root_uses && !caller_scope.is_empty() && u.mod_scope.is_empty();
+            if u.local_name == type_name
+                && !u.is_test
+                && (is_exact || is_root_fallback)
+                && let Some((mod_path, target_sym)) = u.target_path.rsplit_once("::")
+            {
+                let bucket = if is_exact {
+                    &mut scoped_resolved
+                } else {
+                    &mut root_resolved
+                };
+                if mod_path == "super" && !u.mod_scope.is_empty() {
+                    let parent_scope = u.mod_scope.rsplit_once("::").map(|(p, _)| p).unwrap_or("");
+                    if let Some(ids) = self.file_non_method_syms.get(&(owner_file, target_sym)) {
+                        let hits: Vec<&String> = ids
+                            .iter()
+                            .filter(|id| {
+                                self.symbol_mod_scopes
+                                    .get(id.as_str())
+                                    .map(String::as_str)
+                                    .unwrap_or("")
+                                    == parent_scope
+                                    && symbols.get(*id).is_some_and(|s| {
+                                        !s.is_test
+                                            && matches!(
+                                                s.kind,
+                                                SymbolKind::Struct
+                                                    | SymbolKind::Enum
+                                                    | SymbolKind::Type
+                                                    | SymbolKind::Trait
+                                            )
+                                    })
+                            })
+                            .collect();
+                        if hits.len() == 1 {
+                            push_unique(bucket, hits[0].clone());
+                            continue;
+                        }
+                    }
+                }
+                let mut hits = Vec::new();
+                let mut visited = HashSet::new();
+                self.resolve_mod_path_into(
+                    owner_file,
+                    mod_path,
+                    target_sym,
+                    true,
+                    symbols,
+                    0,
+                    &mut visited,
+                    &mut hits,
+                );
+                if hits.len() == 1 {
+                    push_unique(bucket, hits.remove(0));
+                }
+            }
+        }
+        if !scoped_resolved.is_empty() {
+            if scoped_resolved.len() == 1 {
+                scoped_resolved.pop()
+            } else {
+                None
+            }
+        } else if root_resolved.len() == 1 {
+            root_resolved.pop()
+        } else {
+            None
+        }
     }
 
     fn unwrap_type_alias(
@@ -1321,11 +1361,17 @@ impl<'a> RustTypeIndex<'a> {
                 .get(owner.file.as_str())
                 .copied()
                 .unwrap_or(&[]);
-            if let Some(raw_fty) = self
-                .raw_struct_fields
-                .get(&curr_id)
-                .and_then(|f| f.get(field_name))
-                && !raw_fty.is_empty()
+            if let Some(raw_fty) = self.raw_struct_fields.get(&curr_id).and_then(|f| {
+                f.get(field_name).or_else(|| {
+                    if owner.kind == SymbolKind::Struct {
+                        field_name
+                            .rsplit_once("::")
+                            .and_then(|(_, fname)| f.get(fname))
+                    } else {
+                        None
+                    }
+                })
+            }) && !raw_fty.is_empty()
             {
                 return self.resolve_type_with_slices(
                     &owner.file,
@@ -1424,76 +1470,172 @@ impl<'a> RustTypeIndex<'a> {
         by_pkg_name: &HashMap<(Language, &str, &str), Vec<String>>,
         symbols: &HashMap<String, Symbol>,
     ) -> Option<(String, usize)> {
+        if let Some(fn_id) = self.resolve_callee_func_id(
+            ext,
+            caller_id,
+            qualifier,
+            name,
+            by_file_name,
+            by_pkg_name,
+            symbols,
+        ) {
+            let fn_sym = symbols.get(&fn_id)?;
+            if let Some(ret_ty) = self
+                .func_return_types
+                .get(&fn_id)
+                .and_then(|v| v.get(result_index))
+                .filter(|s| !s.is_empty())
+            {
+                let imps = self
+                    .file_imports
+                    .get(fn_sym.file.as_str())
+                    .copied()
+                    .unwrap_or(&[]);
+                if let Some(res) = self.resolve_type_with_slices(
+                    &fn_sym.file,
+                    &fn_sym.package_or_module,
+                    imps,
+                    ret_ty,
+                    symbols,
+                ) {
+                    return Some(res);
+                }
+            }
+        }
+        if let Some(q) = qualifier
+            && let Some(tid) =
+                self.resolve_type(&ext.file, &ext.package_or_module, &ext.imports, q, symbols)
+        {
+            let methods = self.lookup_methods_on_type(&tid, name, false);
+            if methods.is_empty()
+                && (name == "new"
+                    || name == "default"
+                    || name == "from"
+                    || name.starts_with("new_")
+                    || name.starts_with("with_")
+                    || name.starts_with("from_")
+                    || matches!(name, "open" | "connect" | "build" | "init"))
+            {
+                return Some((tid, 0));
+            }
+        }
+        // Tuple struct constructor call: e.g. SlotPair(a, b) or mod_a::SlotPair(a, b).
+        if name.chars().next().is_some_and(|c| c.is_ascii_uppercase()) {
+            let caller_scope = self
+                .symbol_mod_scopes
+                .get(caller_id)
+                .map(String::as_str)
+                .unwrap_or("");
+            if qualifier.is_none()
+                && let Some(ids) = self.file_non_method_syms.get(&(ext.file.as_str(), name))
+            {
+                let scoped: Vec<&String> = ids
+                    .iter()
+                    .filter(|id| {
+                        self.symbol_mod_scopes
+                            .get(id.as_str())
+                            .map(String::as_str)
+                            .unwrap_or("")
+                            == caller_scope
+                            && symbols
+                                .get(*id)
+                                .is_some_and(|s| !s.is_test && s.kind == SymbolKind::Struct)
+                    })
+                    .collect();
+                if scoped.len() == 1 {
+                    return Some((scoped[0].clone(), 0));
+                }
+            }
+            if qualifier.is_none()
+                && !caller_scope.is_empty()
+                && let Some(tid) = self.resolve_imported_type_in_scope(
+                    &ext.file,
+                    name,
+                    caller_scope,
+                    false,
+                    symbols,
+                )
+            {
+                return Some((tid, 0));
+            }
+            if qualifier.is_some() || caller_scope.is_empty() {
+                let type_name = match qualifier {
+                    Some(q) => format!("{q}::{name}"),
+                    None => name.to_string(),
+                };
+                if let Some(res) = self.resolve_type_with_slices_in_scope(
+                    &ext.file,
+                    &ext.package_or_module,
+                    &ext.imports,
+                    &type_name,
+                    caller_scope,
+                    symbols,
+                ) {
+                    return Some(res);
+                }
+            }
+        }
+        None
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn resolve_callee_func_id(
+        &self,
+        ext: &FileExtract,
+        caller_id: &str,
+        qualifier: Option<&str>,
+        name: &str,
+        by_file_name: &HashMap<(&str, &str), String>,
+        by_pkg_name: &HashMap<(Language, &str, &str), Vec<String>>,
+        symbols: &HashMap<String, Symbol>,
+    ) -> Option<String> {
         if let Some(q) = qualifier {
             if let Some(tid) =
                 self.resolve_type(&ext.file, &ext.package_or_module, &ext.imports, q, symbols)
             {
                 let methods = self.lookup_methods_on_type(&tid, name, false);
-                if let Some(mid) = methods.first()
-                    && let Some(msym) = symbols.get(mid)
-                    && let Some(ret_ty) = self
-                        .func_return_types
-                        .get(mid)
-                        .and_then(|v| v.get(result_index))
-                        .filter(|s| !s.is_empty())
-                {
-                    let imps = self
-                        .file_imports
-                        .get(msym.file.as_str())
-                        .copied()
-                        .unwrap_or(&[]);
-                    if let Some(res) = self.resolve_type_with_slices(
-                        &msym.file,
-                        &msym.package_or_module,
-                        imps,
-                        ret_ty,
-                        symbols,
-                    ) {
-                        return Some(res);
-                    }
-                }
-                if methods.is_empty()
-                    && (name == "new"
-                        || name == "default"
-                        || name == "from"
-                        || name.starts_with("new_")
-                        || name.starts_with("with_")
-                        || name.starts_with("from_")
-                        || matches!(name, "open" | "connect" | "build" | "init"))
-                {
-                    return Some((tid, 0));
+                if let Some(mid) = methods.first() {
+                    return Some(mid.clone());
                 }
             }
             if q.chars().next().is_some_and(|c| c.is_ascii_lowercase()) {
                 let hits =
                     self.resolve_qualified_path(&ext.file, caller_id, q, name, false, symbols);
-                if let Some((fn_id, _)) = hits.first()
-                    && let Some(fn_sym) = symbols.get(fn_id)
-                    && let Some(ret_ty) = self
-                        .func_return_types
-                        .get(fn_id)
-                        .and_then(|v| v.get(result_index))
-                        .filter(|s| !s.is_empty())
+                if let Some((fn_id, _)) = hits.first() {
+                    return Some(fn_id.clone());
+                }
+                // Resolve inline module function calls (e.g. api::with_aliased_worker)
+                // from file root scope without intercepting dot-calls or crate::-prefixed paths.
+                let caller_scope = self
+                    .symbol_mod_scopes
+                    .get(caller_id)
+                    .map(String::as_str)
+                    .unwrap_or("");
+                if caller_scope.is_empty()
+                    && let Some(ids) = self.file_non_method_syms.get(&(ext.file.as_str(), name))
                 {
-                    let imps = self
-                        .file_imports
-                        .get(fn_sym.file.as_str())
-                        .copied()
-                        .unwrap_or(&[]);
-                    return self.resolve_type_with_slices(
-                        &fn_sym.file,
-                        &fn_sym.package_or_module,
-                        imps,
-                        ret_ty,
-                        symbols,
-                    );
+                    let inline_hits: Vec<&String> = ids
+                        .iter()
+                        .filter(|id| {
+                            self.symbol_mod_scopes
+                                .get(id.as_str())
+                                .map(String::as_str)
+                                .unwrap_or("")
+                                == q
+                                && symbols
+                                    .get(*id)
+                                    .is_some_and(|s| !s.is_test && s.kind == SymbolKind::Function)
+                        })
+                        .collect();
+                    if inline_hits.len() == 1 {
+                        return Some(inline_hits[0].clone());
+                    }
                 }
             }
             return None;
         }
 
-        let fn_id = self
-            .resolve_bare_call(&ext.file, caller_id, name, false, symbols)
+        self.resolve_bare_call(&ext.file, caller_id, name, false, symbols)
             .into_iter()
             .map(|(id, _)| id)
             .find(|id| {
@@ -1525,23 +1667,52 @@ impl<'a> RustTypeIndex<'a> {
                         })
                     })
                     .cloned()
-            })?;
-        let fn_sym = symbols.get(&fn_id)?;
-        let ret_ty = self
-            .func_return_types
-            .get(&fn_id)
-            .and_then(|v| v.get(result_index))
+            })
+    }
+
+    fn resolve_callback_param_on_func(
+        &self,
+        fn_id: &str,
+        arg_index: usize,
+        param_index: usize,
+        allow_ufcs_receiver_shift: bool,
+        symbols: &HashMap<String, Symbol>,
+    ) -> Option<(String, usize)> {
+        let fn_sym = symbols.get(fn_id)?;
+        let entries = self.func_callback_params.get(fn_id)?;
+        let param_ty = entries
+            .iter()
+            .find(|(ai, pi, _)| *ai == arg_index && *pi == param_index)
+            .or_else(|| {
+                if allow_ufcs_receiver_shift
+                    && fn_sym.kind == SymbolKind::Method
+                    && let Some(shifted) = arg_index.checked_sub(1)
+                {
+                    entries
+                        .iter()
+                        .find(|(ai, pi, _)| *ai == shifted && *pi == param_index)
+                } else {
+                    None
+                }
+            })
+            .map(|(_, _, ty)| ty.as_str())
             .filter(|s| !s.is_empty())?;
         let imps = self
             .file_imports
             .get(fn_sym.file.as_str())
             .copied()
             .unwrap_or(&[]);
-        self.resolve_type_with_slices(
+        let fn_scope = self
+            .symbol_mod_scopes
+            .get(fn_id)
+            .map(String::as_str)
+            .unwrap_or("");
+        self.resolve_type_with_slices_in_scope(
             &fn_sym.file,
             &fn_sym.package_or_module,
             imps,
-            ret_ty,
+            param_ty,
+            fn_scope,
             symbols,
         )
     }
@@ -1585,6 +1756,29 @@ impl<'a> RustTypeIndex<'a> {
                 by_pkg_name,
                 symbols,
             )?,
+            ReceiverStep::ClosureParam {
+                qualifier,
+                name,
+                arg_index,
+                param_index,
+            } => {
+                let fn_id = self.resolve_callee_func_id(
+                    ext,
+                    caller_id,
+                    qualifier.as_deref(),
+                    name,
+                    by_file_name,
+                    by_pkg_name,
+                    symbols,
+                )?;
+                self.resolve_callback_param_on_func(
+                    &fn_id,
+                    *arg_index,
+                    *param_index,
+                    qualifier.is_some(),
+                    symbols,
+                )?
+            }
             _ => return None,
         };
 
@@ -1631,9 +1825,6 @@ impl<'a> RustTypeIndex<'a> {
                     }
                     // Fallback for stdlib/smart-pointer/collection wrapper methods when no local
                     // method of that name exists on the receiver type.
-                    if is_transparent_wrapper_method(name) {
-                        continue;
-                    }
                     if state.1 > 0 {
                         if matches!(
                             name.as_str(),
@@ -1664,9 +1855,39 @@ impl<'a> RustTypeIndex<'a> {
                             continue;
                         }
                     }
+                    if is_transparent_wrapper_method(name) || (state.1 == 0 && name == "get_mut") {
+                        continue;
+                    }
                     return None;
                 }
-                ReceiverStep::Type(_) | ReceiverStep::Call { .. } => return None,
+                ReceiverStep::ClosureParam {
+                    qualifier: None,
+                    name,
+                    arg_index,
+                    param_index,
+                } => {
+                    if state.1 != 0 {
+                        return None;
+                    }
+                    let methods = self.lookup_methods_on_type(&state.0, name, false);
+                    let mut resolved = None;
+                    for mid in &methods {
+                        if let Some(res) = self.resolve_callback_param_on_func(
+                            mid,
+                            *arg_index,
+                            *param_index,
+                            false,
+                            symbols,
+                        ) {
+                            resolved = Some(res);
+                            break;
+                        }
+                    }
+                    state = resolved?;
+                }
+                ReceiverStep::Type(_)
+                | ReceiverStep::Call { .. }
+                | ReceiverStep::ClosureParam { .. } => return None,
             }
         }
         Some(state)
@@ -1704,10 +1925,23 @@ fn is_transparent_wrapper_method(name: &str) -> bool {
             | "as_deref_mut"
             | "unwrap"
             | "expect"
+            | "unwrap_or"
+            | "unwrap_or_else"
+            | "unwrap_or_default"
             | "ok"
+            | "ok_or"
+            | "ok_or_else"
+            | "upgrade"
+            | "inspect"
+            | "inspect_err"
+            | "map_err"
+            | "context"
+            | "with_context"
             | "into_inner"
             | "deref"
             | "deref_mut"
+            | "get_ref"
+            | "take"
             | "pin"
             | "load"
             | "load_full"

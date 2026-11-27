@@ -133,6 +133,15 @@ pub enum ReceiverStep {
     },
     /// Element access via indexing (x[i]) or range iteration on a slice/array/map.
     Elem,
+    /// Callback parameter type inferred from a callee's Fn/FnMut/FnOnce parameter signature.
+    /// When used as the first step, resolves a free or scoped function call; when used after
+    /// another step, resolves a method call on the current receiver type.
+    ClosureParam {
+        qualifier: Option<String>,
+        name: String,
+        arg_index: usize,
+        param_index: usize,
+    },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -223,6 +232,10 @@ pub struct FileExtract {
     /// Function or method symbol ID -> return type names by result position (empty string if unknown/builtin).
     #[serde(default)]
     pub func_return_types: HashMap<String, Vec<String>>,
+    /// Function or method symbol ID -> callback parameter types:
+    /// Vec of (arg_index_excluding_self, closure_param_index, normalized_type_name).
+    #[serde(default)]
+    pub func_callback_params: HashMap<String, Vec<(usize, usize, String)>>,
     /// Explicit trait implementations (e.g. Rust impl Trait for Type).
     #[serde(default)]
     pub trait_impls: Vec<TraitImplInfo>,

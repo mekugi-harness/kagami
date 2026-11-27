@@ -97,6 +97,7 @@ pub fn extract(
         type_aliases: std::collections::HashMap::new(),
         rust_uses: Vec::new(),
         symbol_mod_scopes: std::collections::HashMap::new(),
+        func_callback_params: std::collections::HashMap::new(),
     })
 }
 

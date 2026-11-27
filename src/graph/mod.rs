@@ -900,7 +900,9 @@ impl<'a> GoTypeIndex<'a> {
                         symbols,
                     )?;
                 }
-                ReceiverStep::Type(_) | ReceiverStep::Call { .. } => return None,
+                ReceiverStep::Type(_)
+                | ReceiverStep::Call { .. }
+                | ReceiverStep::ClosureParam { .. } => return None,
             }
         }
         Some(state)
