@@ -2987,3 +2987,665 @@ mod tests {
         );
     }
 }
+#[test]
+fn test_ts_js_function_value_refs_getters_and_lexical_shadowing() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    std::fs::create_dir_all(root.join("src/__tests__")).unwrap();
+
+    std::fs::write(
+        root.join("src/helpers.ts"),
+        r#"
+export function importedCallback(x: number): number {
+  return x + 1;
+}
+
+export function testOnlyProdFn(): number {
+  return 42;
+}
+
+export function testOnlyCallback(x: number): number {
+  return x * 2;
+}
+
+export function unrelatedFreeFn(): string {
+  return "never-called";
+}
+
+export class StateBox {
+  get preset(): string {
+    return "zen";
+  }
+
+  get unusedGetter(): string {
+    return "dead";
+  }
+}
+
+export class Delegate {
+  authorize(token: string): boolean {
+    return token.length > 0;
+  }
+
+  deadDelegate(): void {}
+}
+"#,
+    )
+    .unwrap();
+
+    std::fs::write(
+        root.join("src/main.ts"),
+        r#"
+import { importedCallback, StateBox, Delegate } from "./helpers";
+
+function onLinkClick(_e: Event) {}
+function mapItem(x: number) { return x * 2; }
+function filterItem(x: number) { return x > 0; }
+function eachItem(_x: number) {}
+function timerCb() {}
+function objValFn() {}
+function shorthandFn() {}
+function assignedFn() {}
+function returnedFn() {}
+function arrayFn() {}
+function deadShadowedParam() {}
+function deadShadowedBlock() {}
+function trulyDeadTsFn() {}
+
+class Wrapper {
+  private inner = new Delegate();
+  authorize(token: string): boolean {
+    return this.inner.authorize(token);
+  }
+}
+
+function getReturned() {
+  return returnedFn;
+}
+
+function runShadowCheck(deadShadowedParam: () => void) {
+  deadShadowedParam();
+  {
+    const deadShadowedBlock = () => {};
+    deadShadowedBlock();
+  }
+}
+
+function boot(node: HTMLElement, box: StateBox, obj: { unrelatedFreeFn: number }) {
+  node.addEventListener("click", onLinkClick);
+  node.removeEventListener("click", onLinkClick);
+  [1, 2, 3].map(mapItem).filter(filterItem).forEach(eachItem);
+  [1, 2].map(importedCallback);
+  setTimeout(timerCb, 10);
+  const handlers = { handler: objValFn, shorthandFn };
+  const ref = assignedFn;
+  const arr = [arrayFn];
+  const _ret = getReturned();
+  const _preset = box.preset;
+  const _prop = obj.unrelatedFreeFn;
+  const w = new Wrapper();
+  w.authorize("tok");
+  runShadowCheck(() => {});
+  void handlers;
+  void ref;
+  void arr;
+  void _ret;
+  void _preset;
+  void _prop;
+}
+
+boot(document.body, new StateBox(), { unrelatedFreeFn: 1 });
+"#,
+    )
+    .unwrap();
+
+    // Test-only callers MUST NOT keep production TS functions alive
+    std::fs::write(
+        root.join("src/helpers.test.ts"),
+        r#"
+import { testOnlyProdFn, testOnlyCallback } from "./helpers";
+testOnlyProdFn();
+[1, 2].map(testOnlyCallback);
+"#,
+    )
+    .unwrap();
+
+    std::fs::write(
+        root.join("src/__tests__/extra.spec.ts"),
+        r#"
+import { testOnlyProdFn } from "../helpers";
+testOnlyProdFn();
+"#,
+    )
+    .unwrap();
+
+    let ignores = KagamiConfig::default().build_ignore_globset().unwrap();
+    let files = discover_files(root, &ignores, None).unwrap();
+    let graph = CodeGraph::build(root, &files, false).unwrap();
+    let dead = analyze_dead(
+        &graph,
+        &DeadOptions {
+            scope: DeadScope::Prod,
+            langs: None,
+            allowlist: std::collections::HashSet::new(),
+            include_clusters: true,
+            path_filter: None,
+            min_confidence: Confidence::Heuristic,
+        },
+    );
+
+    let is_dead = |file_suffix: &str, sym: &str| {
+        dead.symbols
+            .iter()
+            .any(|s| s.file.ends_with(file_suffix) && s.symbol == sym)
+    };
+
+    for (file, sym) in [
+        ("src/main.ts", "onLinkClick"),
+        ("src/main.ts", "mapItem"),
+        ("src/main.ts", "filterItem"),
+        ("src/main.ts", "eachItem"),
+        ("src/main.ts", "timerCb"),
+        ("src/main.ts", "objValFn"),
+        ("src/main.ts", "shorthandFn"),
+        ("src/main.ts", "assignedFn"),
+        ("src/main.ts", "returnedFn"),
+        ("src/main.ts", "arrayFn"),
+        ("src/helpers.ts", "importedCallback"),
+        ("src/helpers.ts", "StateBox.preset"),
+        ("src/helpers.ts", "Delegate.authorize"),
+    ] {
+        assert!(
+            !is_dead(file, sym),
+            "Expected {file}::{sym} to be live; dead={:?}",
+            dead.symbols
+        );
+    }
+
+    for (file, sym) in [
+        ("src/main.ts", "deadShadowedParam"),
+        ("src/main.ts", "deadShadowedBlock"),
+        ("src/main.ts", "trulyDeadTsFn"),
+        ("src/helpers.ts", "testOnlyProdFn"),
+        ("src/helpers.ts", "testOnlyCallback"),
+        ("src/helpers.ts", "unrelatedFreeFn"),
+        ("src/helpers.ts", "StateBox.unusedGetter"),
+        ("src/helpers.ts", "Delegate.deadDelegate"),
+    ] {
+        assert!(
+            is_dead(file, sym),
+            "Expected {file}::{sym} to remain dead; dead={:?}",
+            dead.symbols
+        );
+    }
+}
+
+#[test]
+fn test_svelte5_templates_bind_this_barrels_and_routes() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    std::fs::create_dir_all(root.join("src/lib/ui/card")).unwrap();
+    std::fs::create_dir_all(root.join("src/routes")).unwrap();
+
+    std::fs::write(
+        root.join("src/lib/actions.ts"),
+        r#"
+export function followBottom(_node: HTMLElement) {}
+export function atomicInput(_node: HTMLElement, _get: () => unknown) {}
+export function fadeAnim(_node: HTMLElement) {}
+export function formatLabel(s: string) { return s.trim(); }
+export function testOnlyHelper() { return 1; }
+"#,
+    )
+    .unwrap();
+
+    std::fs::write(
+        root.join("src/lib/ui/card/card.svelte"),
+        r#"<script lang="ts">
+  export function cardLiveHelper() {}
+  cardLiveHelper();
+</script>
+<div><slot /></div>
+"#,
+    )
+    .unwrap();
+
+    std::fs::write(
+        root.join("src/lib/ui/card/card-unused.svelte"),
+        r#"<script lang="ts">
+  export function neverUsed() {}
+</script>
+<div>unused</div>
+"#,
+    )
+    .unwrap();
+
+    std::fs::write(
+        root.join("src/lib/ui/card/index.ts"),
+        r#"
+import Root from "./card.svelte";
+import Unused from "./card-unused.svelte";
+export { Root, Root as Card, Unused };
+"#,
+    )
+    .unwrap();
+
+    std::fs::write(
+        root.join("src/lib/Attachments.svelte"),
+        r#"<script lang="ts">
+  export function pick() {}
+  export function addRef(_x: string) {}
+  export function unusedExport() {}
+  function removeItem(_id: string) {}
+  function deadSvelteFn() {}
+</script>
+<button onclick={() => removeItem("a")}>Remove</button>
+"#,
+    )
+    .unwrap();
+
+    std::fs::write(
+        root.join("src/routes/+page.svelte"),
+        r#"<script lang="ts">
+  import Attachments from "$lib/Attachments.svelte";
+  import * as Card from "$lib/ui/card";
+  import { followBottom, atomicInput, fadeAnim, formatLabel } from "$lib/actions";
+
+  let tray = $state<ReturnType<typeof Attachments>>();
+  let items = ["a", "b"];
+  let live = false;
+
+  const fences = (_h: string) => (_node: HTMLElement) => {};
+  const measureHook = (_node: HTMLElement) => {};
+  function thought(t: string) { return t; }
+  function keyFor(x: string) { return x; }
+  function computeConst(x: string) { return x.toUpperCase(); }
+  function renderHtml() { return "<b>hi</b>"; }
+  function onKeyDown(_e: KeyboardEvent) {}
+  function commentedOutFn() {}
+
+  function pushRef() {
+    tray?.addRef("x");
+  }
+  pushRef();
+</script>
+
+<!-- {@attach commentedOutFn} -->
+<Card.Root heading={live ? "Thinking" : thought("hi")} aria-label="Item {formatLabel('x')}">
+  <div {@attach fences("html")} {@attach measureHook} use:followBottom use:atomicInput={() => ({ items })} transition:fadeAnim|global {onKeyDown}>
+    {@html renderHtml()}
+    {#each items as item (keyFor(item))}
+      {@const upper = computeConst(item)}
+      <span>{upper}</span>
+    {/each}
+  </div>
+  <Attachments bind:this={tray} />
+  <button onclick={() => tray?.pick()}>Pick</button>
+</Card.Root>
+
+<style>
+  .unused { color: red; }
+</style>
+"#,
+    )
+    .unwrap();
+
+    std::fs::write(
+        root.join("src/routes/+page.ts"),
+        r#"
+export const load = () => ({ ok: true });
+function deadRouteHelper() {}
+"#,
+    )
+    .unwrap();
+
+    std::fs::write(
+        root.join("src/lib/actions.test.ts"),
+        r#"
+import { testOnlyHelper } from "./actions";
+testOnlyHelper();
+"#,
+    )
+    .unwrap();
+
+    let ignores = KagamiConfig::default().build_ignore_globset().unwrap();
+    let files = discover_files(root, &ignores, None).unwrap();
+    let graph = CodeGraph::build(root, &files, false).unwrap();
+    let dead = analyze_dead(
+        &graph,
+        &DeadOptions {
+            scope: DeadScope::Prod,
+            langs: None,
+            allowlist: std::collections::HashSet::new(),
+            include_clusters: true,
+            path_filter: None,
+            min_confidence: Confidence::Heuristic,
+        },
+    );
+
+    let is_dead = |file_suffix: &str, sym: &str| {
+        dead.symbols
+            .iter()
+            .any(|s| s.file.ends_with(file_suffix) && s.symbol == sym)
+    };
+
+    for (file, sym) in [
+        ("src/lib/Attachments.svelte", "Attachments"),
+        ("src/lib/Attachments.svelte", "pick"),
+        ("src/lib/Attachments.svelte", "addRef"),
+        ("src/lib/Attachments.svelte", "removeItem"),
+        ("src/lib/ui/card/card.svelte", "card"),
+        ("src/lib/ui/card/card.svelte", "cardLiveHelper"),
+        ("src/lib/actions.ts", "followBottom"),
+        ("src/lib/actions.ts", "atomicInput"),
+        ("src/lib/actions.ts", "fadeAnim"),
+        ("src/lib/actions.ts", "formatLabel"),
+        ("src/routes/+page.svelte", "fences"),
+        ("src/routes/+page.svelte", "measureHook"),
+        ("src/routes/+page.svelte", "thought"),
+        ("src/routes/+page.svelte", "keyFor"),
+        ("src/routes/+page.svelte", "computeConst"),
+        ("src/routes/+page.svelte", "renderHtml"),
+        ("src/routes/+page.svelte", "onKeyDown"),
+        ("src/routes/+page.ts", "load"),
+    ] {
+        assert!(
+            !is_dead(file, sym),
+            "Expected {file}::{sym} to be live; dead={:?}",
+            dead.symbols
+        );
+    }
+
+    for (file, sym) in [
+        ("src/lib/Attachments.svelte", "unusedExport"),
+        ("src/lib/Attachments.svelte", "deadSvelteFn"),
+        ("src/lib/ui/card/card-unused.svelte", "card-unused"),
+        ("src/lib/ui/card/card-unused.svelte", "neverUsed"),
+        ("src/routes/+page.svelte", "commentedOutFn"),
+        ("src/routes/+page.ts", "deadRouteHelper"),
+        ("src/lib/actions.ts", "testOnlyHelper"),
+    ] {
+        assert!(
+            is_dead(file, sym),
+            "Expected {file}::{sym} to remain dead; dead={:?}",
+            dead.symbols
+        );
+    }
+}
+#[test]
+fn test_svelte5_ts_review_edge_cases() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    std::fs::create_dir_all(root.join("src/routes")).unwrap();
+    std::fs::create_dir_all(root.join("src/ui")).unwrap();
+
+    // 1. Same-file property read must not hide unused free function;
+    //    hoisted local function / var must shadow imported function;
+    //    for..of & catch destructuring defaults and assignment targets must stay live;
+    //    this.run() on Worker in a.ts must not mark Worker.run in b.ts live.
+    std::fs::write(
+        root.join("src/imported.ts"),
+        r#"
+export function unusedImportedForHoistFn() {}
+export function unusedImportedForHoistVar() {}
+export function liveAfterBlockFn() {}
+export function liveAfterObjMethodVar() {}
+export function unusedBareLoopOrCatchImport() {}
+export function unusedSwitchHoistImport() {}
+export function unusedMethodVarHoistImport() {}
+"#,
+    )
+    .unwrap();
+
+    std::fs::write(
+        root.join("src/b.ts"),
+        r#"
+export class Worker {
+  run(): void {}
+}
+
+export class BaseWorker {
+  inheritedRun(): void {}
+}
+
+export class NsBase {
+  nsRun(): void {}
+}
+"#,
+    )
+    .unwrap();
+
+    std::fs::write(
+        root.join("src/js_inherit.js"),
+        r#"
+class JsBase {
+  jsRun() {}
+}
+class JsChild extends JsBase {
+  constructor() {
+    super();
+    this.jsRun();
+  }
+}
+new JsChild();
+"#,
+    )
+    .unwrap();
+
+    std::fs::write(
+        root.join("src/a.ts"),
+        r#"
+import {
+  unusedImportedForHoistFn as hoistedFn,
+  unusedImportedForHoistVar as hoistedVar,
+  liveAfterBlockFn,
+  liveAfterObjMethodVar,
+  unusedBareLoopOrCatchImport,
+  unusedSwitchHoistImport,
+  unusedMethodVarHoistImport,
+} from "./imported";
+import { BaseWorker } from "./b";
+import * as bNs from "./b";
+
+function sameFileFormat() {}
+function makeId() { return "id"; }
+function getIndex() { return 0; }
+function fallbackMessage() { return "err"; }
+function makeMethodKey() { return "dyn"; }
+
+class Worker {
+  start(): void {
+    this.run();
+  }
+  run(): void {}
+}
+
+class UnrelatedLocal {
+  inheritedRun(): void {}
+}
+
+class ChildWorker extends BaseWorker {
+  go(): void {
+    this.inheritedRun();
+  }
+}
+
+class NsChild extends bNs.NsBase {
+  runNs(): void {
+    this.nsRun();
+  }
+}
+
+function boot(config: { sameFileFormat: string }, rows: Array<{ id?: string }>, target: number[]) {
+  console.log(config.sameFileFormat);
+  hoistedFn();
+  function hoistedFn() {}
+  if (rows.length >= 0) {
+    var hoistedVar = () => {};
+    function liveAfterBlockFn() {}
+    liveAfterBlockFn();
+  }
+  hoistedVar();
+  liveAfterBlockFn();
+  const helperObj = {
+    prepare() {
+      var liveAfterObjMethodVar = 1;
+      return liveAfterObjMethodVar;
+    },
+    [makeMethodKey()]() {},
+    nestedHoist() {
+      const invoke = () => unusedMethodVarHoistImport();
+      var unusedMethodVarHoistImport = () => {};
+      invoke();
+    },
+  };
+  void helperObj;
+  liveAfterObjMethodVar();
+  switch (rows.length) {
+    case 0:
+      unusedSwitchHoistImport();
+      break;
+    case 1:
+      function unusedSwitchHoistImport() {}
+      break;
+  }
+  for (const { id = makeId() } of rows) {
+    console.log(id);
+  }
+  for (const unusedBareLoopOrCatchImport of rows) {
+    void unusedBareLoopOrCatchImport;
+  }
+  for (target[getIndex()] of [1]) {
+    void target;
+  }
+  try {
+    new Worker().start();
+    new ChildWorker().go();
+    new NsChild().runNs();
+  } catch ({ message = fallbackMessage() }: any) {
+    console.log(message);
+  }
+  try {
+    void rows;
+  } catch (unusedBareLoopOrCatchImport) {
+    void unusedBareLoopOrCatchImport;
+  }
+}
+
+boot({ sameFileFormat: "x" }, [], []);
+"#,
+    )
+    .unwrap();
+
+    // 2. Custom alias Svelte component import (@ui/CustomBtn.svelte)
+    std::fs::write(root.join("src/ui/CustomBtn.svelte"), "<button>Click</button>").unwrap();
+    std::fs::write(root.join("src/ui/Panel.svelte"), "<div><slot /></div>").unwrap();
+    std::fs::write(root.join("src/ui/UnusedWidget.svelte"), "<div>unused</div>").unwrap();
+    std::fs::write(root.join("src/ui/SlotWidget.svelte"), "<div>slot</div>").unwrap();
+
+    // 3. Script string containing "<!--" must not hide template;
+    //    {#each} / {@const} bindings must shadow unused script functions inside block,
+    //    while outer callable resolves again after block closes.
+    std::fs::write(
+        root.join("src/routes/+page.svelte"),
+        r#"<script lang="ts">
+  import PrimaryBtn from "@ui/CustomBtn.svelte";
+  import Panel from "../ui/Panel.svelte";
+  import UnusedWidget from "../ui/UnusedWidget.svelte";
+  import SlotWidget from "../ui/SlotWidget.svelte";
+  const marker = "<!--";
+  function renderLabel() { return marker; }
+  function label() { return "unused"; }
+  function afterBlock() { return "used-after"; }
+  function afterPanel() { return "used-after-panel"; }
+  let labels = ["a", "b"];
+  let widgets: any[] = [];
+</script>
+
+<PrimaryBtn />
+<p>{renderLabel()}</p>
+<Panel>
+  <svelte:fragment slot="header">{@const SlotWidget = "preview"}<span>{SlotWidget}</span></svelte:fragment>
+  <SlotWidget />
+  {@const afterPanel = "local"}{afterPanel}
+</Panel>
+<p>{afterPanel()}</p>
+{#each widgets as UnusedWidget}
+  <UnusedWidget />
+{/each}
+{#each labels as label (label)}
+  <span>{label.toUpperCase()}</span>
+{/each}
+{#each labels as afterBlock}
+  <span>{afterBlock}</span>
+{/each}
+<span>{afterBlock()}</span>
+"#,
+    )
+    .unwrap();
+
+    let ignores = KagamiConfig::default().build_ignore_globset().unwrap();
+    let files = discover_files(root, &ignores, None).unwrap();
+    let graph = CodeGraph::build(root, &files, false).unwrap();
+    let dead = analyze_dead(
+        &graph,
+        &DeadOptions {
+            scope: DeadScope::Prod,
+            langs: None,
+            allowlist: std::collections::HashSet::new(),
+            include_clusters: true,
+            path_filter: None,
+            min_confidence: Confidence::Heuristic,
+        },
+    );
+
+    let is_dead = |file_suffix: &str, sym: &str| {
+        dead.symbols
+            .iter()
+            .any(|s| s.file.ends_with(file_suffix) && s.symbol == sym)
+    };
+
+    for (file, sym) in [
+        ("src/a.ts", "makeId"),
+        ("src/a.ts", "getIndex"),
+        ("src/a.ts", "fallbackMessage"),
+        ("src/a.ts", "makeMethodKey"),
+        ("src/a.ts", "Worker.run"),
+        ("src/b.ts", "BaseWorker.inheritedRun"),
+        ("src/b.ts", "NsBase.nsRun"),
+        ("src/js_inherit.js", "JsBase.jsRun"),
+        ("src/imported.ts", "liveAfterBlockFn"),
+        ("src/imported.ts", "liveAfterObjMethodVar"),
+        ("src/ui/CustomBtn.svelte", "CustomBtn"),
+        ("src/ui/Panel.svelte", "Panel"),
+        ("src/ui/SlotWidget.svelte", "SlotWidget"),
+        ("src/routes/+page.svelte", "renderLabel"),
+        ("src/routes/+page.svelte", "afterBlock"),
+        ("src/routes/+page.svelte", "afterPanel"),
+    ] {
+        assert!(
+            !is_dead(file, sym),
+            "Expected {file}::{sym} to be live; dead={:?}",
+            dead.symbols
+        );
+    }
+
+    for (file, sym) in [
+        ("src/a.ts", "sameFileFormat"),
+        ("src/imported.ts", "unusedImportedForHoistFn"),
+        ("src/imported.ts", "unusedImportedForHoistVar"),
+        ("src/imported.ts", "unusedBareLoopOrCatchImport"),
+        ("src/imported.ts", "unusedSwitchHoistImport"),
+        ("src/imported.ts", "unusedMethodVarHoistImport"),
+        ("src/a.ts", "UnrelatedLocal.inheritedRun"),
+        ("src/b.ts", "Worker.run"),
+        ("src/routes/+page.svelte", "label"),
+        ("src/ui/UnusedWidget.svelte", "UnusedWidget"),
+    ] {
+        assert!(
+            is_dead(file, sym),
+            "Expected {file}::{sym} to remain dead; dead={:?}",
+            dead.symbols
+        );
+    }
+}

@@ -1403,7 +1403,9 @@ fn resolve_ref(
         // link the var itself so callbacks registered in its initializer remain reachable.
         push_const_qualifier_refs(ext, qual, symbols, by_file_name, by_pkg_name, &mut results);
         if let Some(id) = by_file_name.get(&(ext.file.as_str(), r.target_name.as_str())) {
-            if symbols.get(id).map(|s| s.kind == SymbolKind::Method).unwrap_or(false) {
+            if id != &r.from_symbol_id
+                && symbols.get(id).map(|s| s.kind == SymbolKind::Method).unwrap_or(false)
+            {
                 results.push((id.clone(), Confidence::Resolved));
                 found_method = true;
             }
@@ -1416,7 +1418,8 @@ fn resolve_ref(
             if !ext.package_or_module.is_empty() {
                 if let Some(ids) = by_pkg_name.get(&(ext.lang, ext.package_or_module.as_str(), r.target_name.as_str())) {
                     for id in ids {
-                        if symbols.get(id).map(|s| s.kind == SymbolKind::Method).unwrap_or(false)
+                        if id != &r.from_symbol_id
+                            && symbols.get(id).map(|s| s.kind == SymbolKind::Method).unwrap_or(false)
                             && seen_methods.insert(id.clone())
                         {
                             candidate_methods.push(id.clone());
@@ -1480,6 +1483,21 @@ fn resolve_ref(
                             .unwrap_or(false)
                     })
                     .collect()
+            } else if r.qualifier.is_some() {
+                let ts_family = matches!(
+                    ext.lang,
+                    Language::TypeScript | Language::JavaScript | Language::Svelte
+                ) && r.kind == EdgeKind::Calls;
+                ids.iter()
+                    .filter(|id| {
+                        *id != &r.from_symbol_id
+                            && (!ts_family
+                                || symbols
+                                    .get(*id)
+                                    .map(|s| s.kind == SymbolKind::Method)
+                                    .unwrap_or(false))
+                    })
+                    .collect()
             } else {
                 ids.iter().collect()
             };
@@ -1507,6 +1525,21 @@ fn resolve_ref(
                     symbols
                         .get(*id)
                         .map(|s| s.kind != SymbolKind::Method)
+                        .unwrap_or(false)
+                })
+                .collect()
+        } else if matches!(
+            ext.lang,
+            Language::TypeScript | Language::JavaScript | Language::Svelte
+        ) && r.qualifier.is_some()
+            && r.kind == EdgeKind::Calls
+        {
+            cands
+                .iter()
+                .filter(|id| {
+                    symbols
+                        .get(*id)
+                        .map(|s| s.kind == SymbolKind::Method)
                         .unwrap_or(false)
                 })
                 .collect()
