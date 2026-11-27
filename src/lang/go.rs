@@ -351,6 +351,9 @@ pub fn extract(rel_path: &str, src: &str, blake3_hex: String) -> Result<FileExtr
         embedded_types,
         struct_fields,
         func_return_types,
+        trait_impls: Vec::new(),
+        impl_macros: Vec::new(),
+        cfg_gated_symbols: HashMap::new(),
     })
 }
 
