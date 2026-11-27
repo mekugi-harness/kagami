@@ -3649,3 +3649,253 @@ boot({ sameFileFormat: "x" }, [], []);
         );
     }
 }
+
+#[test]
+fn test_ts_js_class_field_receiver_resolution() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    std::fs::create_dir_all(root.join("src")).unwrap();
+
+    std::fs::write(
+        root.join("src/transport.ts"),
+        r#"
+export class Connector {
+  authorize(token: string): void {
+    void token;
+  }
+  onTick(): void {}
+  info(): string {
+    return "unused";
+  }
+  respondError(msg: string): void {
+    void msg;
+  }
+  neverCalledFromInnerFn(): void {}
+}
+
+export class OptionalService {
+  ping(): void {}
+  poke(): void {}
+  unusedOpt(): void {}
+}
+
+export class InjectedSvc {
+  dispatch(): void {}
+  unusedInjected(): void {}
+}
+
+export class NsSvc {
+  sync(): void {}
+}
+
+export class TypeOnlySvc {
+  run(): void {}
+  unusedTypeOnly(): void {}
+}
+
+export class SharedSvc {
+  reset(): void {}
+}
+
+export class DecoyConnector {
+  authorize(token: string): void {
+    void token;
+  }
+  neverCalledFromInnerFn(): void {}
+}
+
+export function testOnlyHelper(): number {
+  return 42;
+}
+"#,
+    )
+    .unwrap();
+
+    std::fs::write(
+        root.join("src/js_helper.js"),
+        r#"
+export class JsHelper {
+  execute() {
+    return 1;
+  }
+  unusedJsMethod() {
+    return 0;
+  }
+}
+
+export class JsConsumer {
+  #helper = new JsHelper();
+  constructor() {
+    this.alt = new JsHelper();
+  }
+  execute() {
+    this.#helper.execute();
+    this.alt.execute();
+  }
+}
+
+const jc = new JsConsumer();
+jc.execute();
+"#,
+    )
+    .unwrap();
+
+    std::fs::write(
+        root.join("src/machine.ts"),
+        r#"
+import { Connector, OptionalService, InjectedSvc, SharedSvc } from "./transport";
+import type { TypeOnlySvc } from "./transport";
+import * as ns from "./transport";
+
+class LocalHelper {
+  assist(): void {}
+  unusedLocal(): void {}
+}
+
+export class Machine {
+  static #shared = new SharedSvc();
+  #connector: Connector;
+  #maybe: OptionalService | null = null;
+  #local = new LocalHelper();
+  #typeOnly: TypeOnlySvc;
+  public pubConnector = new Connector();
+
+  constructor(
+    private injected: InjectedSvc,
+    readonly nsSvc: ns.NsSvc,
+    typeOnly: TypeOnlySvc,
+  ) {
+    this.#connector = new Connector();
+    this.#typeOnly = typeOnly;
+  }
+
+  static resetAll(): void {
+    this.#shared.reset();
+  }
+
+  authorize(token: string): void {
+    this.#connector.authorize(token);
+    const tick = () => this.#connector.onTick();
+    tick();
+    this.#maybe?.ping();
+    this.#maybe!.poke();
+    this.injected.dispatch();
+    this.nsSvc.sync();
+    this.#typeOnly.run();
+    this.#local.assist();
+    this.neverCalledFromInnerFn();
+  }
+
+  neverCalledFromInnerFn(): void {
+    const rebound = function () {
+      // Rebound `this` must not resolve against Machine's fields
+      // @ts-ignore
+      this.#connector.neverCalledFromInnerFn();
+    };
+    void rebound;
+  }
+}
+
+const m = new Machine(new InjectedSvc(), new ns.NsSvc(), new (class {} as any)());
+m.authorize("secret");
+Machine.resetAll();
+"#,
+    )
+    .unwrap();
+
+    std::fs::write(
+        root.join("src/transport.test.ts"),
+        r#"
+import { testOnlyHelper } from "./transport";
+testOnlyHelper();
+"#,
+    )
+    .unwrap();
+
+    let ignores = KagamiConfig::default().build_ignore_globset().unwrap();
+    let files = discover_files(root, &ignores, None).unwrap();
+    let graph = CodeGraph::build(root, &files, false).unwrap();
+
+    // Verify Machine.authorize -> Connector.authorize is a Confidence::Resolved edge
+    let has_resolved_auth_edge = graph.edges.iter().any(|e| {
+        graph
+            .symbols
+            .get(&e.from)
+            .map(|s| s.qualified_name == "Machine.authorize")
+            .unwrap_or(false)
+            && graph
+                .symbols
+                .get(&e.to)
+                .map(|s| s.qualified_name == "Connector.authorize")
+                .unwrap_or(false)
+            && e.confidence == Confidence::Resolved
+    });
+    assert!(
+        has_resolved_auth_edge,
+        "Expected Machine.authorize -> Connector.authorize at Confidence::Resolved"
+    );
+    let has_resolved_rebound_ref = graph.extracts.iter().any(|ext| {
+        ext.refs
+            .iter()
+            .any(|r| r.target_name == "Connector.neverCalledFromInnerFn")
+    });
+    assert!(
+        !has_resolved_rebound_ref,
+        "Rebound `this` inside non-arrow function must not resolve Machine's field to Connector"
+    );
+
+    let dead = analyze_dead(
+        &graph,
+        &DeadOptions {
+            scope: DeadScope::Prod,
+            langs: None,
+            allowlist: std::collections::HashSet::new(),
+            include_clusters: true,
+            path_filter: None,
+            min_confidence: Confidence::Heuristic,
+        },
+    );
+
+    let is_dead = |file_suffix: &str, sym: &str| {
+        dead.symbols
+            .iter()
+            .any(|s| s.file.ends_with(file_suffix) && s.symbol == sym)
+    };
+
+    for (file, sym) in [
+        ("src/transport.ts", "Connector.authorize"),
+        ("src/transport.ts", "Connector.onTick"),
+        ("src/transport.ts", "OptionalService.ping"),
+        ("src/transport.ts", "OptionalService.poke"),
+        ("src/transport.ts", "InjectedSvc.dispatch"),
+        ("src/transport.ts", "NsSvc.sync"),
+        ("src/transport.ts", "TypeOnlySvc.run"),
+        ("src/transport.ts", "SharedSvc.reset"),
+        ("src/machine.ts", "LocalHelper.assist"),
+        ("src/js_helper.js", "JsHelper.execute"),
+    ] {
+        assert!(
+            !is_dead(file, sym),
+            "Expected {file}::{sym} to be live; dead={:?}",
+            dead.symbols
+        );
+    }
+
+    for (file, sym) in [
+        ("src/transport.ts", "Connector.info"),
+        ("src/transport.ts", "Connector.respondError"),
+        ("src/transport.ts", "DecoyConnector.authorize"),
+        ("src/transport.ts", "OptionalService.unusedOpt"),
+        ("src/transport.ts", "InjectedSvc.unusedInjected"),
+        ("src/transport.ts", "TypeOnlySvc.unusedTypeOnly"),
+        ("src/transport.ts", "testOnlyHelper"),
+        ("src/machine.ts", "LocalHelper.unusedLocal"),
+        ("src/js_helper.js", "JsHelper.unusedJsMethod"),
+    ] {
+        assert!(
+            is_dead(file, sym),
+            "Expected {file}::{sym} to remain dead; dead={:?}",
+            dead.symbols
+        );
+    }
+}
