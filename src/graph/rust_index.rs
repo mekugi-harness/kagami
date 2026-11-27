@@ -553,60 +553,10 @@ impl<'a> RustTypeIndex<'a> {
         {
             return Some(id.clone());
         }
-        if let Some(uses) = self.file_all_uses.get(owner_file) {
-            for u in uses {
-                if u.local_name == type_name
-                    && !u.is_test
-                    && (u.mod_scope == caller_scope || u.mod_scope.is_empty())
-                    && let Some((mod_path, target_sym)) = u.target_path.rsplit_once("::")
-                {
-                    if mod_path == "super" && !u.mod_scope.is_empty() {
-                        let parent_scope =
-                            u.mod_scope.rsplit_once("::").map(|(p, _)| p).unwrap_or("");
-                        if let Some(ids) = self.file_non_method_syms.get(&(owner_file, target_sym))
-                        {
-                            let hits: Vec<&String> = ids
-                                .iter()
-                                .filter(|id| {
-                                    self.symbol_mod_scopes
-                                        .get(id.as_str())
-                                        .map(String::as_str)
-                                        .unwrap_or("")
-                                        == parent_scope
-                                        && symbols.get(*id).is_some_and(|s| {
-                                            !s.is_test
-                                                && matches!(
-                                                    s.kind,
-                                                    SymbolKind::Struct
-                                                        | SymbolKind::Enum
-                                                        | SymbolKind::Type
-                                                        | SymbolKind::Trait
-                                                )
-                                        })
-                                })
-                                .collect();
-                            if hits.len() == 1 {
-                                return Some(hits[0].clone());
-                            }
-                        }
-                    }
-                    let mut hits = Vec::new();
-                    let mut visited = HashSet::new();
-                    self.resolve_mod_path_into(
-                        owner_file,
-                        mod_path,
-                        target_sym,
-                        true,
-                        symbols,
-                        0,
-                        &mut visited,
-                        &mut hits,
-                    );
-                    if hits.len() == 1 {
-                        return Some(hits.remove(0));
-                    }
-                }
-            }
+        if let Some(id) =
+            self.resolve_imported_type_in_scope(owner_file, type_name, caller_scope, true, symbols)
+        {
+            return Some(id);
         }
         let cands = self.types_by_name.get(type_name)?;
         if cands.len() == 1 {
@@ -623,6 +573,72 @@ impl<'a> RustTypeIndex<'a> {
             .collect();
         if matched.len() == 1 {
             return Some(matched[0].clone());
+        }
+        None
+    }
+
+    fn resolve_imported_type_in_scope(
+        &self,
+        owner_file: &str,
+        type_name: &str,
+        caller_scope: &str,
+        include_root_uses: bool,
+        symbols: &HashMap<String, Symbol>,
+    ) -> Option<String> {
+        let uses = self.file_all_uses.get(owner_file)?;
+        for u in uses {
+            let scope_ok =
+                u.mod_scope == caller_scope || (include_root_uses && u.mod_scope.is_empty());
+            if u.local_name == type_name
+                && !u.is_test
+                && scope_ok
+                && let Some((mod_path, target_sym)) = u.target_path.rsplit_once("::")
+            {
+                if mod_path == "super" && !u.mod_scope.is_empty() {
+                    let parent_scope =
+                        u.mod_scope.rsplit_once("::").map(|(p, _)| p).unwrap_or("");
+                    if let Some(ids) = self.file_non_method_syms.get(&(owner_file, target_sym)) {
+                        let hits: Vec<&String> = ids
+                            .iter()
+                            .filter(|id| {
+                                self.symbol_mod_scopes
+                                    .get(id.as_str())
+                                    .map(String::as_str)
+                                    .unwrap_or("")
+                                    == parent_scope
+                                    && symbols.get(*id).is_some_and(|s| {
+                                        !s.is_test
+                                            && matches!(
+                                                s.kind,
+                                                SymbolKind::Struct
+                                                    | SymbolKind::Enum
+                                                    | SymbolKind::Type
+                                                    | SymbolKind::Trait
+                                            )
+                                    })
+                            })
+                            .collect();
+                        if hits.len() == 1 {
+                            return Some(hits[0].clone());
+                        }
+                    }
+                }
+                let mut hits = Vec::new();
+                let mut visited = HashSet::new();
+                self.resolve_mod_path_into(
+                    owner_file,
+                    mod_path,
+                    target_sym,
+                    true,
+                    symbols,
+                    0,
+                    &mut visited,
+                    &mut hits,
+                );
+                if hits.len() == 1 {
+                    return Some(hits.remove(0));
+                }
+            }
         }
         None
     }
@@ -1511,6 +1527,18 @@ impl<'a> RustTypeIndex<'a> {
                 if scoped.len() == 1 {
                     return Some((scoped[0].clone(), 0));
                 }
+            }
+            if qualifier.is_none()
+                && !caller_scope.is_empty()
+                && let Some(tid) = self.resolve_imported_type_in_scope(
+                    &ext.file,
+                    name,
+                    caller_scope,
+                    false,
+                    symbols,
+                )
+            {
+                return Some((tid, 0));
             }
             if qualifier.is_some() || caller_scope.is_empty() {
                 let type_name = match qualifier {

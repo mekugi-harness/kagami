@@ -2692,6 +2692,7 @@ impl Decoy {
     fn refresh(&self) {}
     fn slot_tuple_finish(&self) {}
     fn slot_closure_finish(&self) {}
+    fn imported_pair_finish(&self) {}
 }
 
 struct FirstSlot;
@@ -2707,6 +2708,9 @@ impl SecondSlot {
 }
 
 struct SlotPair(FirstSlot, SecondSlot);
+impl SlotPair {
+    fn imported_pair_finish(&self) {}
+}
 
 fn with_slot_pair(f: impl Fn(FirstSlot, SecondSlot)) {
     f(FirstSlot, SecondSlot);
@@ -2719,8 +2723,13 @@ impl AliasWorker {
 
 mod api {
     use super::AliasWorker as CallbackWorker;
+    use super::SlotPair as LocalPair;
+    use super::{FirstSlot, SecondSlot};
     pub fn with_aliased_worker(f: impl Fn(CallbackWorker)) {
         f(CallbackWorker);
+    }
+    pub fn run_imported_ctor() {
+        LocalPair(FirstSlot, SecondSlot).imported_pair_finish();
     }
 }
 
@@ -2869,6 +2878,7 @@ fn main() {
     second.slot_tuple_finish();
     with_slot_pair(|/* skip */ _, s| s.slot_closure_finish());
     api::with_aliased_worker(|w| w.work());
+    api::run_imported_ctor();
     let local_weak: helpers::Weak = helpers::Weak;
     local_weak.refresh();
 
@@ -2936,6 +2946,7 @@ mod tests {
         ("src/main.rs", "WatchState::ufcs_call"),
         ("src/main.rs", "SecondSlot::slot_tuple_finish"),
         ("src/main.rs", "SecondSlot::slot_closure_finish"),
+        ("src/main.rs", "SlotPair::imported_pair_finish"),
         ("src/main.rs", "AliasWorker::work"),
         ("src/helpers.rs", "RemoteState::touch_generic"),
         ("src/helpers.rs", "RemoteState::touch_impl_fn"),
@@ -2965,6 +2976,7 @@ mod tests {
         ("src/main.rs", "Decoy::refresh"),
         ("src/main.rs", "Decoy::slot_tuple_finish"),
         ("src/main.rs", "Decoy::slot_closure_finish"),
+        ("src/main.rs", "Decoy::imported_pair_finish"),
         ("src/helpers.rs", "RemoteState::unused_remote"),
     ] {
         assert!(
