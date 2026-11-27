@@ -1109,14 +1109,16 @@ fn extract_rust_callback_params(
     if let Some(tparams) = func_node.child_by_field_name("type_parameters") {
         let mut c = tparams.walk();
         for ch in tparams.children(&mut c) {
-            if ch.kind() == "constrained_type_parameter"
-                && let (Some(left), Some(bounds)) = (
-                    ch.child_by_field_name("left"),
-                    ch.child_by_field_name("bounds"),
-                )
-                && let Some(tys) = extract_fn_trait_param_types(node_text(bounds, src), impl_type)
-            {
-                generic_fn_bounds.insert(node_text(left, src).trim().to_string(), tys);
+            if matches!(ch.kind(), "constrained_type_parameter" | "type_parameter") {
+                let left = ch
+                    .child_by_field_name("left")
+                    .or_else(|| ch.child_by_field_name("name"));
+                if let (Some(left), Some(bounds)) = (left, ch.child_by_field_name("bounds"))
+                    && let Some(tys) =
+                        extract_fn_trait_param_types(node_text(bounds, src), impl_type)
+                {
+                    generic_fn_bounds.insert(node_text(left, src).trim().to_string(), tys);
+                }
             }
         }
     }
@@ -1148,6 +1150,18 @@ fn extract_rust_callback_params(
     let mut pc = plist.walk();
     for ch in plist.children(&mut pc) {
         if ch.kind() != "parameter" {
+            continue;
+        }
+        // Skip explicit typed receivers like self: Arc<Self> or mut self: Pin<&mut Self>.
+        if arg_idx == 0
+            && ch.child_by_field_name("pattern").is_some_and(|p| {
+                node_text(p, src)
+                    .trim()
+                    .trim_start_matches("mut ")
+                    .trim()
+                    == "self"
+            })
+        {
             continue;
         }
         if let Some(ty_node) = ch.child_by_field_name("type") {
@@ -1417,11 +1431,17 @@ fn bind_rust_pattern(
                 if Some(ch.id()) == type_id {
                     continue;
                 }
+                if ch.is_extra() {
+                    continue;
+                }
                 if ch.kind() == "remaining_field_pattern" {
                     pos_idx = None;
                     continue;
                 }
-                if matches!(ch.kind(), "line_comment" | "block_comment") {
+                if ch.kind() == "_" {
+                    if let Some(idx) = pos_idx {
+                        pos_idx = Some(idx + 1);
+                    }
                     continue;
                 }
                 if ch.is_named() {
@@ -1743,38 +1763,39 @@ fn normalize_rust_type_text(raw: &str, impl_type: Option<&str>) -> String {
         .filter(|a| !a.starts_with('\''))
         .collect();
 
-    if matches!(
-        short_base,
-        "Arc"
-            | "Rc"
-            | "Weak"
-            | "Box"
-            | "Pin"
-            | "Mutex"
-            | "RwLock"
-            | "RefCell"
-            | "Cell"
-            | "OnceLock"
-            | "OnceCell"
-            | "LazyLock"
-            | "Option"
-            | "Result"
-            | "MutexGuard"
-            | "RwLockReadGuard"
-            | "RwLockWriteGuard"
-            | "OwnedMutexGuard"
-            | "MappedMutexGuard"
-            | "Ref"
-            | "RefMut"
-            | "ArcSwap"
-            | "ArcSwapOption"
-            | "Cow"
-            | "ManuallyDrop"
-            | "MaybeUninit"
-            | "NonNull"
-            | "BoxFuture"
-            | "LocalBoxFuture"
-    ) || (short_base.ends_with("Result") && !type_args.is_empty())
+    if !type_args.is_empty()
+        && (matches!(
+            short_base,
+            "Arc"
+                | "Rc"
+                | "Weak"
+                | "Box"
+                | "Pin"
+                | "Mutex"
+                | "RwLock"
+                | "RefCell"
+                | "Cell"
+                | "OnceLock"
+                | "OnceCell"
+                | "LazyLock"
+                | "Option"
+                | "Result"
+                | "MutexGuard"
+                | "RwLockReadGuard"
+                | "RwLockWriteGuard"
+                | "OwnedMutexGuard"
+                | "MappedMutexGuard"
+                | "Ref"
+                | "RefMut"
+                | "ArcSwap"
+                | "ArcSwapOption"
+                | "Cow"
+                | "ManuallyDrop"
+                | "MaybeUninit"
+                | "NonNull"
+                | "BoxFuture"
+                | "LocalBoxFuture"
+        ) || short_base.ends_with("Result"))
     {
         if let Some(first) = type_args.first() {
             return normalize_rust_type_text(first, impl_type);
@@ -2828,6 +2849,13 @@ fn walk_rust_closure(
         let mut param_idx = 0usize;
         let mut c = plist.walk();
         for ch in plist.children(&mut c) {
+            if ch.is_extra() {
+                continue;
+            }
+            if ch.kind() == "_" {
+                param_idx += 1;
+                continue;
+            }
             if ch.kind() == "parameter" {
                 let pty = ch
                     .child_by_field_name("type")

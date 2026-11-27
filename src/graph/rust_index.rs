@@ -1300,6 +1300,30 @@ impl<'a> RustTypeIndex<'a> {
                 }
             }
         }
+        // Fall back to an inline module defined in the same file (e.g. mod api { pub fn foo() }).
+        if out.is_empty()
+            && let Some(ids) = self.file_non_method_syms.get(&(caller_file, target_name))
+        {
+            let target_scope = if caller_scope.is_empty() {
+                raw_segs.join("::")
+            } else {
+                format!("{}::{}", caller_scope, raw_segs.join("::"))
+            };
+            for id in ids {
+                let sym_scope = self
+                    .symbol_mod_scopes
+                    .get(id.as_str())
+                    .map(String::as_str)
+                    .unwrap_or("");
+                if sym_scope == target_scope
+                    && symbols
+                        .get(id)
+                        .is_some_and(|s| !s.is_test || caller_is_test)
+                {
+                    push_unique(&mut out, id.clone());
+                }
+            }
+        }
 
         out.into_iter()
             .map(|id| (id, Confidence::Resolved))
@@ -1485,6 +1509,28 @@ impl<'a> RustTypeIndex<'a> {
                 return Some((tid, 0));
             }
         }
+        // Tuple struct constructor call: e.g. SlotPair(a, b) or mod_a::SlotPair(a, b).
+        if name.chars().next().is_some_and(|c| c.is_ascii_uppercase()) {
+            let type_name = match qualifier {
+                Some(q) => format!("{q}::{name}"),
+                None => name.to_string(),
+            };
+            let caller_scope = self
+                .symbol_mod_scopes
+                .get(caller_id)
+                .map(String::as_str)
+                .unwrap_or("");
+            if let Some(res) = self.resolve_type_with_slices_in_scope(
+                &ext.file,
+                &ext.package_or_module,
+                &ext.imports,
+                &type_name,
+                caller_scope,
+                symbols,
+            ) {
+                return Some(res);
+            }
+        }
         None
     }
 
@@ -1558,14 +1604,26 @@ impl<'a> RustTypeIndex<'a> {
         fn_id: &str,
         arg_index: usize,
         param_index: usize,
+        allow_ufcs_receiver_shift: bool,
         symbols: &HashMap<String, Symbol>,
     ) -> Option<(String, usize)> {
         let fn_sym = symbols.get(fn_id)?;
-        let param_ty = self
-            .func_callback_params
-            .get(fn_id)?
+        let entries = self.func_callback_params.get(fn_id)?;
+        let param_ty = entries
             .iter()
             .find(|(ai, pi, _)| *ai == arg_index && *pi == param_index)
+            .or_else(|| {
+                if allow_ufcs_receiver_shift
+                    && fn_sym.kind == SymbolKind::Method
+                    && let Some(shifted) = arg_index.checked_sub(1)
+                {
+                    entries
+                        .iter()
+                        .find(|(ai, pi, _)| *ai == shifted && *pi == param_index)
+                } else {
+                    None
+                }
+            })
             .map(|(_, _, ty)| ty.as_str())
             .filter(|s| !s.is_empty())?;
         let imps = self
@@ -1573,11 +1631,17 @@ impl<'a> RustTypeIndex<'a> {
             .get(fn_sym.file.as_str())
             .copied()
             .unwrap_or(&[]);
-        self.resolve_type_with_slices(
+        let fn_scope = self
+            .symbol_mod_scopes
+            .get(fn_id)
+            .map(String::as_str)
+            .unwrap_or("");
+        self.resolve_type_with_slices_in_scope(
             &fn_sym.file,
             &fn_sym.package_or_module,
             imps,
             param_ty,
+            fn_scope,
             symbols,
         )
     }
@@ -1636,7 +1700,13 @@ impl<'a> RustTypeIndex<'a> {
                     by_pkg_name,
                     symbols,
                 )?;
-                self.resolve_callback_param_on_func(&fn_id, *arg_index, *param_index, symbols)?
+                self.resolve_callback_param_on_func(
+                    &fn_id,
+                    *arg_index,
+                    *param_index,
+                    qualifier.is_some(),
+                    symbols,
+                )?
             }
             _ => return None,
         };
@@ -1735,6 +1805,7 @@ impl<'a> RustTypeIndex<'a> {
                             mid,
                             *arg_index,
                             *param_index,
+                            false,
                             symbols,
                         ) {
                             resolved = Some(res);

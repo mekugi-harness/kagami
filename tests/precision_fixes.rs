@@ -2635,7 +2635,8 @@ edition = "2021"
 
 pub struct RemoteState;
 impl RemoteState {
-    pub fn touch(&mut self) {}
+    pub fn touch_generic(&mut self) {}
+    pub fn touch_impl_fn(&mut self) {}
     pub fn unused_remote(&mut self) {}
 }
 
@@ -2654,6 +2655,11 @@ pub fn with_impl_fn(f: impl Fn(&mut RemoteState)) {
     let mut s = RemoteState;
     f(&mut s);
 }
+
+pub struct Weak;
+impl Weak {
+    pub fn refresh(&self) {}
+}
 "#,
     )
     .unwrap();
@@ -2671,6 +2677,9 @@ impl Projector {
     fn push(&mut self) {}
     fn finish(&mut self) {}
     fn reset(&mut self) {}
+    fn tuple_ping(&mut self) {}
+    fn mutex_touch(&mut self) {}
+    fn map_touch(&mut self) {}
     fn dead_projector_method(&mut self) {}
 }
 
@@ -2679,6 +2688,37 @@ impl Decoy {
     fn push(&mut self) {}
     fn terminate(&self) {}
     fn upsert_thread(&mut self) {}
+    fn work(&self) {}
+    fn refresh(&self) {}
+    fn slot_finish(&self) {}
+}
+
+struct FirstSlot;
+impl FirstSlot {
+    fn slot_finish(&self) {}
+}
+
+struct SecondSlot;
+impl SecondSlot {
+    fn slot_finish(&self) {}
+}
+
+struct SlotPair(FirstSlot, SecondSlot);
+
+fn with_slot_pair(f: impl Fn(FirstSlot, SecondSlot)) {
+    f(FirstSlot, SecondSlot);
+}
+
+struct AliasWorker;
+impl AliasWorker {
+    fn work(&self) {}
+}
+
+mod api {
+    use super::AliasWorker as CallbackWorker;
+    pub fn with_aliased_worker(f: impl Fn(CallbackWorker)) {
+        f(CallbackWorker);
+    }
 }
 
 enum Mode {
@@ -2760,10 +2800,10 @@ impl Cleanup {
             p.terminate();
         }
         if let Ok(p) = self.cache.get_mut() {
-            p.push();
+            p.mutex_touch();
         }
         if let Some(p) = self.map.get_mut("k") {
-            p.finish();
+            p.map_touch();
         }
         Ok(())
     }
@@ -2774,6 +2814,8 @@ struct WatchState;
 impl WatchState {
     fn upsert_thread(&mut self) {}
     fn remove_thread(&mut self) {}
+    fn explicit_self_call(&mut self) {}
+    fn ufcs_call(&mut self) {}
     fn dead_watch_method(&mut self) {}
     fn test_only_prod_method(&mut self) {}
 }
@@ -2787,6 +2829,14 @@ impl Watcher {
         F: FnOnce(&mut WatchState) -> Option<()>,
     {
         let _ = mutate(&mut self.state);
+    }
+    fn with_arc_self(self: Arc<Self>, f: impl FnOnce(&mut WatchState)) {
+        let mut s = WatchState;
+        f(&mut s);
+    }
+    fn with_ufcs_self(&self, f: impl FnOnce(&mut WatchState)) {
+        let mut s = WatchState;
+        f(&mut s);
     }
     fn upsert(&mut self) {
         self.mutate_and_publish(move |state| {
@@ -2810,7 +2860,14 @@ fn main() {
     };
     r.step();
     let TupleWrap(mut inner) = TupleWrap(Projector);
-    inner.push();
+    inner.tuple_ping();
+
+    let SlotPair(_, second) = SlotPair(FirstSlot, SecondSlot);
+    second.slot_finish();
+    with_slot_pair(|/* skip */ _, s| s.slot_finish());
+    api::with_aliased_worker(|w| w.work());
+    let local_weak: helpers::Weak = helpers::Weak;
+    local_weak.refresh();
 
     let h = Arc::new(ProcessHandle {
         kind: ProcessKind::Local(Some(Terminator)),
@@ -2825,14 +2882,17 @@ fn main() {
     let mut w = Watcher { state: WatchState };
     w.upsert();
     w.remove();
+    let arc_w = Arc::new(Watcher { state: WatchState });
+    arc_w.with_arc_self(|st| st.explicit_self_call());
+    Watcher::with_ufcs_self(&w, |st| st.ufcs_call());
 
     with_remote_pair(|map, item| {
         if let Some(st) = map.get_mut("a") {
-            st.touch();
+            st.touch_generic();
         }
         item.mark();
     });
-    with_impl_fn(|st| st.touch());
+    with_impl_fn(|st| st.touch_impl_fn());
 }
 
 #[cfg(test)]
@@ -2860,14 +2920,23 @@ mod tests {
         ("src/main.rs", "Projector::push"),
         ("src/main.rs", "Projector::finish"),
         ("src/main.rs", "Projector::reset"),
+        ("src/main.rs", "Projector::tuple_ping"),
+        ("src/main.rs", "Projector::mutex_touch"),
+        ("src/main.rs", "Projector::map_touch"),
         ("src/main.rs", "Terminator::terminate"),
         ("src/main.rs", "Terminator::terminate_discovery"),
         ("src/main.rs", "ProcessHandle::terminate_discovery"),
         ("src/main.rs", "ProcessHandle::terminate"),
         ("src/main.rs", "WatchState::upsert_thread"),
         ("src/main.rs", "WatchState::remove_thread"),
-        ("src/helpers.rs", "RemoteState::touch"),
+        ("src/main.rs", "WatchState::explicit_self_call"),
+        ("src/main.rs", "WatchState::ufcs_call"),
+        ("src/main.rs", "SecondSlot::slot_finish"),
+        ("src/main.rs", "AliasWorker::work"),
+        ("src/helpers.rs", "RemoteState::touch_generic"),
+        ("src/helpers.rs", "RemoteState::touch_impl_fn"),
         ("src/helpers.rs", "RemoteItem::mark"),
+        ("src/helpers.rs", "Weak::refresh"),
     ] {
         assert!(
             !is_dead_in(file, sym),
@@ -2883,9 +2952,13 @@ mod tests {
         ("src/main.rs", "WatchState::dead_watch_method"),
         ("src/main.rs", "WatchState::test_only_prod_method"),
         ("src/main.rs", "test_only_free_fn"),
+        ("src/main.rs", "FirstSlot::slot_finish"),
         ("src/main.rs", "Decoy::push"),
         ("src/main.rs", "Decoy::terminate"),
         ("src/main.rs", "Decoy::upsert_thread"),
+        ("src/main.rs", "Decoy::work"),
+        ("src/main.rs", "Decoy::refresh"),
+        ("src/main.rs", "Decoy::slot_finish"),
         ("src/helpers.rs", "RemoteState::unused_remote"),
     ] {
         assert!(
