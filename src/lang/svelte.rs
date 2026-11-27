@@ -41,7 +41,8 @@ pub fn extract(rel_path: &str, src: &str, blake3_hex: String) -> Result<FileExtr
     let mut refs = Vec::new();
     let mut bridges = Vec::new();
     let mut ir_funcs = Vec::new();
-    let mut comp_aliases: std::collections::HashMap<String, String> = std::collections::HashMap::new();
+    let mut comp_aliases: std::collections::HashMap<String, (String, Option<String>)> =
+        std::collections::HashMap::new();
 
     // Extract all <script ...>...</script> blocks
     let mut search_pos = 0;
@@ -60,11 +61,17 @@ pub fn extract(rel_path: &str, src: &str, blake3_hex: String) -> Result<FileExtr
             let t = sline.trim();
             if let Some(rest) = t.strip_prefix("import ") {
                 if let Some((alias_part, path_part)) = rest.split_once(" from ") {
-                    let alias = alias_part.trim();
+                    let alias = alias_part.split(',').next().unwrap_or("").trim();
                     let path = path_part.trim().trim_end_matches(';').trim_matches('"').trim_matches('\'');
-                    if !alias.contains('{') && path.ends_with(".svelte") {
+                    if !alias.is_empty()
+                        && !alias.starts_with('{')
+                        && !alias.starts_with('*')
+                        && !alias.starts_with("type ")
+                        && path.ends_with(".svelte")
+                    {
                         if let Some(stem) = Path::new(path).file_stem().and_then(|s| s.to_str()) {
-                            comp_aliases.insert(alias.to_string(), stem.to_string());
+                            let resolved_file = resolve_relative_path(rel_path, path);
+                            comp_aliases.insert(alias.to_string(), (stem.to_string(), resolved_file));
                         }
                     }
                 }
@@ -72,6 +79,17 @@ pub fn extract(rel_path: &str, src: &str, blake3_hex: String) -> Result<FileExtr
         }
 
         if let Ok(sub) = ts_js::extract(rel_path, script_src, String::new(), Language::Svelte, line_offset) {
+            for sym in &sub.symbols {
+                if sym.kind == SymbolKind::Script && sym.name == "<module>" {
+                    refs.push(RawRef {
+                        from_symbol_id: comp_id.clone(),
+                        target_name: sym.id.clone(),
+                        qualifier: None,
+                        kind: EdgeKind::Calls,
+                        line: sym.span.start_line,
+                    });
+                }
+            }
             imports.extend(sub.imports);
             symbols.extend(sub.symbols);
             refs.extend(sub.refs);
@@ -109,11 +127,14 @@ pub fn extract(rel_path: &str, src: &str, blake3_hex: String) -> Result<FileExtr
             }
             let tag = &src[start..end];
             if !tag.is_empty() {
-                let target = comp_aliases.get(tag).cloned().unwrap_or_else(|| tag.to_string());
+                let (target, qualifier) = comp_aliases
+                    .get(tag)
+                    .cloned()
+                    .unwrap_or_else(|| (tag.to_string(), None));
                 refs.push(RawRef {
                     from_symbol_id: comp_id.clone(),
                     target_name: target,
-                    qualifier: None,
+                    qualifier,
                     kind: EdgeKind::TemplateRef,
                     line: line_num,
                 });
@@ -155,4 +176,28 @@ pub fn extract(rel_path: &str, src: &str, blake3_hex: String) -> Result<FileExtr
         bridges,
         ir_funcs,
     })
+}
+
+fn resolve_relative_path(current_file: &str, import_path: &str) -> Option<String> {
+    if !import_path.starts_with("./") && !import_path.starts_with("../") {
+        return None;
+    }
+    let mut parts: Vec<&str> = match current_file.rsplit_once('/') {
+        Some((dir, _)) if !dir.is_empty() => dir.split('/').collect(),
+        _ => Vec::new(),
+    };
+    for seg in import_path.split('/') {
+        match seg {
+            "" | "." => {}
+            ".." => {
+                parts.pop()?;
+            }
+            other => parts.push(other),
+        }
+    }
+    if parts.is_empty() {
+        None
+    } else {
+        Some(parts.join("/"))
+    }
 }

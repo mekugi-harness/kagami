@@ -198,6 +198,11 @@ fn resolve_ref(
     by_lang_name: &HashMap<(Language, &str), Vec<String>>,
     by_lang_qname: &HashMap<(Language, &str), Vec<String>>,
 ) -> Vec<(String, Confidence)> {
+    // 0. Direct symbol ID match (e.g. Svelte component -> <module> script block)
+    if r.qualifier.is_none() && symbols.contains_key(&r.target_name) {
+        return vec![(r.target_name.clone(), Confidence::Resolved)];
+    }
+
     // 1. O(1) same-file match
     if r.qualifier.is_none() {
         if let Some(id) = by_file_name.get(&(ext.file.as_str(), r.target_name.as_str())) {
@@ -207,6 +212,14 @@ fn resolve_ref(
 
     // 2. O(1) qualified match (Type.Method or Type::method)
     if let Some(ref qual) = r.qualifier {
+        // Exact file-path qualifier (e.g. relative Svelte default component import)
+        if let Some(id) = by_file_name.get(&(qual.as_str(), r.target_name.as_str())) {
+            return vec![(id.clone(), Confidence::Resolved)];
+        }
+        if qual.ends_with(".svelte") {
+            return Vec::new();
+        }
+
         for sep in [".", "::"] {
             let q = format!("{}{}{}", qual, sep, r.target_name);
             if let Some(ids) = by_lang_qname.get(&(ext.lang, q.as_str())) {

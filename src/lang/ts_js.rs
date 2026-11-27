@@ -57,19 +57,32 @@ pub fn extract(
         let root = tree.root_node();
         let mut rc = root.walk();
         for ch in root.children(&mut rc) {
-            if matches!(
-                ch.kind(),
+            match ch.kind() {
                 "expression_statement"
-                    | "if_statement"
-                    | "for_statement"
-                    | "for_in_statement"
-                    | "while_statement"
-                    | "try_statement"
-                    | "lexical_declaration"
-                    | "variable_declaration"
-            ) {
-                has_top_level_exec = true;
-                collect_ts_refs_and_bridges(ch, src, line_offset, &mod_id, &mut refs, &mut bridges);
+                | "if_statement"
+                | "for_statement"
+                | "for_in_statement"
+                | "while_statement"
+                | "try_statement" => {
+                    has_top_level_exec = true;
+                    collect_ts_refs_and_bridges(ch, src, line_offset, &mod_id, &mut refs, &mut bridges);
+                }
+                "lexical_declaration" | "variable_declaration" => {
+                    if collect_ts_non_func_var_inits(ch, src, line_offset, &mod_id, &mut refs, &mut bridges) {
+                        has_top_level_exec = true;
+                    }
+                }
+                "export_statement" => {
+                    let mut ec = ch.walk();
+                    for ech in ch.children(&mut ec) {
+                        if matches!(ech.kind(), "lexical_declaration" | "variable_declaration")
+                            && collect_ts_non_func_var_inits(ech, src, line_offset, &mod_id, &mut refs, &mut bridges)
+                        {
+                            has_top_level_exec = true;
+                        }
+                    }
+                }
+                _ => {}
             }
         }
     }
@@ -120,6 +133,40 @@ pub fn extract(
         bridges,
         ir_funcs,
     })
+}
+
+fn is_ts_function_value(mut node: Node<'_>) -> bool {
+    while node.kind() == "parenthesized_expression" {
+        if let Some(inner) = node.named_child(0) {
+            node = inner;
+        } else {
+            break;
+        }
+    }
+    matches!(node.kind(), "arrow_function" | "function_expression")
+}
+
+fn collect_ts_non_func_var_inits(
+    decl_node: Node<'_>,
+    src: &str,
+    line_offset: usize,
+    mod_id: &str,
+    refs: &mut Vec<RawRef>,
+    bridges: &mut Vec<BridgeHint>,
+) -> bool {
+    let mut found = false;
+    let mut vc = decl_node.walk();
+    for decl in decl_node.children(&mut vc) {
+        if decl.kind() == "variable_declarator" {
+            if let Some(val) = decl.child_by_field_name("value") {
+                if !is_ts_function_value(val) {
+                    found = true;
+                    collect_ts_refs_and_bridges(val, src, line_offset, mod_id, refs, bridges);
+                }
+            }
+        }
+    }
+    found
 }
 
 #[allow(clippy::too_many_arguments)]

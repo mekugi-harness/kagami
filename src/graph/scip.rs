@@ -150,9 +150,27 @@ fn scip_symbol_matches_name(scip_sym: &str, name: &str) -> bool {
     if name.is_empty() {
         return false;
     }
-    // Match against the terminal descriptor segment (ignoring earlier owner/type prefixes)
-    let trimmed = scip_sym.trim_end_matches(|c: char| matches!(c, '.' | '#' | '/' | '(' | ')' | '!' | ':'));
-    let terminal = trimmed
+    // Strip trailing SCIP descriptor punctuation and empty/numeric method disambiguators
+    // (e.g. foo()., foo(+1)., bar(+2)().), while preserving parameter descriptors like (x).
+    let mut s = scip_sym.trim_end_matches(|c: char| matches!(c, '.' | '#' | '/' | '!' | ':'));
+    loop {
+        if let Some(before_close) = s.strip_suffix(')') {
+            if let Some(open_idx) = before_close.rfind('(') {
+                let inner = &before_close[open_idx + 1..];
+                let digits = inner.strip_prefix('+').unwrap_or(inner);
+                let is_disambiguator =
+                    inner.is_empty() || (!digits.is_empty() && digits.chars().all(|c| c.is_ascii_digit()));
+                if is_disambiguator {
+                    s = before_close[..open_idx]
+                        .trim_end_matches(|c: char| matches!(c, '.' | '#' | '/' | '!' | ':'));
+                    continue;
+                }
+            }
+        }
+        break;
+    }
+    let s = s.strip_suffix('\x60').unwrap_or(s);
+    let terminal = s
         .rsplit(|c: char| !c.is_alphanumeric() && c != '_')
         .next()
         .unwrap_or("");
@@ -210,6 +228,7 @@ pub fn apply_scip_overlay(graph: &mut CodeGraph, index: &ScipIndex, analysis_roo
 
     let mut added_or_upgraded = 0usize;
     let mut seen_new: HashSet<(String, String, EdgeKind)> = HashSet::new();
+    let mut exact_sites: HashSet<(String, String, usize)> = HashSet::new();
 
     // 2. Process non-local reference occurrences
     for doc in &index.documents {
@@ -240,6 +259,7 @@ pub fn apply_scip_overlay(graph: &mut CodeGraph, index: &ScipIndex, analysis_roo
             if from_id == target_id {
                 continue;
             }
+            exact_sites.insert((from_id.clone(), rel.clone(), line));
             if let Some(&eidx) = existing.get(&(from_id.clone(), target_id.clone())) {
                 if graph.edges[eidx].confidence < Confidence::Exact {
                     graph.edges[eidx].confidence = Confidence::Exact;
@@ -324,6 +344,24 @@ pub fn apply_scip_overlay(graph: &mut CodeGraph, index: &ScipIndex, analysis_roo
                     graph.incoming.entry(from_id.clone()).or_default().push(rev_idx);
                     added_or_upgraded += 1;
                 }
+            }
+        }
+    }
+
+    // 4. Prune competing lower-confidence guessed edges at sites where SCIP established Exact edges
+    if !exact_sites.is_empty() {
+        let before = graph.edges.len();
+        graph.edges.retain(|e| {
+            e.confidence == Confidence::Exact
+                || e.via_bridge.is_some()
+                || !exact_sites.contains(&(e.from.clone(), e.file.clone(), e.line))
+        });
+        if graph.edges.len() != before {
+            graph.outgoing.clear();
+            graph.incoming.clear();
+            for (idx, e) in graph.edges.iter().enumerate() {
+                graph.outgoing.entry(e.from.clone()).or_default().push(idx);
+                graph.incoming.entry(e.to.clone()).or_default().push(idx);
             }
         }
     }

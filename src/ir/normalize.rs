@@ -205,13 +205,24 @@ fn is_err_return(node: &IrNode) -> bool {
     fn contains_err(n: &IrNode) -> bool {
         match n {
             IrNode::Var(v) => v == "err",
-            IrNode::Return(Some(inner)) => contains_err(inner),
             IrNode::Seq(items) => items.iter().any(contains_err),
             IrNode::Call { args, .. } => args.iter().any(contains_err),
             _ => false,
         }
     }
-    is_return_only(node) && contains_err(node)
+    let ret = match node {
+        IrNode::Return(v) => Some(v),
+        IrNode::Seq(items) if items.len() == 1 => match &items[0] {
+            IrNode::Return(v) => Some(v),
+            _ => None,
+        },
+        _ => None,
+    };
+    match ret {
+        Some(None) => true,
+        Some(Some(inner)) => contains_err(inner),
+        None => false,
+    }
 }
 
 fn extract_eq_scrutinee<'a>(cond: &'a IrNode) -> Option<(&'a IrNode, &'a IrNode)> {
