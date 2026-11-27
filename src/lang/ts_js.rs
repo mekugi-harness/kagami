@@ -292,13 +292,34 @@ fn collect_ts_imported_bindings(
                                     .child_by_field_name("alias")
                                     .map(|a| node_text(a, src).to_string())
                                     .unwrap_or_else(|| orig.clone());
-                                bindings.insert(
-                                    local,
-                                    ImportedBinding {
-                                        target_name: orig,
-                                        resolved_file: resolved_file.clone(),
-                                    },
-                                );
+                                if orig == "default" {
+                                    if resolved_file.is_some() {
+                                        let target_name = if path.ends_with(".svelte") {
+                                            Path::new(&path)
+                                                .file_stem()
+                                                .and_then(|s| s.to_str())
+                                                .unwrap_or(&local)
+                                                .to_string()
+                                        } else {
+                                            "<default>".to_string()
+                                        };
+                                        bindings.insert(
+                                            local,
+                                            ImportedBinding {
+                                                target_name,
+                                                resolved_file: resolved_file.clone(),
+                                            },
+                                        );
+                                    }
+                                } else {
+                                    bindings.insert(
+                                        local,
+                                        ImportedBinding {
+                                            target_name: orig,
+                                            resolved_file: resolved_file.clone(),
+                                        },
+                                    );
+                                }
                             }
                         }
                     }
@@ -438,6 +459,7 @@ fn walk_ts_nodes(
                 if is_default {
                     let span = node_span(child, line_offset);
                     let def_id = make_symbol_id(rel_path, "<default>", span.start_line);
+                    let has_decl = symbols.len() > sym_len_before;
                     symbols.push(Symbol {
                         id: def_id.clone(),
                         name: "<default>".to_string(),
@@ -445,14 +467,18 @@ fn walk_ts_nodes(
                         kind: SymbolKind::Script,
                         lang,
                         file: rel_path.to_string(),
-                        span: crate::model::Span { start_line: 0, end_line: 0 },
+                        span: if has_decl {
+                            crate::model::Span { start_line: 0, end_line: 0 }
+                        } else {
+                            span
+                        },
                         visibility: Visibility::Public,
                         is_test: is_test_file,
                         is_entrypoint: false,
                         is_dynamic_candidate: false,
                         package_or_module: rel_path.to_string(),
                     });
-                    if symbols.len() > sym_len_before + 1 {
+                    if has_decl {
                         // Link <default> to the first declared symbol inside export default ...
                         let target_id = symbols[sym_len_before].id.clone();
                         refs.push(RawRef {
@@ -498,7 +524,13 @@ fn walk_ts_nodes(
                         }
                     }
                 } else {
-                    // Handle export { localFn as default };
+                    // Handle export { localFn as default }; and export { run as default } from './mod';
+                    let reexport_source = child
+                        .child_by_field_name("source")
+                        .map(|s| strip_quotes(node_text(s, src)));
+                    if let Some(ref spath) = reexport_source {
+                        imports.push(spath.clone());
+                    }
                     let mut ec = child.walk();
                     for clause in child.children(&mut ec) {
                         if clause.kind() != "export_clause" {
@@ -529,17 +561,42 @@ fn walk_ts_nodes(
                                         package_or_module: rel_path.to_string(),
                                     });
                                     let ident = node_text(orig, src);
-                                    let (target_name, qualifier) = imported_bindings
-                                        .get(ident)
-                                        .map(|b| (b.target_name.clone(), b.resolved_file.clone()))
-                                        .unwrap_or_else(|| (ident.to_string(), None));
-                                    refs.push(RawRef {
-                                        from_symbol_id: def_id,
-                                        target_name,
-                                        qualifier,
-                                        kind: EdgeKind::Calls,
-                                        line: span.start_line,
-                                    });
+                                    if let Some(ref spath) = reexport_source {
+                                        if let Some(resolved_file) = resolve_relative_path(rel_path, spath) {
+                                            let target_name = if ident == "default" {
+                                                if spath.ends_with(".svelte") {
+                                                    Path::new(spath)
+                                                        .file_stem()
+                                                        .and_then(|s| s.to_str())
+                                                        .unwrap_or(ident)
+                                                        .to_string()
+                                                } else {
+                                                    "<default>".to_string()
+                                                }
+                                            } else {
+                                                ident.to_string()
+                                            };
+                                            refs.push(RawRef {
+                                                from_symbol_id: def_id,
+                                                target_name,
+                                                qualifier: Some(resolved_file),
+                                                kind: EdgeKind::Calls,
+                                                line: span.start_line,
+                                            });
+                                        }
+                                    } else {
+                                        let (target_name, qualifier) = imported_bindings
+                                            .get(ident)
+                                            .map(|b| (b.target_name.clone(), b.resolved_file.clone()))
+                                            .unwrap_or_else(|| (ident.to_string(), None));
+                                        refs.push(RawRef {
+                                            from_symbol_id: def_id,
+                                            target_name,
+                                            qualifier,
+                                            kind: EdgeKind::Calls,
+                                            line: span.start_line,
+                                        });
+                                    }
                                 }
                             }
                         }

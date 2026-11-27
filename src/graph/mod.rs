@@ -252,8 +252,8 @@ fn resolve_ref(
                 for (js_ext, ts_exts) in [
                     (".js", &[ ".ts", ".tsx" ][..]),
                     (".jsx", &[ ".tsx", ".ts" ][..]),
-                    (".mjs", &[ ".mts", ".ts" ][..]),
-                    (".cjs", &[ ".cts", ".ts" ][..]),
+                    (".mjs", &[ ".mts" ][..]),
+                    (".cjs", &[ ".cts" ][..]),
                 ] {
                     if let Some(stem) = qual.strip_suffix(js_ext) {
                         for ts_ext in ts_exts {
