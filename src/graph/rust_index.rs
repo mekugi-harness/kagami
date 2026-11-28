@@ -1203,11 +1203,11 @@ impl<'a> RustTypeIndex<'a> {
                                 self.file_uses_by_local.get(&(caller_file, target_sym))
                         {
                             for u2 in reimports {
-                                    if u2.mod_scope == caller_scope
-                                        && (!u2.is_test || caller_is_test)
-                                        && u2.target_path != u.target_path
-                                        && let Some((mp2, ts2)) = u2.target_path.rsplit_once("::")
-                                    {
+                                if u2.mod_scope == caller_scope
+                                    && (!u2.is_test || caller_is_test)
+                                    && u2.target_path != u.target_path
+                                    && let Some((mp2, ts2)) = u2.target_path.rsplit_once("::")
+                                {
                                     if mp2 == "super" {
                                         let parent_scope = caller_scope
                                             .rsplit_once("::")

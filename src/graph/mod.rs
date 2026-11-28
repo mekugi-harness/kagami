@@ -44,14 +44,24 @@ pub struct CodeGraph {
 
 impl CodeGraph {
     pub fn build(root: &Path, files: &[DiscoveredFile], use_cache: bool) -> Result<Self> {
-        Self::build_internal(root, files, use_cache, true)
+        Self::build_internal(root, files, use_cache, true, false)
     }
 
     /// Build the graph for commands that only need symbols/edges/interface_impls (e.g. `dead`,
     /// `blast-radius`), allowing a fast warm load directly from `.kagami/graph.bin` without
     /// deserializing raw per-file extracts or IR.
     pub fn build_for_graph(root: &Path, files: &[DiscoveredFile], use_cache: bool) -> Result<Self> {
-        Self::build_internal(root, files, use_cache, false)
+        Self::build_internal(root, files, use_cache, false, true)
+    }
+
+    /// Build the graph for a path-scoped query without reading or overwriting the whole-repo
+    /// graph snapshot cache (while still reusing and preserving per-file extracts in `cache.bin`).
+    pub fn build_for_scoped_graph(
+        root: &Path,
+        files: &[DiscoveredFile],
+        use_cache: bool,
+    ) -> Result<Self> {
+        Self::build_internal(root, files, use_cache, false, false)
     }
 
     /// Attempt to load the compact cached `GraphSnapshot` directly without hydrating a full
@@ -74,6 +84,7 @@ impl CodeGraph {
         files: &[DiscoveredFile],
         use_cache: bool,
         need_extracts: bool,
+        allow_graph_cache: bool,
     ) -> Result<Self> {
         let prof = std::env::var_os("KAGAMI_PROFILE").is_some();
         let t0 = std::time::Instant::now();
@@ -87,7 +98,7 @@ impl CodeGraph {
         let cargo_paths = collect_cargo_manifest_paths(root, &rust_rel_paths);
 
         // Fast-path: if caller does not need raw extracts/IR, try loading the cached graph snapshot.
-        if use_cache && !need_extracts {
+        if use_cache && !need_extracts && allow_graph_cache {
             if let Some(graph) = try_load_cached_graph(&store, root, files, &cargo_paths, prof, t0) {
                 return Ok(graph);
             }
@@ -153,22 +164,25 @@ impl CodeGraph {
         let t_parse = t0.elapsed();
 
         if use_cache {
-            let current_paths: FxHashSet<&str> =
-                parsed.iter().map(|p| p.extract.file.as_str()).collect();
-            let has_stale = prev_cache
-                .files
-                .keys()
-                .any(|rel| !current_paths.contains(rel.as_str()));
-            let dirty = prev_cache.version != PARSER_VERSION
-                || has_stale
-                || parsed.len() != prev_cache.files.len()
-                || parsed.iter().any(|p| p.reparsed || p.stat_changed);
+            let mut next_cache = prev_cache;
+            let version_changed = next_cache.version != PARSER_VERSION;
+            next_cache.version = PARSER_VERSION;
+            let prev_len = next_cache.files.len();
+            if allow_graph_cache {
+                let current_paths: FxHashSet<&str> =
+                    parsed.iter().map(|p| p.extract.file.as_str()).collect();
+                next_cache
+                    .files
+                    .retain(|rel, _| current_paths.contains(rel.as_str()));
+            } else {
+                next_cache.files.retain(|rel, _| root.join(rel).exists());
+            }
+            let removed_stale = next_cache.files.len() != prev_len;
+            let has_new_or_changed = parsed.iter().any(|p| {
+                p.reparsed || p.stat_changed || !next_cache.files.contains_key(&p.extract.file)
+            });
 
-            if dirty {
-                let mut next_cache = CacheData {
-                    version: PARSER_VERSION,
-                    files: HashMap::with_capacity(parsed.len()),
-                };
+            if version_changed || removed_stale || has_new_or_changed {
                 for item in &parsed {
                     next_cache.files.insert(
                         item.extract.file.clone(),
@@ -183,7 +197,7 @@ impl CodeGraph {
         }
         let t_save = t0.elapsed();
 
-        let manifest_entries: Vec<ManifestEntry> = if use_cache {
+        let manifest_entries: Vec<ManifestEntry> = if use_cache && allow_graph_cache {
             parsed
                 .iter()
                 .map(|p| ManifestEntry {
@@ -203,7 +217,7 @@ impl CodeGraph {
         let g = Self::from_extracts_with_crates(extracts, crate_roots);
         let t_graph = t0.elapsed();
 
-        if use_cache {
+        if use_cache && allow_graph_cache {
             let cargo_entries = build_cargo_manifest_entries(root, &cargo_paths);
             let fingerprint = compute_repo_fingerprint(&manifest_entries, &cargo_entries);
             let manifest = GraphManifest {
@@ -212,18 +226,14 @@ impl CodeGraph {
                 files: manifest_entries,
                 cargo_manifests: cargo_entries,
             };
-            let graph_unchanged = store
-                .load_manifest()
-                .is_some_and(|m| m.fingerprint == fingerprint && store.graph_path().exists());
-            if !graph_unchanged {
-                if let Some(snap) = GraphSnapshot::from_graph_parts(
-                    fingerprint,
-                    &g.symbols,
-                    &g.edges,
-                    &g.interface_impls,
-                ) {
-                    store.save_graph(&snap);
-                }
+            // Only reached on graph cache miss/corrupt/stale; always persist fresh graph snapshot.
+            if let Some(snap) = GraphSnapshot::from_graph_parts(
+                fingerprint,
+                &g.symbols,
+                &g.edges,
+                &g.interface_impls,
+            ) {
+                store.save_graph(&snap);
             }
             store.save_manifest(&manifest);
         }

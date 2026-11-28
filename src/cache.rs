@@ -18,6 +18,9 @@ pub struct FileStat {
     pub mtime_secs: i64,
     pub mtime_nanos: u32,
     pub size: u64,
+    pub ctime_secs: i64,
+    pub ctime_nanos: i64,
+    pub ino: u64,
 }
 
 impl FileStat {
@@ -32,10 +35,20 @@ impl FileStat {
                 (-(dur.as_secs() as i64), dur.subsec_nanos())
             }
         };
+        #[cfg(unix)]
+        let (ctime_secs, ctime_nanos, ino) = {
+            use std::os::unix::fs::MetadataExt;
+            (meta.ctime(), meta.ctime_nsec(), meta.ino())
+        };
+        #[cfg(not(unix))]
+        let (ctime_secs, ctime_nanos, ino) = (0, 0, 0);
         Some(Self {
             mtime_secs,
             mtime_nanos,
             size,
+            ctime_secs,
+            ctime_nanos,
+            ino,
         })
     }
 }
@@ -343,6 +356,11 @@ impl CacheStore {
     }
 
     pub fn cleanup_legacy_json(&self) {
+        if let Ok(meta) = fs::symlink_metadata(&self.dir)
+            && meta.file_type().is_symlink()
+        {
+            return;
+        }
         if let Ok(meta) = fs::symlink_metadata(&self.legacy_json_path)
             && !meta.file_type().is_symlink()
             && meta.file_type().is_file()

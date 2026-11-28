@@ -145,6 +145,23 @@ fn corrupt_and_stale_version_cache_recovery() {
     let r_stale =
         serde_json::to_string(&analyze_dead(&recovered_stale, &dead_opts(DeadKinds::All))).unwrap();
     assert_eq!(baseline, r_stale);
+
+    // 3. Corrupt ONLY graph.bin while manifest.bin stays valid: recovery must repair graph.bin
+    // so the subsequent run hits the snapshot cache.
+    fs::write(store.graph_path(), b"TRUNCATED").unwrap();
+    let recovered_graph_only = CodeGraph::build_for_graph(root, &files, true).unwrap();
+    assert_eq!(
+        baseline,
+        serde_json::to_string(&analyze_dead(
+            &recovered_graph_only,
+            &dead_opts(DeadKinds::All)
+        ))
+        .unwrap()
+    );
+    assert!(
+        CodeGraph::try_load_cached_snapshot(root, &files).is_some(),
+        "repaired graph.bin should hit snapshot cache on the next run"
+    );
 }
 
 #[test]
@@ -288,5 +305,33 @@ fn cargo_toml_change_invalidates_graph_cache() {
     assert_eq!(
         serde_json::to_string(&r2).unwrap(),
         serde_json::to_string(&r_uncached).unwrap()
+    );
+}
+
+#[test]
+fn scoped_build_preserves_whole_repo_cache() {
+    let dir = setup_polyglot_repo();
+    let root = dir.path();
+    let all_files = discover_all(root);
+    let store = CacheStore::new(root);
+
+    // Populate whole-repo cache
+    let _ = CodeGraph::build_for_graph(root, &all_files, true).unwrap();
+    let orig_count = store.load().files.len();
+    assert!(orig_count >= 3);
+
+    // Run a path-scoped build on only pkg/app.go
+    let go_only: Vec<_> = all_files
+        .iter()
+        .filter(|f| f.rel_path.ends_with(".go"))
+        .cloned()
+        .collect();
+    let _ = CodeGraph::build_for_scoped_graph(root, &go_only, true).unwrap();
+
+    // Whole-repo extract cache and graph snapshot must remain intact
+    assert_eq!(store.load().files.len(), orig_count);
+    assert!(
+        CodeGraph::try_load_cached_snapshot(root, &all_files).is_some(),
+        "scoped build must not evict whole-repo graph snapshot"
     );
 }

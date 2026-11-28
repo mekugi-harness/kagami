@@ -67,7 +67,7 @@ kagami --scip go.scip --scip rust.scip.json dead
 
 - `--root <dir>` — Repository root (default: `.`).
 - `--path <glob>` — Repeatable relative path glob filter restricting reported results.
-- `--no-cache` — Bypass the incremental cache (`.kagami/cache.json`).
+- `--no-cache` — Bypass the incremental binary caches under `.kagami/` (`cache.bin`, `manifest.bin`, `graph.bin`).
 - `--scip <path>` — Repeatable SCIP index file (`.scip` or `.scip.json`).
 - `--format <md|json>` — Output format (default: `md`).
 

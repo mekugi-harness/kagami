@@ -264,6 +264,7 @@ pub fn analyze_dead(graph: &CodeGraph, opts: &DeadOptions) -> DeadReport {
             .then_with(|| a.reason.cmp(&b.reason))
             .then_with(|| a.file.cmp(&b.file))
             .then_with(|| a.span.start_line.cmp(&b.span.start_line))
+            .then_with(|| a.symbol.cmp(&b.symbol))
     });
 
     DeadReport {
@@ -419,6 +420,7 @@ pub fn analyze_dead_snapshot(snap: &GraphSnapshot, opts: &DeadOptions) -> DeadRe
             .then_with(|| a.reason.cmp(&b.reason))
             .then_with(|| a.file.cmp(&b.file))
             .then_with(|| a.span.start_line.cmp(&b.span.start_line))
+            .then_with(|| a.symbol.cmp(&b.symbol))
     });
 
     DeadReport {

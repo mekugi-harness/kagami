@@ -215,7 +215,11 @@ fn main() -> Result<()> {
         } => {
             // Always index whole repo for blast-radius so cross-file/cross-lang callers are visible
             let files = discover_files(&root, &extra_ignores, path_filter.as_ref())?;
-            let mut graph = CodeGraph::build_for_graph(&root, &files, !cli.no_cache)?;
+            let mut graph = if path_filter.is_some() {
+                CodeGraph::build_for_scoped_graph(&root, &files, !cli.no_cache)?
+            } else {
+                CodeGraph::build_for_graph(&root, &files, !cli.no_cache)?
+            };
             if let Some(ref tp) = test_paths {
                 graph.apply_test_paths(tp);
             }
