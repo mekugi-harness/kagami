@@ -983,19 +983,35 @@ fn walk_rust_items(
                 };
                 if let Some(body) = child.child_by_field_name("body") {
                     let prev_dir_scopes = ctx.mod_dir_scopes.clone();
-                    let mut uncond_paths = Vec::new();
-                    let mut cond_paths = Vec::new();
+                    let mut active_paths: Vec<String> = Vec::new();
+                    let mut cond_preds: Vec<String> = Vec::new();
+                    let mut has_uncond = false;
                     for &a in &attrs {
                         let ps = extract_rust_attr_path_overrides(&[a], ctx.src);
                         if ps.is_empty() {
                             continue;
                         }
-                        if attr_path(node_text(a, ctx.src)) == "path" {
-                            uncond_paths.extend(ps);
+                        let txt = node_text(a, ctx.src);
+                        if attr_path(txt) == "path" {
+                            active_paths.extend(ps);
+                            has_uncond = true;
+                            break;
                         } else {
-                            cond_paths.extend(ps);
+                            active_paths.extend(ps);
+                            if let Some(idx) = txt.find("cfg_attr(")
+                                && let Some(inner) = extract_balanced_parens(&txt[idx + 9..])
+                                && let Some((pred, _)) = inner.split_once(',')
+                            {
+                                cond_preds.push(pred.trim().to_string());
+                            }
                         }
                     }
+                    let preds_exhaustive = cond_preds.iter().any(|p| {
+                        let neg = format!("not({})", p);
+                        cond_preds
+                            .iter()
+                            .any(|q| q.replace(' ', "") == neg.replace(' ', ""))
+                    });
                     let join_dir = |base: &str, seg: &str| -> String {
                         let clean = seg.trim().trim_start_matches("./").trim_matches('/');
                         let s = if clean == "." { "" } else { clean };
@@ -1006,10 +1022,7 @@ fn walk_rust_items(
                             (false, false) => format!("{}/{}", base, s),
                         }
                     };
-                    if !uncond_paths.is_empty()
-                        || !cond_paths.is_empty()
-                        || !prev_dir_scopes.is_empty()
-                    {
+                    if !active_paths.is_empty() || !prev_dir_scopes.is_empty() {
                         let bases: Vec<String> = if prev_dir_scopes.is_empty() {
                             vec![mod_path.replace("::", "/")]
                         } else {
@@ -1021,18 +1034,12 @@ fn walk_rust_items(
                                 next_scopes.push(s);
                             }
                         };
-                        if !uncond_paths.is_empty() {
-                            for b in &bases {
-                                for p in &uncond_paths {
-                                    push_scope(join_dir(b, p));
-                                }
-                            }
-                        } else {
-                            for b in &bases {
+                        for b in &bases {
+                            if !has_uncond && !preds_exhaustive {
                                 push_scope(join_dir(b, mod_name));
-                                for p in &cond_paths {
-                                    push_scope(join_dir(b, p));
-                                }
+                            }
+                            for p in &active_paths {
+                                push_scope(join_dir(b, p));
                             }
                         }
                         ctx.mod_dir_scopes = next_scopes;

@@ -524,22 +524,11 @@ impl<'a> RustTypeIndex<'a> {
             .filter(|tr| known_files.contains(tr.as_str()))
             .filter_map(|tr| tr.rsplit_once('/').map(|(d, _)| d))
             .filter(|d| !d.is_empty())
+            .filter(|d| !target_root_dirs.contains(*d))
             .filter(|d| !crate_roots.values().any(|info| info.src_dir == *d))
             .collect();
-        let mut file_to_crate_root: HashMap<&'a str, String> = HashMap::new();
+        let mut auto_bin_dirs: FxHashSet<String> = FxHashSet::default();
         for &file in &known_files {
-            // Files inside an explicit non-library target root's directory (works even when autobins = false).
-            if let Some(best_dir) = explicit_target_dirs
-                .iter()
-                .copied()
-                .filter(|d| file.starts_with(&format!("{}/", d)))
-                .max_by_key(|d| d.len())
-            {
-                file_to_crate_root.insert(file, best_dir.to_string());
-                continue;
-            }
-            // A multi-file binary under src/bin/<name>/... has its own crate root dir iff
-            // src/bin/<name>/main.rs or an explicit Cargo target entry exists inside that directory.
             if let Some(bin_dir) = target_root_dirs
                 .iter()
                 .filter(|d| *d == "src/bin" || d.ends_with("/src/bin"))
@@ -549,14 +538,26 @@ impl<'a> RustTypeIndex<'a> {
                         rest.split_once('/').and_then(|(sub, _)| {
                             let cand_dir = format!("{}/{}", d, sub);
                             let cand_main = format!("{}/main.rs", cand_dir);
-                            (known_files.contains(cand_main.as_str())
-                                || explicit_target_dirs.contains(cand_dir.as_str()))
-                            .then_some(cand_dir)
+                            known_files.contains(cand_main.as_str()).then_some(cand_dir)
                         })
                     })
                 })
             {
-                file_to_crate_root.insert(file, bin_dir);
+                auto_bin_dirs.insert(bin_dir);
+            }
+        }
+        let mut file_to_crate_root: HashMap<&'a str, String> = HashMap::new();
+        for &file in &known_files {
+            // Pick the most specific target crate root directory across auto-discovered binaries
+            // (src/bin/<name>/main.rs) and explicit non-library target directories.
+            let best_target_dir = auto_bin_dirs
+                .iter()
+                .map(String::as_str)
+                .chain(explicit_target_dirs.iter().copied())
+                .filter(|d| file.starts_with(&format!("{}/", d)))
+                .max_by_key(|d| d.len());
+            if let Some(best_dir) = best_target_dir {
+                file_to_crate_root.insert(file, best_dir.to_string());
                 continue;
             }
             if target_roots.contains(file)
@@ -781,18 +782,30 @@ impl<'a> RustTypeIndex<'a> {
         // Resolve #[path = "..."] mod declarations against known_files and index macro-generated items.
         let mut file_mod_paths: FxHashMap<(&'a str, &'a str), Vec<String>> = FxHashMap::default();
         let mut mod_path_names: FxHashSet<&'a str> = FxHashSet::default();
-        let path_loaded_files = discover_path_loaded_files(
+        let prod_path_loaded_files = discover_path_loaded_files(
             extracts,
             &known_files,
             &target_roots,
             &target_root_dirs,
             false,
         );
+        let all_path_loaded_files = discover_path_loaded_files(
+            extracts,
+            &known_files,
+            &target_roots,
+            &target_root_dirs,
+            true,
+        );
         for ext in extracts {
             if ext.lang != Language::Rust {
                 continue;
             }
             if !ext.rust_mod_paths.is_empty() {
+                let active_path_loaded = if ext.is_test_file {
+                    &all_path_loaded_files
+                } else {
+                    &prod_path_loaded_files
+                };
                 for mp in &ext.rust_mod_paths {
                     let Some(ref raw_path) = mp.path else {
                         continue;
@@ -803,7 +816,7 @@ impl<'a> RustTypeIndex<'a> {
                         true,
                         &target_roots,
                         &target_root_dirs,
-                        &path_loaded_files,
+                        active_path_loaded,
                     ) {
                         let cand = normalize_rel_path_join(&bd, raw_path);
                         if known_files.contains(cand.as_str()) {

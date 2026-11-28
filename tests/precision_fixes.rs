@@ -5297,6 +5297,10 @@ fn test_rust_pr20_review_regressions() {
     fs::create_dir_all(root.join("src/nested_outer/inner_ov")).unwrap();
     fs::create_dir_all(root.join("src/cond_support")).unwrap();
     fs::create_dir_all(root.join("src/cond_alt")).unwrap();
+    fs::create_dir_all(root.join("src/bin/server")).unwrap();
+    fs::create_dir_all(root.join("src/unix_layout")).unwrap();
+    fs::create_dir_all(root.join("src/portable_layout")).unwrap();
+    fs::create_dir_all(root.join("src/exh_layout")).unwrap();
     fs::create_dir_all(root.join("named_pkg/src/bin")).unwrap();
     fs::create_dir_all(root.join("cli/src")).unwrap();
     fs::create_dir_all(root.join("shared/sub")).unwrap();
@@ -5316,6 +5320,70 @@ path = "app/entry.rs"
 [[bin]]
 name = "custom_entry_bin"
 path = "src/bin/custom_entry/entry.rs"
+
+[[bin]]
+name = "standalone_api_bin"
+path = "src/bin/api.rs"
+"#,
+    )
+    .unwrap();
+
+    // Standalone explicit binary src/bin/api.rs alongside auto-discovered src/bin/server/main.rs
+    fs::write(
+        root.join("src/bin/api.rs"),
+        r#"
+pub fn srv_api_run() {}
+fn main() {}
+"#,
+    )
+    .unwrap();
+    fs::write(
+        root.join("src/bin/server/main.rs"),
+        r#"
+mod api;
+mod worker;
+fn main() {
+    worker::run();
+}
+"#,
+    )
+    .unwrap();
+    fs::write(
+        root.join("src/bin/server/api.rs"),
+        r#"
+pub fn srv_api_run() {}
+"#,
+    )
+    .unwrap();
+    fs::write(
+        root.join("src/bin/server/worker.rs"),
+        r#"
+pub fn run() {
+    crate::api::srv_api_run();
+}
+"#,
+    )
+    .unwrap();
+
+    // Conditional-before-unconditional #[path] + exhaustive complementary cfg_attr
+    fs::write(
+        root.join("src/unix_layout/fixtures.rs"),
+        r#"
+pub fn unix_layout_fixture() {}
+"#,
+    )
+    .unwrap();
+    fs::write(
+        root.join("src/portable_layout/fixtures.rs"),
+        r#"
+pub fn portable_layout_fixture() {}
+"#,
+    )
+    .unwrap();
+    fs::write(
+        root.join("src/exh_layout/fixtures.rs"),
+        r#"
+pub fn orphan_default_layout_fn() {}
 "#,
     )
     .unwrap();
@@ -5836,6 +5904,18 @@ mod cond_support {
     #[cfg(test)]
     mod fixtures;
 }
+#[cfg_attr(unix, path = "unix_layout")]
+#[path = "portable_layout"]
+mod cond_before_fallback {
+    #[cfg(test)]
+    mod fixtures;
+}
+#[cfg_attr(unix, path = "unix_layout")]
+#[cfg_attr(not(unix), path = "portable_layout")]
+mod exh_layout {
+    #[cfg(test)]
+    mod fixtures;
+}
 
 mod helpers {
     #[cfg(test)]
@@ -6044,6 +6124,31 @@ fn main() {
     assert!(
         !is_dead("src/cond_alt/fixtures.rs", "cond_alt_fixture"),
         "Expected conditional #[cfg_attr(..., path = ...)] inline mod to also cover alt fixture dir; dead={:?}",
+        dead_prod.symbols
+    );
+    assert!(
+        !is_dead("src/bin/server/api.rs", "srv_api_run"),
+        "Expected src/bin/server/worker.rs crate::api::srv_api_run() to resolve to src/bin/server/api.rs; dead={:?}",
+        dead_prod.symbols
+    );
+    assert!(
+        is_dead("src/bin/api.rs", "srv_api_run"),
+        "Expected standalone src/bin/api.rs::srv_api_run to remain dead; dead={:?}",
+        dead_prod.symbols
+    );
+    assert!(
+        !is_dead("src/unix_layout/fixtures.rs", "unix_layout_fixture"),
+        "Expected conditional #[cfg_attr(unix, path = ...)] before #[path = ...] to exclude unix_layout/fixtures.rs; dead={:?}",
+        dead_prod.symbols
+    );
+    assert!(
+        !is_dead("src/portable_layout/fixtures.rs", "portable_layout_fixture"),
+        "Expected fallback #[path = ...] fixture to be excluded; dead={:?}",
+        dead_prod.symbols
+    );
+    assert!(
+        is_dead("src/exh_layout/fixtures.rs", "orphan_default_layout_fn"),
+        "Expected orphan file in unreachable default dir of exhaustive cfg_attr to remain reportable; dead={:?}",
         dead_prod.symbols
     );
     assert!(
