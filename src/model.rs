@@ -153,7 +153,7 @@ pub struct RawRef {
     pub kind: EdgeKind,
     pub line: usize,
     /// Optional structured receiver type/field chain for precise method resolution (Go).
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(default)]
     pub receiver_chain: Option<Vec<ReceiverStep>>,
 }
 

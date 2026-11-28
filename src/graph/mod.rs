@@ -4,10 +4,13 @@ pub mod dead;
 mod rust_index;
 pub mod scip;
 
-use crate::cache::{CacheData, CacheStore, PARSER_VERSION};
+use crate::cache::{
+    CacheData, CacheStore, CachedFile, CargoManifestEntry, FileStat, GraphManifest, GraphSnapshot,
+    ManifestEntry, PARSER_VERSION,
+};
 use crate::graph::rust_index::{
-    CargoCrateInfo, RustTypeIndex, discover_cargo_crates, materialize_rust_trait_and_macro_edges,
-    resolve_rust_module_qualified,
+    CargoCrateInfo, RustTypeIndex, collect_cargo_manifest_paths, discover_cargo_crates,
+    materialize_rust_trait_and_macro_edges, resolve_rust_module_qualified,
 };
 use crate::lang;
 use crate::model::{
@@ -16,6 +19,7 @@ use crate::model::{
 use crate::walker::DiscoveredFile;
 use anyhow::Result;
 use rayon::prelude::*;
+use rustc_hash::{FxHashMap, FxHashSet};
 use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::path::Path;
@@ -40,7 +44,55 @@ pub struct CodeGraph {
 
 impl CodeGraph {
     pub fn build(root: &Path, files: &[DiscoveredFile], use_cache: bool) -> Result<Self> {
+        Self::build_internal(root, files, use_cache, true)
+    }
+
+    /// Build the graph for commands that only need symbols/edges/interface_impls (e.g. `dead`,
+    /// `blast-radius`), allowing a fast warm load directly from `.kagami/graph.bin` without
+    /// deserializing raw per-file extracts or IR.
+    pub fn build_for_graph(root: &Path, files: &[DiscoveredFile], use_cache: bool) -> Result<Self> {
+        Self::build_internal(root, files, use_cache, false)
+    }
+
+    /// Attempt to load the compact cached `GraphSnapshot` directly without hydrating a full
+    /// `CodeGraph` (zero per-edge String allocations). Returns `None` on cache miss.
+    pub fn try_load_cached_snapshot(root: &Path, files: &[DiscoveredFile]) -> Option<GraphSnapshot> {
+        let prof = std::env::var_os("KAGAMI_PROFILE").is_some();
+        let t0 = std::time::Instant::now();
         let store = CacheStore::new(root);
+        let rust_rel_paths: Vec<&str> = files
+            .iter()
+            .filter(|f| f.lang == Language::Rust)
+            .map(|f| f.rel_path.as_str())
+            .collect();
+        let cargo_paths = collect_cargo_manifest_paths(root, &rust_rel_paths);
+        try_load_validated_snapshot(&store, root, files, &cargo_paths, prof, t0)
+    }
+
+    fn build_internal(
+        root: &Path,
+        files: &[DiscoveredFile],
+        use_cache: bool,
+        need_extracts: bool,
+    ) -> Result<Self> {
+        let prof = std::env::var_os("KAGAMI_PROFILE").is_some();
+        let t0 = std::time::Instant::now();
+        let store = CacheStore::new(root);
+
+        let rust_rel_paths: Vec<&str> = files
+            .iter()
+            .filter(|f| f.lang == Language::Rust)
+            .map(|f| f.rel_path.as_str())
+            .collect();
+        let cargo_paths = collect_cargo_manifest_paths(root, &rust_rel_paths);
+
+        // Fast-path: if caller does not need raw extracts/IR, try loading the cached graph snapshot.
+        if use_cache && !need_extracts {
+            if let Some(graph) = try_load_cached_graph(&store, root, files, &cargo_paths, prof, t0) {
+                return Ok(graph);
+            }
+        }
+
         let prev_cache = if use_cache {
             store.load()
         } else {
@@ -49,34 +101,142 @@ impl CodeGraph {
                 files: HashMap::new(),
             }
         };
+        let t_load = t0.elapsed();
 
-        let extracts: Vec<FileExtract> = files
-            .par_iter()
-            .filter_map(|df| {
-                let bytes = fs::read(&df.abs_path).ok()?;
-                let hash = blake3::hash(&bytes).to_hex().to_string();
-                if let Some(cached) = prev_cache.files.get(&df.rel_path) {
-                    if cached.blake3 == hash && cached.lang == df.lang {
-                        return Some(cached.clone());
-                    }
-                }
-                let src = String::from_utf8_lossy(&bytes);
-                lang::extract_file(&df.rel_path, df.lang, &src, hash).ok()
-            })
-            .collect();
-
-        if use_cache {
-            let mut next_cache = prev_cache;
-            next_cache.version = PARSER_VERSION;
-            next_cache.files.retain(|rel, _| root.join(rel).exists());
-            for ext in &extracts {
-                next_cache.files.insert(ext.file.clone(), ext.clone());
-            }
-            store.save(&next_cache);
+        struct ParsedItem {
+            extract: FileExtract,
+            stat: FileStat,
+            reparsed: bool,
+            stat_changed: bool,
         }
 
+        let parsed: Vec<ParsedItem> = files
+            .par_iter()
+            .filter_map(|df| {
+                let stat = FileStat::from_path(&df.abs_path).unwrap_or_default();
+                if use_cache
+                    && let Some(cached) = prev_cache.files.get(&df.rel_path)
+                    && cached.stat == stat
+                    && cached.extract.lang == df.lang
+                {
+                    return Some(ParsedItem {
+                        extract: cached.extract.clone(),
+                        stat,
+                        reparsed: false,
+                        stat_changed: false,
+                    });
+                }
+                let bytes = fs::read(&df.abs_path).ok()?;
+                let hash = blake3::hash(&bytes).to_hex().to_string();
+                if use_cache
+                    && let Some(cached) = prev_cache.files.get(&df.rel_path)
+                    && cached.extract.blake3 == hash
+                    && cached.extract.lang == df.lang
+                {
+                    return Some(ParsedItem {
+                        extract: cached.extract.clone(),
+                        stat,
+                        reparsed: false,
+                        stat_changed: true,
+                    });
+                }
+                let src = String::from_utf8_lossy(&bytes);
+                let extract = lang::extract_file(&df.rel_path, df.lang, &src, hash).ok()?;
+                Some(ParsedItem {
+                    extract,
+                    stat,
+                    reparsed: true,
+                    stat_changed: true,
+                })
+            })
+            .collect();
+        let t_parse = t0.elapsed();
+
+        if use_cache {
+            let current_paths: FxHashSet<&str> =
+                parsed.iter().map(|p| p.extract.file.as_str()).collect();
+            let has_stale = prev_cache
+                .files
+                .keys()
+                .any(|rel| !current_paths.contains(rel.as_str()));
+            let dirty = prev_cache.version != PARSER_VERSION
+                || has_stale
+                || parsed.len() != prev_cache.files.len()
+                || parsed.iter().any(|p| p.reparsed || p.stat_changed);
+
+            if dirty {
+                let mut next_cache = CacheData {
+                    version: PARSER_VERSION,
+                    files: HashMap::with_capacity(parsed.len()),
+                };
+                for item in &parsed {
+                    next_cache.files.insert(
+                        item.extract.file.clone(),
+                        CachedFile {
+                            stat: item.stat,
+                            extract: item.extract.clone(),
+                        },
+                    );
+                }
+                store.save(&next_cache);
+            }
+        }
+        let t_save = t0.elapsed();
+
+        let manifest_entries: Vec<ManifestEntry> = if use_cache {
+            parsed
+                .iter()
+                .map(|p| ManifestEntry {
+                    rel_path: p.extract.file.clone(),
+                    lang: p.extract.lang,
+                    stat: p.stat,
+                    blake3: p.extract.blake3.clone(),
+                })
+                .collect()
+        } else {
+            Vec::new()
+        };
+        let extracts: Vec<FileExtract> = parsed.into_iter().map(|p| p.extract).collect();
+
         let crate_roots = discover_cargo_crates(root, &extracts);
-        Ok(Self::from_extracts_with_crates(extracts, crate_roots))
+        let t_crates = t0.elapsed();
+        let g = Self::from_extracts_with_crates(extracts, crate_roots);
+        let t_graph = t0.elapsed();
+
+        if use_cache {
+            let cargo_entries = build_cargo_manifest_entries(root, &cargo_paths);
+            let fingerprint = compute_repo_fingerprint(&manifest_entries, &cargo_entries);
+            let manifest = GraphManifest {
+                version: PARSER_VERSION,
+                fingerprint,
+                files: manifest_entries,
+                cargo_manifests: cargo_entries,
+            };
+            let graph_unchanged = store
+                .load_manifest()
+                .is_some_and(|m| m.fingerprint == fingerprint && store.graph_path().exists());
+            if !graph_unchanged {
+                if let Some(snap) = GraphSnapshot::from_graph_parts(
+                    fingerprint,
+                    &g.symbols,
+                    &g.edges,
+                    &g.interface_impls,
+                ) {
+                    store.save_graph(&snap);
+                }
+            }
+            store.save_manifest(&manifest);
+        }
+
+        if prof {
+            eprintln!("[profile]   cache_load: {:.3}s", t_load.as_secs_f64());
+            eprintln!("[profile]   hash_and_parse: {:.3}s", (t_parse - t_load).as_secs_f64());
+            eprintln!("[profile]   cache_save: {:.3}s", (t_save - t_parse).as_secs_f64());
+            eprintln!("[profile]   discover_cargo_crates: {:.3}s", (t_crates - t_save).as_secs_f64());
+            eprintln!("[profile]   from_extracts_with_crates: {:.3}s", (t_graph - t_crates).as_secs_f64());
+            eprintln!("[profile]   graph_cache_save: {:.3}s", (t0.elapsed() - t_graph).as_secs_f64());
+        }
+        Ok(g)
     }
 
     pub fn apply_test_paths(&mut self, test_paths: &globset::GlobSet) {
@@ -95,12 +255,18 @@ impl CodeGraph {
         extracts: Vec<FileExtract>,
         crate_roots: HashMap<String, CargoCrateInfo>,
     ) -> Self {
-        let mut symbols: HashMap<String, Symbol> = HashMap::new();
-        let mut known_files: HashSet<&str> = HashSet::new();
-        let mut by_file_name: HashMap<(&str, &str), String> = HashMap::new();
-        let mut by_pkg_name: HashMap<(Language, &str, &str), Vec<String>> = HashMap::new();
-        let mut by_lang_name: HashMap<(Language, &str), Vec<String>> = HashMap::new();
-        let mut by_lang_qname: HashMap<(Language, &str), Vec<String>> = HashMap::new();
+        let prof = std::env::var_os("KAGAMI_PROFILE").is_some();
+        let t0 = std::time::Instant::now();
+        let total_syms: usize = extracts.iter().map(|e| e.symbols.len()).sum();
+        let mut symbols: HashMap<String, Symbol> = HashMap::with_capacity(total_syms);
+        let mut known_files: HashSet<&str> = HashSet::with_capacity(extracts.len());
+        let mut by_file_name: HashMap<(&str, &str), String> = HashMap::with_capacity(total_syms * 2);
+        let mut by_pkg_name: HashMap<(Language, &str, &str), Vec<String>> =
+            HashMap::with_capacity(total_syms);
+        let mut by_lang_name: HashMap<(Language, &str), Vec<String>> =
+            HashMap::with_capacity(total_syms);
+        let mut by_lang_qname: HashMap<(Language, &str), Vec<String>> =
+            HashMap::with_capacity(total_syms);
 
         for ext in &extracts {
             known_files.insert(ext.file.as_str());
@@ -146,69 +312,75 @@ impl CodeGraph {
                 }
             }
         }
+        let t_symmaps = t0.elapsed();
 
-        let mut edges: Vec<Edge> = Vec::new();
-        let mut seen: HashSet<(String, String, EdgeKind)> = HashSet::new();
         let go_index = GoTypeIndex::build(&extracts, &symbols, &by_pkg_name);
+        let t_go = t0.elapsed();
         let rust_index = RustTypeIndex::build(&extracts, &symbols, crate_roots);
+        let t_rust = t0.elapsed();
         let ts_index = TsClassIndex::build(&extracts, &known_files, &symbols);
+        let t_ts = t0.elapsed();
         let ts_star_reexports: HashMap<&str, &[String]> = extracts
             .iter()
             .filter(|e| !e.ts_star_reexports.is_empty())
             .map(|e| (e.file.as_str(), e.ts_star_reexports.as_slice()))
             .collect();
 
-        for ext in &extracts {
-            let alias_map = build_import_alias_map(&ext.imports);
-            let mut rel_import_paths: HashSet<String> = HashSet::new();
-            for imp in &ext.imports {
-                if matches!(
-                    ext.lang,
-                    Language::TypeScript | Language::JavaScript | Language::Svelte
-                ) {
-                    if let Some(resolved) =
-                        crate::lang::ts_js::resolve_relative_path(&ext.file, imp)
-                    {
-                        rel_import_paths.insert(resolved);
+        let per_file_edges: Vec<Vec<Edge>> = extracts
+            .par_iter()
+            .map(|ext| {
+                let alias_map = build_import_alias_map(&ext.imports);
+                let mut rel_import_paths: HashSet<String> = HashSet::new();
+                for imp in &ext.imports {
+                    if matches!(
+                        ext.lang,
+                        Language::TypeScript | Language::JavaScript | Language::Svelte
+                    ) {
+                        if let Some(resolved) =
+                            crate::lang::ts_js::resolve_relative_path(&ext.file, imp)
+                        {
+                            rel_import_paths.insert(resolved);
+                        }
                     }
                 }
-            }
 
-            for r in &ext.refs {
-                if !symbols.contains_key(&r.from_symbol_id) {
-                    continue;
-                }
-                let resolved = resolve_ref(
-                    ext,
-                    r,
-                    &alias_map,
-                    &rel_import_paths,
-                    &known_files,
-                    &symbols,
-                    &by_file_name,
-                    &by_pkg_name,
-                    &by_lang_name,
-                    &by_lang_qname,
-                    &go_index,
-                    &rust_index,
-                    &ts_index,
-                    &ts_star_reexports,
-                );
-                let resolved = if ext.lang == Language::Rust && r.kind == EdgeKind::Calls {
-                    rust_index.expand_cfg_siblings(resolved)
-                } else {
-                    resolved
-                };
-                for (target_id, conf) in resolved {
-                    if target_id == r.from_symbol_id {
+                let mut qbuf = String::with_capacity(64);
+                let mut local_edges = Vec::new();
+                for r in &ext.refs {
+                    if !symbols.contains_key(&r.from_symbol_id) {
                         continue;
                     }
-                    let cross_lang = symbols
-                        .get(&target_id)
-                        .map(|t| t.lang != ext.lang)
-                        .unwrap_or(false);
-                    if seen.insert((r.from_symbol_id.clone(), target_id.clone(), r.kind)) {
-                        edges.push(Edge {
+                    let resolved = resolve_ref(
+                        ext,
+                        r,
+                        &alias_map,
+                        &rel_import_paths,
+                        &known_files,
+                        &symbols,
+                        &by_file_name,
+                        &by_pkg_name,
+                        &by_lang_name,
+                        &by_lang_qname,
+                        &go_index,
+                        &rust_index,
+                        &ts_index,
+                        &ts_star_reexports,
+                        &mut qbuf,
+                    );
+                    let resolved = if ext.lang == Language::Rust && r.kind == EdgeKind::Calls {
+                        rust_index.expand_cfg_siblings(resolved)
+                    } else {
+                        resolved
+                    };
+                    for (target_id, conf) in resolved {
+                        if target_id == r.from_symbol_id {
+                            continue;
+                        }
+                        let cross_lang = symbols
+                            .get(&target_id)
+                            .map(|t| t.lang != ext.lang)
+                            .unwrap_or(false);
+                        local_edges.push(Edge {
                             from: r.from_symbol_id.clone(),
                             to: target_id,
                             kind: r.kind,
@@ -220,10 +392,25 @@ impl CodeGraph {
                         });
                     }
                 }
+                local_edges
+            })
+            .collect();
+
+        let total_raw_edges: usize = per_file_edges.iter().map(Vec::len).sum();
+        let mut edges: Vec<Edge> = Vec::with_capacity(total_raw_edges);
+        let mut seen: FxHashSet<(String, String, EdgeKind)> =
+            FxHashSet::with_capacity_and_hasher(total_raw_edges, Default::default());
+        for file_edges in per_file_edges {
+            for edge in file_edges {
+                if seen.insert((edge.from.clone(), edge.to.clone(), edge.kind)) {
+                    edges.push(edge);
+                }
             }
         }
+        let t_resolve = t0.elapsed();
 
         bridges::materialize_bridges(&extracts, &symbols, &mut edges);
+        let t_bridges = t0.elapsed();
         let mut interface_impls = materialize_go_interface_edges(
             &go_index,
             &symbols,
@@ -231,6 +418,7 @@ impl CodeGraph {
             &mut edges,
             &mut seen,
         );
+        let t_go_iface = t0.elapsed();
         interface_impls.extend(materialize_rust_trait_and_macro_edges(
             &extracts,
             &rust_index,
@@ -241,12 +429,20 @@ impl CodeGraph {
             &mut edges,
             &mut seen,
         ));
+        let t_rust_trait = t0.elapsed();
 
-        let mut outgoing: HashMap<String, Vec<usize>> = HashMap::new();
-        let mut incoming: HashMap<String, Vec<usize>> = HashMap::new();
-        for (idx, e) in edges.iter().enumerate() {
-            outgoing.entry(e.from.clone()).or_default().push(idx);
-            incoming.entry(e.to.clone()).or_default().push(idx);
+        let (outgoing, incoming) = build_adjacency_lists(&symbols, &edges);
+        if prof {
+            let total_refs: usize = extracts.iter().map(|e| e.refs.len()).sum();
+            eprintln!("[profile]     symmaps: {:.3}s ({} syms, {} refs)", t_symmaps.as_secs_f64(), symbols.len(), total_refs);
+            eprintln!("[profile]     GoTypeIndex::build: {:.3}s", (t_go - t_symmaps).as_secs_f64());
+            eprintln!("[profile]     RustTypeIndex::build: {:.3}s", (t_rust - t_go).as_secs_f64());
+            eprintln!("[profile]     TsClassIndex::build: {:.3}s", (t_ts - t_rust).as_secs_f64());
+            eprintln!("[profile]     resolve_ref loop: {:.3}s ({} edges)", (t_resolve - t_ts).as_secs_f64(), edges.len());
+            eprintln!("[profile]     materialize_bridges: {:.3}s", (t_bridges - t_resolve).as_secs_f64());
+            eprintln!("[profile]     go_interface_edges: {:.3}s", (t_go_iface - t_bridges).as_secs_f64());
+            eprintln!("[profile]     rust_trait_macro_edges: {:.3}s", (t_rust_trait - t_go_iface).as_secs_f64());
+            eprintln!("[profile]     adj_lists: {:.3}s", (t0.elapsed() - t_rust_trait).as_secs_f64());
         }
 
         Self {
@@ -258,6 +454,214 @@ impl CodeGraph {
             interface_impls,
         }
     }
+}
+
+fn build_cargo_manifest_entries(root: &Path, cargo_paths: &[String]) -> Vec<CargoManifestEntry> {
+    cargo_paths
+        .par_iter()
+        .filter_map(|rel| {
+            let abs = root.join(rel);
+            let stat = FileStat::from_path(&abs)?;
+            let bytes = fs::read(&abs).ok()?;
+            let blake3 = blake3::hash(&bytes).to_hex().to_string();
+            Some(CargoManifestEntry {
+                rel_path: rel.clone(),
+                stat,
+                blake3,
+            })
+        })
+        .collect()
+}
+
+fn compute_repo_fingerprint(
+    files: &[ManifestEntry],
+    cargo_manifests: &[CargoManifestEntry],
+) -> [u8; 32] {
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(&PARSER_VERSION.to_le_bytes());
+    hasher.update(&(files.len() as u64).to_le_bytes());
+    for f in files {
+        hasher.update(f.rel_path.as_bytes());
+        hasher.update(&[0u8, f.lang as u8]);
+        hasher.update(f.blake3.as_bytes());
+        hasher.update(&[0u8]);
+    }
+    hasher.update(&(cargo_manifests.len() as u64).to_le_bytes());
+    for c in cargo_manifests {
+        hasher.update(c.rel_path.as_bytes());
+        hasher.update(&[0u8]);
+        hasher.update(c.blake3.as_bytes());
+        hasher.update(&[0u8]);
+    }
+    *hasher.finalize().as_bytes()
+}
+
+fn try_load_cached_graph(
+    store: &CacheStore,
+    root: &Path,
+    files: &[DiscoveredFile],
+    cargo_paths: &[String],
+    prof: bool,
+    t0: std::time::Instant,
+) -> Option<CodeGraph> {
+    let snap = try_load_validated_snapshot(store, root, files, cargo_paths, prof, t0)?;
+    let t_loaded = t0.elapsed();
+    let parts = snap.into_graph_parts()?;
+    if prof {
+        eprintln!(
+            "[profile]   graph_cache hydrate: {:.3}s",
+            (t0.elapsed() - t_loaded).as_secs_f64()
+        );
+    }
+    Some(CodeGraph {
+        extracts: Vec::new(),
+        symbols: parts.symbols,
+        edges: parts.edges,
+        outgoing: parts.outgoing,
+        incoming: parts.incoming,
+        interface_impls: parts.interface_impls,
+    })
+}
+
+fn try_load_validated_snapshot(
+    store: &CacheStore,
+    root: &Path,
+    files: &[DiscoveredFile],
+    cargo_paths: &[String],
+    prof: bool,
+    t0: std::time::Instant,
+) -> Option<GraphSnapshot> {
+    let mut manifest = store.load_manifest()?;
+    if manifest.files.len() != files.len() || manifest.cargo_manifests.len() != cargo_paths.len() {
+        return None;
+    }
+    for (df, entry) in files.iter().zip(manifest.files.iter()) {
+        if df.rel_path != entry.rel_path || df.lang != entry.lang {
+            return None;
+        }
+    }
+    for (rel, entry) in cargo_paths.iter().zip(manifest.cargo_manifests.iter()) {
+        if rel != &entry.rel_path {
+            return None;
+        }
+    }
+
+    // Parallel stat check with content-hash fallback when (mtime, size) changed
+    let file_checks: Option<Vec<Option<FileStat>>> = files
+        .par_iter()
+        .zip(manifest.files.par_iter())
+        .map(|(df, entry)| {
+            let cur_stat = FileStat::from_path(&df.abs_path)?;
+            if cur_stat == entry.stat {
+                return Some(None);
+            }
+            let bytes = fs::read(&df.abs_path).ok()?;
+            let hash = blake3::hash(&bytes).to_hex().to_string();
+            if hash == entry.blake3 {
+                Some(Some(cur_stat))
+            } else {
+                None
+            }
+        })
+        .collect();
+    let file_stat_updates = file_checks?;
+
+    let cargo_checks: Option<Vec<Option<FileStat>>> = cargo_paths
+        .par_iter()
+        .zip(manifest.cargo_manifests.par_iter())
+        .map(|(rel, entry)| {
+            let abs = root.join(rel);
+            let cur_stat = FileStat::from_path(&abs)?;
+            if cur_stat == entry.stat {
+                return Some(None);
+            }
+            let bytes = fs::read(&abs).ok()?;
+            let hash = blake3::hash(&bytes).to_hex().to_string();
+            if hash == entry.blake3 {
+                Some(Some(cur_stat))
+            } else {
+                None
+            }
+        })
+        .collect();
+    let cargo_stat_updates = cargo_checks?;
+    let t_stat = t0.elapsed();
+
+    let snap = store.load_graph()?;
+    if snap.fingerprint != manifest.fingerprint {
+        return None;
+    }
+    let t_load_graph = t0.elapsed();
+
+    let mut manifest_dirty = false;
+    for (entry, upd) in manifest.files.iter_mut().zip(file_stat_updates) {
+        if let Some(new_stat) = upd {
+            entry.stat = new_stat;
+            manifest_dirty = true;
+        }
+    }
+    for (entry, upd) in manifest
+        .cargo_manifests
+        .iter_mut()
+        .zip(cargo_stat_updates)
+    {
+        if let Some(new_stat) = upd {
+            entry.stat = new_stat;
+            manifest_dirty = true;
+        }
+    }
+    if manifest_dirty {
+        store.save_manifest(&manifest);
+    }
+
+    if prof {
+        eprintln!(
+            "[profile]   graph_cache HIT: stat={:.3}s load={:.3}s (manifest_dirty={})",
+            t_stat.as_secs_f64(),
+            (t_load_graph - t_stat).as_secs_f64(),
+            manifest_dirty
+        );
+    }
+    Some(snap)
+}
+
+fn build_adjacency_lists(
+    symbols: &HashMap<String, Symbol>,
+    edges: &[Edge],
+) -> (HashMap<String, Vec<usize>>, HashMap<String, Vec<usize>>) {
+    let n = symbols.len();
+    let mut sym_ids: Vec<&str> = Vec::with_capacity(n);
+    let mut id_to_idx: FxHashMap<&str, usize> =
+        FxHashMap::with_capacity_and_hasher(n, Default::default());
+    for id in symbols.keys() {
+        id_to_idx.insert(id.as_str(), sym_ids.len());
+        sym_ids.push(id.as_str());
+    }
+    let mut out_vecs: Vec<Vec<usize>> = vec![Vec::new(); n];
+    let mut in_vecs: Vec<Vec<usize>> = vec![Vec::new(); n];
+    let mut outgoing: HashMap<String, Vec<usize>> = HashMap::with_capacity(n);
+    let mut incoming: HashMap<String, Vec<usize>> = HashMap::with_capacity(n);
+    for (idx, e) in edges.iter().enumerate() {
+        if let Some(&fi) = id_to_idx.get(e.from.as_str()) {
+            out_vecs[fi].push(idx);
+        } else {
+            outgoing.entry(e.from.clone()).or_default().push(idx);
+        }
+        if let Some(&ti) = id_to_idx.get(e.to.as_str()) {
+            in_vecs[ti].push(idx);
+        } else {
+            incoming.entry(e.to.clone()).or_default().push(idx);
+        }
+    }
+    for (i, id) in sym_ids.into_iter().enumerate() {
+        if !out_vecs[i].is_empty() {
+            outgoing.insert(id.to_string(), std::mem::take(&mut out_vecs[i]));
+        }
+        if !in_vecs[i].is_empty() {
+            incoming.insert(id.to_string(), std::mem::take(&mut in_vecs[i]));
+        }
+    }
+    (outgoing, incoming)
 }
 
 fn is_go_stdlib_interface_method(name: &str) -> bool {
@@ -922,7 +1326,7 @@ fn materialize_go_interface_edges(
     symbols: &HashMap<String, Symbol>,
     by_pkg_name: &HashMap<(Language, &str, &str), Vec<String>>,
     edges: &mut Vec<Edge>,
-    seen: &mut HashSet<(String, String, EdgeKind)>,
+    seen: &mut FxHashSet<(String, String, EdgeKind)>,
 ) -> Vec<InterfaceImpl> {
     let mut push_impl_edge = |type_id: &str, method_id: &str, conf: Confidence| {
         if seen.insert((
@@ -1337,6 +1741,7 @@ fn resolve_ref(
     rust_index: &RustTypeIndex<'_>,
     ts_index: &TsClassIndex,
     ts_star_reexports: &HashMap<&str, &[String]>,
+    qbuf: &mut String,
 ) -> Vec<(String, Confidence)> {
     // 0. Direct symbol ID match (e.g. Svelte component -> <module> script block)
     if r.qualifier.is_none() && symbols.contains_key(&r.target_name) {
@@ -1524,8 +1929,11 @@ fn resolve_ref(
         }
 
         for sep in [".", "::"] {
-            let q = format!("{}{}{}", qual, sep, r.target_name);
-            if let Some(ids) = by_lang_qname.get(&(ext.lang, q.as_str())) {
+            qbuf.clear();
+            qbuf.push_str(qual);
+            qbuf.push_str(sep);
+            qbuf.push_str(&r.target_name);
+            if let Some(ids) = by_lang_qname.get(&(ext.lang, qbuf.as_str())) {
                 if ids.len() <= 3 {
                     return ids.iter().map(|id| (id.clone(), Confidence::Resolved)).collect();
                 }
@@ -1639,22 +2047,30 @@ fn resolve_ref(
         // Fall back to combined same-package + imported-package methods when same-file lookup finds
         // nothing, so an unrelated same-package method never shadows an imported receiver's method.
         if !found_method {
-            let mut seen_methods: HashSet<String> = HashSet::new();
+            let mut seen_methods: FxHashSet<&str> = FxHashSet::default();
             let mut candidate_methods: Vec<String> = Vec::new();
+            let mut too_many = false;
             if !ext.package_or_module.is_empty() {
                 if let Some(ids) = by_pkg_name.get(&(ext.lang, ext.package_or_module.as_str(), r.target_name.as_str())) {
                     for id in ids {
                         if id != &r.from_symbol_id
                             && symbols.get(id).map(|s| s.kind == SymbolKind::Method).unwrap_or(false)
-                            && seen_methods.insert(id.clone())
+                            && seen_methods.insert(id.as_str())
                         {
                             candidate_methods.push(id.clone());
+                            if candidate_methods.len() > 4 {
+                                too_many = true;
+                                break;
+                            }
                         }
                     }
                 }
             }
-            let mut seen_imps: HashSet<&str> = HashSet::new();
-            for &imp_path in alias_map.values() {
+            let mut seen_imps: FxHashSet<&str> = FxHashSet::default();
+            'imps: for &imp_path in alias_map.values() {
+                if too_many {
+                    break;
+                }
                 if !seen_imps.insert(imp_path) {
                     continue;
                 }
@@ -1671,14 +2087,18 @@ fn resolve_ref(
                                     import_path_matches_dir(imp_path, dir)
                                 })
                                 .unwrap_or(false);
-                            if is_matching_method && seen_methods.insert(id.clone()) {
+                            if is_matching_method && seen_methods.insert(id.as_str()) {
                                 candidate_methods.push(id.clone());
+                                if candidate_methods.len() > 4 {
+                                    too_many = true;
+                                    break 'imps;
+                                }
                             }
                         }
                     }
                 }
             }
-            if !candidate_methods.is_empty() && candidate_methods.len() <= 4 {
+            if !too_many && !candidate_methods.is_empty() && candidate_methods.len() <= 4 {
                 let conf = if candidate_methods.len() == 1 {
                     Confidence::Resolved
                 } else {
@@ -1708,6 +2128,7 @@ fn resolve_ref(
                             .map(|s| s.kind != SymbolKind::Method)
                             .unwrap_or(false)
                     })
+                    .take(5)
                     .collect()
             } else if r.qualifier.is_some() {
                 let ts_family = matches!(
@@ -1723,9 +2144,10 @@ fn resolve_ref(
                                     .map(|s| s.kind == SymbolKind::Method)
                                     .unwrap_or(false))
                     })
+                    .take(5)
                     .collect()
             } else {
-                ids.iter().collect()
+                ids.iter().take(5).collect()
             };
             if !filtered.is_empty() && filtered.len() <= 4 {
                 return filtered
@@ -1753,6 +2175,7 @@ fn resolve_ref(
                         .map(|s| s.kind != SymbolKind::Method)
                         .unwrap_or(false)
                 })
+                .take(17)
                 .collect()
         } else if matches!(
             ext.lang,
@@ -1768,9 +2191,10 @@ fn resolve_ref(
                         .map(|s| s.kind == SymbolKind::Method)
                         .unwrap_or(false)
                 })
+                .take(17)
                 .collect()
         } else {
-            cands.iter().collect()
+            cands.iter().take(17).collect()
         };
         if cands.len() == 1 {
             return vec![(cands[0].clone(), Confidence::Heuristic)];
