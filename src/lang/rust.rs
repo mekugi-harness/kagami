@@ -34,7 +34,7 @@ struct RustExtractCtx<'a> {
     rust_macro_defs: HashMap<String, Vec<String>>,
     rust_top_level_macros: Vec<(String, String)>,
     symbol_mod_scopes: HashMap<String, String>,
-    mod_dir_scopes: Vec<String>,
+    mod_dir_scopes: Vec<(String, bool)>,
 }
 
 /// Lexical scope stack for Rust local variables and inferred receiver chains.
@@ -983,7 +983,7 @@ fn walk_rust_items(
                 };
                 if let Some(body) = child.child_by_field_name("body") {
                     let prev_dir_scopes = ctx.mod_dir_scopes.clone();
-                    let mut active_paths: Vec<String> = Vec::new();
+                    let mut active_paths: Vec<(String, bool)> = Vec::new();
                     let mut cond_preds: Vec<String> = Vec::new();
                     let mut has_uncond = false;
                     for &a in &attrs {
@@ -993,17 +993,20 @@ fn walk_rust_items(
                         }
                         let txt = node_text(a, ctx.src);
                         if attr_path(txt) == "path" {
-                            active_paths.extend(ps);
+                            active_paths.extend(ps.into_iter().map(|p| (p, false)));
                             has_uncond = true;
                             break;
                         } else {
-                            active_paths.extend(ps);
+                            let mut pred_is_test = false;
                             if let Some(idx) = txt.find("cfg_attr(")
                                 && let Some(inner) = extract_balanced_parens(&txt[idx + 9..])
                                 && let Some((pred, _)) = inner.split_once(',')
                             {
-                                cond_preds.push(pred.trim().to_string());
+                                let p = pred.trim();
+                                pred_is_test = !cfg_may_hold_without_test(p);
+                                cond_preds.push(p.to_string());
                             }
+                            active_paths.extend(ps.into_iter().map(|p| (p, pred_is_test)));
                         }
                     }
                     let preds_exhaustive = cond_preds.iter().any(|p| {
@@ -1023,23 +1026,25 @@ fn walk_rust_items(
                         }
                     };
                     if !active_paths.is_empty() || !prev_dir_scopes.is_empty() {
-                        let bases: Vec<String> = if prev_dir_scopes.is_empty() {
-                            vec![mod_path.replace("::", "/")]
+                        let bases: Vec<(String, bool)> = if prev_dir_scopes.is_empty() {
+                            vec![(mod_path.replace("::", "/"), false)]
                         } else {
                             prev_dir_scopes.clone()
                         };
-                        let mut next_scopes: Vec<String> = Vec::new();
-                        let mut push_scope = |s: String| {
-                            if !next_scopes.contains(&s) {
-                                next_scopes.push(s);
+                        let mut next_scopes: Vec<(String, bool)> = Vec::new();
+                        let mut push_scope = |s: String, is_test: bool| {
+                            if let Some(existing) = next_scopes.iter_mut().find(|(e, _)| *e == s) {
+                                existing.1 &= is_test;
+                            } else {
+                                next_scopes.push((s, is_test));
                             }
                         };
-                        for b in &bases {
+                        for (b, base_test) in &bases {
                             if !has_uncond && !preds_exhaustive {
-                                push_scope(join_dir(b, mod_name));
+                                push_scope(join_dir(b, mod_name), *base_test);
                             }
-                            for p in &active_paths {
-                                push_scope(join_dir(b, p));
+                            for (p, path_test) in &active_paths {
+                                push_scope(join_dir(b, p), *base_test || *path_test);
                             }
                         }
                         ctx.mod_dir_scopes = next_scopes;
@@ -1058,18 +1063,19 @@ fn walk_rust_items(
                     ctx.mod_dir_scopes = prev_dir_scopes;
                 } else if !mod_name.is_empty() {
                     let path_overrides = extract_rust_attr_path_overrides(&attrs, ctx.src);
-                    let scopes: Vec<String> = if ctx.mod_dir_scopes.is_empty() {
-                        vec![mod_path.to_string()]
+                    let scopes: Vec<(String, bool)> = if ctx.mod_dir_scopes.is_empty() {
+                        vec![(mod_path.to_string(), false)]
                     } else {
                         ctx.mod_dir_scopes.clone()
                     };
-                    for dir_scope in scopes {
+                    for (dir_scope, scope_is_test) in scopes {
+                        let mod_is_test = sub_test || scope_is_test;
                         if path_overrides.is_empty() {
                             ctx.rust_mod_paths.push(RustModPath {
                                 mod_scope: dir_scope,
                                 mod_name: mod_name.to_string(),
                                 path: None,
-                                is_test: sub_test,
+                                is_test: mod_is_test,
                             });
                         } else {
                             for p in &path_overrides {
@@ -1077,7 +1083,7 @@ fn walk_rust_items(
                                     mod_scope: dir_scope.clone(),
                                     mod_name: mod_name.to_string(),
                                     path: Some(p.clone()),
-                                    is_test: sub_test,
+                                    is_test: mod_is_test,
                                 });
                             }
                         }

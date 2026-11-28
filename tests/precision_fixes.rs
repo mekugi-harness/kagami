@@ -5301,6 +5301,10 @@ fn test_rust_pr20_review_regressions() {
     fs::create_dir_all(root.join("src/unix_layout")).unwrap();
     fs::create_dir_all(root.join("src/portable_layout")).unwrap();
     fs::create_dir_all(root.join("src/exh_layout")).unwrap();
+    fs::create_dir_all(root.join("src/exh_unix")).unwrap();
+    fs::create_dir_all(root.join("src/exh_portable")).unwrap();
+    fs::create_dir_all(root.join("src/test_sel")).unwrap();
+    fs::create_dir_all(root.join("src/prod_sel")).unwrap();
     fs::create_dir_all(root.join("named_pkg/src/bin")).unwrap();
     fs::create_dir_all(root.join("cli/src")).unwrap();
     fs::create_dir_all(root.join("shared/sub")).unwrap();
@@ -5384,6 +5388,38 @@ pub fn portable_layout_fixture() {}
         root.join("src/exh_layout/fixtures.rs"),
         r#"
 pub fn orphan_default_layout_fn() {}
+"#,
+    )
+    .unwrap();
+    fs::write(
+        root.join("src/exh_unix/fixtures.rs"),
+        r#"
+pub fn exh_unix_fixture() {}
+"#,
+    )
+    .unwrap();
+    fs::write(
+        root.join("src/exh_portable/fixtures.rs"),
+        r#"
+pub fn exh_portable_fixture() {}
+"#,
+    )
+    .unwrap();
+
+    // #[cfg_attr(test, path = "test_sel")] before #[path = "prod_sel"]: test variant must not keep prod probe live
+    fs::write(
+        root.join("src/test_sel/backend.rs"),
+        r#"
+pub fn run_sel() {
+    crate::test_only_probe();
+}
+"#,
+    )
+    .unwrap();
+    fs::write(
+        root.join("src/prod_sel/backend.rs"),
+        r#"
+pub fn run_sel() {}
 "#,
     )
     .unwrap();
@@ -5910,12 +5946,18 @@ mod cond_before_fallback {
     #[cfg(test)]
     mod fixtures;
 }
-#[cfg_attr(unix, path = "unix_layout")]
-#[cfg_attr(not(unix), path = "portable_layout")]
+#[cfg_attr(unix, path = "exh_unix")]
+#[cfg_attr(not(unix), path = "exh_portable")]
 mod exh_layout {
     #[cfg(test)]
     mod fixtures;
 }
+#[cfg_attr(test, path = "test_sel")]
+#[path = "prod_sel"]
+mod test_vs_prod_sel {
+    pub mod backend;
+}
+fn test_only_probe() {}
 
 mod helpers {
     #[cfg(test)]
@@ -5979,6 +6021,7 @@ fn main() {
     dir_worker::run_dir_worker();
     branch::chosen::chosen_selected();
     path_worker::adapters::invoke();
+    test_vs_prod_sel::backend::run_sel();
     feature::helpers::fixtures::feature_prod_fixture();
     let p = plat::Plat::open();
     p.go();
@@ -6149,6 +6192,21 @@ fn main() {
     assert!(
         is_dead("src/exh_layout/fixtures.rs", "orphan_default_layout_fn"),
         "Expected orphan file in unreachable default dir of exhaustive cfg_attr to remain reportable; dead={:?}",
+        dead_prod.symbols
+    );
+    assert!(
+        !is_dead("src/exh_unix/fixtures.rs", "exh_unix_fixture"),
+        "Expected exhaustive cfg_attr unix fixture to be excluded; dead={:?}",
+        dead_prod.symbols
+    );
+    assert!(
+        !is_dead("src/exh_portable/fixtures.rs", "exh_portable_fixture"),
+        "Expected exhaustive cfg_attr portable fixture to be excluded; dead={:?}",
+        dead_prod.symbols
+    );
+    assert!(
+        is_dead("src/main.rs", "test_only_probe"),
+        "Expected symbol called only by #[cfg_attr(test, path = ...)] backend to remain dead in --scope prod; dead={:?}",
         dead_prod.symbols
     );
     assert!(
