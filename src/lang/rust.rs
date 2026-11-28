@@ -411,7 +411,7 @@ fn emit_scoped_call_ref(
     let prefix_parts: Vec<&str> = parts[..parts.len() - 1]
         .iter()
         .copied()
-        .filter(|p| *p != "self")
+        .filter(|p| !matches!(*p, "crate" | "super" | "self"))
         .collect();
     let qual = if prefix_parts.is_empty() {
         None
@@ -470,7 +470,7 @@ fn emit_scoped_type_ref(
     let prefix_parts: Vec<&str> = parts[..parts.len() - 1]
         .iter()
         .copied()
-        .filter(|p| !matches!(*p, "crate" | "super" | "self"))
+        .filter(|p| *p != "self")
         .collect();
     if prefix_parts.is_empty() {
         if !is_rust_builtin_type(last) {

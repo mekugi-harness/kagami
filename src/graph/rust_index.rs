@@ -1332,6 +1332,42 @@ impl<'a> RustTypeIndex<'a> {
         }
 
         let mut out: Vec<String> = Vec::new();
+        // When a caller inside an inline module uses `super::...`, consume leading `super`
+        // segments against `caller_scope` first so `super::Config` resolves to the enclosing
+        // same-file scope before climbing physical file modules.
+        if !caller_scope.is_empty() && raw_segs.first() == Some(&"super") {
+            let mut scope_parts: Vec<&str> = caller_scope.split("::").collect();
+            let mut idx = 0;
+            while idx < raw_segs.len() && raw_segs[idx] == "super" && !scope_parts.is_empty() {
+                scope_parts.pop();
+                idx += 1;
+            }
+            if idx == raw_segs.len() {
+                let target_scope = scope_parts.join("::");
+                if let Some(ids) = self.file_non_method_syms.get(&(caller_file, target_name)) {
+                    for id in ids {
+                        let sc = self
+                            .symbol_mod_scopes
+                            .get(id.as_str())
+                            .map(String::as_str)
+                            .unwrap_or("");
+                        if sc == target_scope
+                            && symbols.get(id).is_some_and(|s| {
+                                filter.matches(s.kind) && (!s.is_test || caller_is_test)
+                            })
+                        {
+                            push_unique(&mut out, id.clone());
+                        }
+                    }
+                }
+                if !out.is_empty() {
+                    return out
+                        .into_iter()
+                        .map(|id| (id, Confidence::Resolved))
+                        .collect();
+                }
+            }
+        }
         // Collect matches across ALL matching alias expansions in the caller's scope
         // (e.g. mutually exclusive `#[cfg(unix)]` / `#[cfg(not(unix))]` module aliases).
         for segs in alias_paths {
@@ -2209,10 +2245,9 @@ pub fn materialize_rust_trait_and_macro_edges(
                     // Calling an explicit trait-impl method directly on a concrete receiver
                     // (e.g. `h.run()`) uses both the trait and the receiver type.
                     for mid in &imp.method_ids {
-                        if symbols
-                            .get(mid)
-                            .is_some_and(|s| matches!(s.kind, SymbolKind::Method | SymbolKind::Const))
-                        {
+                        if symbols.get(mid).is_some_and(|s| {
+                            matches!(s.kind, SymbolKind::Method | SymbolKind::Const)
+                        }) {
                             let line = symbols.get(mid).map(|s| s.span.start_line).unwrap_or(1);
                             push_edge(mid, &tr_id, EdgeKind::TypeRef, Confidence::Resolved, &ext.file, line);
                             push_edge(mid, &tid, EdgeKind::TypeRef, Confidence::Resolved, &ext.file, line);

@@ -155,6 +155,12 @@ type LocalConstraint interface {
 
 type LocalConverted int
 
+type LiveInitConfig struct{}
+
+func initLoad() *LiveInitConfig { return &LiveInitConfig{} }
+
+var _ = (*LiveInitConfig)(initLoad())
+
 const LocalFlag = 4
 const LocalMapKey = "k"
 var LocalCounter = 0
@@ -280,6 +286,11 @@ func main() {
     let dead_all = run_dead(root, DeadKinds::All, DeadScope::Prod);
     assert!(dead_all.iter().any(|(_, s, _)| s == "OrphanDTO"));
     assert!(dead_all.iter().any(|(_, s, _)| s == "OrphanDTO.Handle"));
+    assert!(
+        !dead_all.iter().any(|(_, s, _)| s == "initLoad"),
+        "runtime call inside (*LiveInitConfig)(initLoad()) must stay live: {:?}",
+        dead_all
+    );
 }
 
 #[test]

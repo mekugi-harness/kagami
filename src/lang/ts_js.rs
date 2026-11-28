@@ -474,7 +474,11 @@ pub(crate) fn collect_svelte_script_context(
     ctx.type_namespace_imports
         .extend(ts_imports.type_namespaces);
     ctx.local_callables
-        .extend(collect_ts_local_callables(tree.root_node(), script_src, false));
+        .extend(collect_ts_local_callables(
+            tree.root_node(),
+            script_src,
+            false,
+        ));
     ctx.local_classes
         .extend(collect_ts_local_classes(tree.root_node(), script_src));
     Ok(())

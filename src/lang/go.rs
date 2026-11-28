@@ -369,7 +369,14 @@ pub fn extract(rel_path: &str, src: &str, blake3_hex: String) -> Result<FileExtr
                             && spec.child_by_field_name("value").is_none()
                             && let Some(val) = inherited_const_value
                         {
-                            emit_expr_list_refs(val, src, &id, &empty_locals, &empty_env, &mut refs);
+                            emit_expr_list_refs(
+                                val,
+                                src,
+                                &id,
+                                &empty_locals,
+                                &empty_env,
+                                &mut refs,
+                            );
                             collect_refs_and_bridges(
                                 val,
                                 src,
