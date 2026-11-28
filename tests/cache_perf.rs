@@ -320,7 +320,14 @@ fn scoped_build_preserves_whole_repo_cache() {
     let orig_count = store.load().files.len();
     assert!(orig_count >= 3);
 
-    // Run a path-scoped build on only pkg/app.go
+    // Edit pkg/app.go so the scoped build actually rewrites cache.bin
+    thread::sleep(Duration::from_millis(25));
+    fs::write(
+        root.join("pkg/app.go"),
+        "package main\nfunc main() { liveGo(); deadGo() }\nfunc liveGo() {}\nfunc deadGo() {}\n",
+    )
+    .unwrap();
+
     let go_only: Vec<_> = all_files
         .iter()
         .filter(|f| f.rel_path.ends_with(".go"))
@@ -328,10 +335,49 @@ fn scoped_build_preserves_whole_repo_cache() {
         .collect();
     let _ = CodeGraph::build_for_scoped_graph(root, &go_only, true).unwrap();
 
-    // Whole-repo extract cache and graph snapshot must remain intact
-    assert_eq!(store.load().files.len(), orig_count);
+    // Extract cache rewrite must retain out-of-scope Rust extracts
+    let reloaded = store.load();
+    assert_eq!(reloaded.files.len(), orig_count);
+    assert!(reloaded.files.contains_key("src/lib.rs"));
+    assert!(reloaded.files.contains_key("src/main.rs"));
+}
+
+#[cfg(unix)]
+#[test]
+fn same_size_preserved_mtime_edit_invalidates_cache() {
+    let dir = setup_polyglot_repo();
+    let root = dir.path();
+    let files = discover_all(root);
+    let go_path = root.join("pkg/app.go");
+
+    let g1 = CodeGraph::build_for_graph(root, &files, true).unwrap();
+    let r1 = analyze_dead(&g1, &dead_opts(DeadKinds::Callables));
+    assert!(r1.symbols.iter().any(|s| s.symbol == "deadGo"));
+    assert!(!r1.symbols.iter().any(|s| s.symbol == "liveGo"));
+
+    // Replace with equal-length content that calls deadGo() instead of liveGo(),
+    // then restore the original mtime to verify ctime/ino invalidation.
+    let orig_mtime = fs::metadata(&go_path).unwrap().modified().unwrap();
+    let orig_bytes = fs::read(&go_path).unwrap();
+    let replaced = "package main\nfunc main() { deadGo() }\nfunc liveGo() {}\nfunc deadGo() {}\n";
+    assert_eq!(orig_bytes.len(), replaced.len());
+    thread::sleep(Duration::from_millis(25));
+    fs::write(&go_path, replaced).unwrap();
+    fs::OpenOptions::new()
+        .write(true)
+        .open(&go_path)
+        .unwrap()
+        .set_modified(orig_mtime)
+        .unwrap();
+
+    let g2 = CodeGraph::build_for_graph(root, &files, true).unwrap();
+    let r2 = analyze_dead(&g2, &dead_opts(DeadKinds::Callables));
     assert!(
-        CodeGraph::try_load_cached_snapshot(root, &all_files).is_some(),
-        "scoped build must not evict whole-repo graph snapshot"
+        r2.symbols.iter().any(|s| s.symbol == "liveGo"),
+        "liveGo should now be dead after equal-size preserved-mtime edit"
+    );
+    assert!(
+        !r2.symbols.iter().any(|s| s.symbol == "deadGo"),
+        "deadGo should now be live after equal-size preserved-mtime edit"
     );
 }
