@@ -736,6 +736,7 @@ const ExprN = 2
 const StructFieldN = 7
 const LenTarget = "abcd"
 const MinBound = 4
+const max = 64
 const TestOnlyN = 8
 const UnusedLocalN = 9
 
@@ -754,9 +755,10 @@ func consumeRows(
 	expr *[ExprN + 1]int,
 	sized *[len(LenTarget)]byte,
 	clamped *[min(MinBound, 2)]byte,
+	capped *[max]byte,
 ) int {
 	var parts [BodyVarN]string
-	_, _, _, _, _ = p, cross, expr, sized, clamped
+	_, _, _, _, _, _ = p, cross, expr, sized, clamped, capped
 	return len(rows) + len(parts)
 }
 
@@ -764,7 +766,7 @@ func main() {
 	var h Holder
 	_ = h
 	_ = sigRetOnly()
-	_ = consumeRows(nil, nil, nil, nil, nil, nil)
+	_ = consumeRows(nil, nil, nil, nil, nil, nil, nil)
 }
 "#,
     )
@@ -797,6 +799,7 @@ func TestArrayLengthConst(t *testing.T) {
         "StructFieldN",
         "LenTarget",
         "MinBound",
+        "max",
     ] {
         assert!(
             !has(live),

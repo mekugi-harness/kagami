@@ -830,26 +830,21 @@ fn collect_signature_type_refs(
     refs: &mut Vec<RawRef>,
 ) {
     let empty_locals = HashMap::new();
-    let mut sig_refs = Vec::new();
     let mut ignored_bridges = Vec::new();
     for field in ["receiver", "type_parameters", "parameters", "result"] {
         if let Some(ch) = node.child_by_field_name(field) {
-            collect_refs_and_bridges(
+            collect_refs_and_bridges_inner(
                 ch,
                 src,
                 from_id,
                 &empty_locals,
                 env,
-                &mut sig_refs,
+                refs,
                 &mut ignored_bridges,
+                true,
             );
         }
     }
-    refs.extend(sig_refs.into_iter().filter(|r| {
-        !(r.kind == EdgeKind::Calls
-            && r.qualifier.is_none()
-            && is_go_builtin_func(&r.target_name))
-    }));
 }
 
 fn emit_qualified_type_ref(node: Node<'_>, src: &str, from_id: &str, refs: &mut Vec<RawRef>) {
@@ -1553,6 +1548,20 @@ fn collect_refs_and_bridges(
     refs: &mut Vec<RawRef>,
     bridges: &mut Vec<BridgeHint>,
 ) {
+    collect_refs_and_bridges_inner(node, src, from_id, locals, env, refs, bridges, false);
+}
+
+#[allow(clippy::too_many_arguments)]
+fn collect_refs_and_bridges_inner(
+    node: Node<'_>,
+    src: &str,
+    from_id: &str,
+    locals: &HashMap<String, Vec<(usize, usize)>>,
+    env: &GoLocalEnv<'_>,
+    refs: &mut Vec<RawRef>,
+    bridges: &mut Vec<BridgeHint>,
+    skip_builtin_calls: bool,
+) {
     let mut stack = vec![node];
     while let Some(n) = stack.pop() {
         match n.kind() {
@@ -1569,14 +1578,16 @@ fn collect_refs_and_bridges(
                     match func.kind() {
                         "identifier" => {
                             let target = node_text(func, src).to_string();
-                            refs.push(RawRef {
-                                from_symbol_id: from_id.to_string(),
-                                target_name: target,
-                                qualifier: None,
-                                kind: EdgeKind::Calls,
-                                line,
-                                receiver_chain: None,
-                            });
+                            if !(skip_builtin_calls && is_go_builtin_func(&target)) {
+                                refs.push(RawRef {
+                                    from_symbol_id: from_id.to_string(),
+                                    target_name: target,
+                                    qualifier: None,
+                                    kind: EdgeKind::Calls,
+                                    line,
+                                    receiver_chain: None,
+                                });
+                            }
                         }
                         "selector_expression" => {
                             let operand_node = func.child_by_field_name("operand");
