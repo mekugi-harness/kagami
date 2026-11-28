@@ -5289,6 +5289,8 @@ fn test_rust_pr20_review_regressions() {
     fs::create_dir_all(root.join("src/feature/helpers")).unwrap();
     fs::create_dir_all(root.join("src/platform/support")).unwrap();
     fs::create_dir_all(root.join("src/examples/client")).unwrap();
+    fs::create_dir_all(root.join("src/dir_worker")).unwrap();
+    fs::create_dir_all(root.join("src/branch/selected")).unwrap();
     fs::create_dir_all(root.join("cli/src")).unwrap();
     fs::create_dir_all(root.join("shared/sub")).unwrap();
     fs::create_dir_all(root.join("app")).unwrap();
@@ -5505,9 +5507,58 @@ pub fn src_examples_client_fixture() {}
     fs::write(
         root.join("src/api.rs"),
         r#"
+pub fn bin_api_run() {}
+pub fn api_init() {}
 pub mod nested {
     pub fn make() {}
 }
+"#,
+    )
+    .unwrap();
+
+    // Directory module src/dir_worker/mod.rs calling crate::api::api_init() must reach src/api.rs, not local inline api
+    fs::write(
+        root.join("src/dir_worker/mod.rs"),
+        r#"
+mod api {
+    pub fn api_init() {}
+}
+pub fn run_dir_worker() {
+    crate::api::api_init();
+}
+"#,
+    )
+    .unwrap();
+
+    // Top-level #[path = "selected.rs"] in src/branch.rs must NOT mark src/branch/selected.rs as path-loaded
+    fs::write(
+        root.join("src/selected.rs"),
+        r#"
+pub fn chosen_selected() {}
+"#,
+    )
+    .unwrap();
+    fs::write(
+        root.join("src/branch.rs"),
+        r#"
+#[path = "selected.rs"]
+pub mod chosen;
+pub mod selected;
+"#,
+    )
+    .unwrap();
+    fs::write(
+        root.join("src/branch/selected.rs"),
+        r#"
+#[cfg(test)]
+mod fixtures;
+"#,
+    )
+    .unwrap();
+    fs::write(
+        root.join("src/branch/selected/fixtures.rs"),
+        r#"
+pub fn branch_selected_fixture() {}
 "#,
     )
     .unwrap();
@@ -5625,6 +5676,8 @@ mod pub_err;
 mod feature;
 mod api;
 mod worker;
+mod dir_worker;
+mod branch;
 mod examples;
 #[path = "platform/linux.rs"]
 mod platform_mod;
@@ -5688,6 +5741,8 @@ fn main() {
     imp::run();
     ext_parent::inner::run_check();
     worker::run_worker();
+    dir_worker::run_dir_worker();
+    branch::chosen::chosen_selected();
     feature::helpers::fixtures::feature_prod_fixture();
     let p = plat::Plat::open();
     p.go();
@@ -5752,6 +5807,26 @@ fn main() {
     assert!(
         !is_dead("src/bin/tool/main.rs", "bin_api_run"),
         "Expected src/bin/tool/main.rs crate::api::bin_api_run() to stay live; dead={:?}",
+        dead_prod.symbols
+    );
+    assert!(
+        is_dead("src/api.rs", "bin_api_run"),
+        "Expected library src/api.rs::bin_api_run to stay dead when only bin/tool calls crate::api::bin_api_run(); dead={:?}",
+        dead_prod.symbols
+    );
+    assert!(
+        !is_dead("src/api.rs", "api_init"),
+        "Expected src/dir_worker/mod.rs crate::api::api_init() to resolve to src/api.rs; dead={:?}",
+        dead_prod.symbols
+    );
+    assert!(
+        is_dead("src/dir_worker/mod.rs", "api_init"),
+        "Expected shadowing inline dir_worker::api::api_init to remain dead; dead={:?}",
+        dead_prod.symbols
+    );
+    assert!(
+        !is_dead("src/branch/selected/fixtures.rs", "branch_selected_fixture"),
+        "Expected ordinary src/branch/selected.rs #[cfg(test)] fixture to be excluded from prod; dead={:?}",
         dead_prod.symbols
     );
     assert!(

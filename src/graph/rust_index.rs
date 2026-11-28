@@ -132,13 +132,27 @@ pub fn discover_cargo_crates(
                     if val.get("lib").and_then(|t| t.get("path")).is_some() {
                         push_unique(&mut target_roots, lib_file.clone());
                     }
-                    for section in ["bin", "example", "test", "bench"] {
+                    for (section, default_dir) in [
+                        ("bin", "src/bin"),
+                        ("example", "examples"),
+                        ("test", "tests"),
+                        ("bench", "benches"),
+                    ] {
                         if let Some(items) = val.get(section).and_then(|v| v.as_array()) {
                             for item in items {
                                 if let Some(p) = item.get("path").and_then(|v| v.as_str()) {
                                     let full = normalize_rel_path_join(&dir, p);
                                     if !full.is_empty() {
                                         push_unique(&mut target_roots, full);
+                                    }
+                                } else if let Some(name) = item.get("name").and_then(|v| v.as_str())
+                                {
+                                    for suffix in [".rs", "/main.rs"] {
+                                        let rel = format!("{}/{}{}", default_dir, name, suffix);
+                                        push_unique(
+                                            &mut target_roots,
+                                            normalize_rel_path_join(&dir, &rel),
+                                        );
                                     }
                                 }
                             }
@@ -196,7 +210,7 @@ pub fn discover_cargo_crates(
     crate_roots
 }
 
-/// Returns true when file is a Cargo target root (lib.rs, main.rs, mod.rs,
+/// Returns true when file is a Cargo crate root (lib.rs, main.rs,
 /// explicit Cargo.toml target path, or direct child of a manifest-relative target dir).
 fn is_rust_crate_root_file(
     file: &str,
@@ -205,7 +219,7 @@ fn is_rust_crate_root_file(
 ) -> bool {
     let file_dir = file.rsplit_once('/').map(|(d, _)| d).unwrap_or("");
     let file_name = file.rsplit('/').next().unwrap_or(file);
-    matches!(file_name, "lib.rs" | "mod.rs" | "main.rs")
+    matches!(file_name, "lib.rs" | "main.rs")
         || target_roots.contains(file)
         || target_root_dirs.contains(file_dir)
 }
@@ -222,7 +236,8 @@ fn rust_mod_base_dirs(
 ) -> Vec<String> {
     let file_dir = file.rsplit_once('/').map(|(d, _)| d).unwrap_or("");
     let file_name = file.rsplit('/').next().unwrap_or(file);
-    let is_dir_mod = is_rust_crate_root_file(file, target_roots, target_root_dirs)
+    let is_dir_mod = file_name == "mod.rs"
+        || is_rust_crate_root_file(file, target_roots, target_root_dirs)
         || path_loaded_files.contains(file);
     let mod_root_dir = if is_dir_mod {
         file_dir.to_string()
@@ -244,22 +259,11 @@ fn rust_mod_base_dirs(
             format!("{}/{}", mod_root_dir, scope_rel)
         }
     };
-    if !has_explicit_path {
-        return vec![scoped_dir];
+    if has_explicit_path && mod_scope.is_empty() {
+        // Top-level `#[path = "..."] mod foo;` resolves relative to the declaring file's directory.
+        return vec![file_dir.to_string()];
     }
-    let mut dirs = vec![scoped_dir];
-    push_unique(&mut dirs, mod_root_dir);
-    push_unique(&mut dirs, file_dir.to_string());
-    if !mod_scope.is_empty() && !is_dir_mod {
-        let scope_rel = mod_scope.replace("::", "/");
-        let file_scoped = if file_dir.is_empty() {
-            scope_rel
-        } else {
-            format!("{}/{}", file_dir, scope_rel)
-        };
-        push_unique(&mut dirs, file_scoped);
-    }
-    dirs
+    vec![scoped_dir]
 }
 
 /// Propagate `#[cfg(test)]` transitively from parent Rust files to external child `mod` files
@@ -494,15 +498,18 @@ impl<'a> RustTypeIndex<'a> {
             .collect();
         let mut file_to_crate_root: HashMap<&'a str, String> = HashMap::new();
         for &file in &known_files {
-            // A multi-file binary under src/bin/<name>/... has its own crate root dir src/bin/<name>.
+            // A multi-file binary under src/bin/<name>/... has its own crate root dir iff src/bin/<name>/main.rs exists.
             if let Some(bin_dir) = target_root_dirs
                 .iter()
                 .filter(|d| *d == "src/bin" || d.ends_with("/src/bin"))
                 .find_map(|d| {
                     let prefix = format!("{}/", d);
                     file.strip_prefix(&prefix).and_then(|rest| {
-                        rest.split_once('/')
-                            .map(|(sub, _)| format!("{}/{}", d, sub))
+                        rest.split_once('/').and_then(|(sub, _)| {
+                            let cand_dir = format!("{}/{}", d, sub);
+                            let cand_main = format!("{}/main.rs", cand_dir);
+                            known_files.contains(cand_main.as_str()).then_some(cand_dir)
+                        })
                     })
                 })
             {
@@ -1916,7 +1923,10 @@ impl<'a> RustTypeIndex<'a> {
                 visited,
                 out,
             );
-            if out.len() > before {
+            let any_cfg = out[before..]
+                .iter()
+                .any(|id| self.cfg_gated_ids.contains(id.as_str()));
+            if out.len() > before && !any_cfg {
                 return;
             }
         }
