@@ -563,11 +563,6 @@ pub(crate) fn extract_with_context(
         .parse(src, None)
         .ok_or_else(|| anyhow::anyhow!("failed to parse TS/JS file {}", rel_path))?;
 
-    let is_test_file = rel_path.contains(".test.")
-        || rel_path.contains(".spec.")
-        || rel_path.contains("/__tests__/")
-        || rel_path.starts_with("tests/")
-        || rel_path.contains("/tests/");
     let is_sveltekit_route = rel_path.contains("/routes/")
         && (rel_path.ends_with("+page.ts")
             || rel_path.ends_with("+layout.ts")
@@ -579,6 +574,11 @@ pub(crate) fn extract_with_context(
             || rel_path.ends_with("+server.js")
             || rel_path.ends_with("+page.server.js")
             || rel_path.ends_with("+layout.server.js"));
+    let is_test_file = rel_path.contains(".test.")
+        || rel_path.contains(".spec.")
+        || rel_path.contains("/__tests__/")
+        || (!is_sveltekit_route
+            && (rel_path.starts_with("tests/") || rel_path.contains("/tests/")));
 
     let mut imports = Vec::new();
     let mut symbols = Vec::new();

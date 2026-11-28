@@ -426,6 +426,8 @@ fn dead_reason_rank(reason: &str) -> u8 {
     }
 }
 
+/// Sorts dead symbols by confidence descending, then unreferenced ahead of
+/// unreachable_cluster within each confidence tier, then file/line/symbol.
 fn sort_dead_symbols(dead_list: &mut [DeadSymbol]) {
     dead_list.sort_by(|a, b| {
         b.confidence

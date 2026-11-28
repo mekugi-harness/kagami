@@ -175,21 +175,33 @@ fn has_inner_test_attr(parent: Node<'_>, src: &str) -> bool {
     false
 }
 
+fn attr_path(attr: &str) -> &str {
+    let s = attr.trim();
+    let inner = s
+        .strip_prefix("#![")
+        .or_else(|| s.strip_prefix("#["))
+        .unwrap_or(s)
+        .trim_start();
+    let end = inner
+        .find(|c: char| c.is_ascii_whitespace() || matches!(c, '(' | '=' | ']'))
+        .unwrap_or(inner.len());
+    inner[..end].trim()
+}
+
 fn attr_is_test(attr: &str) -> bool {
-    if attr.contains("#[test]")
-        || attr.contains("::test]")
-        || attr.contains("::test(")
-        || attr.contains("#[bench]")
-        || attr.contains("::bench]")
-        || attr.contains("::bench(")
-        || attr.contains("#[rstest")
-        || attr.contains("#[test_case")
-        || attr.contains("#[traced_test")
-        || attr.contains("criterion")
+    let path = attr_path(attr);
+    let last = path.rsplit("::").next().unwrap_or(path);
+    if matches!(
+        last,
+        "test" | "bench" | "rstest" | "test_case" | "traced_test"
+    ) || path == "criterion"
+        || path.starts_with("criterion::")
     {
         return true;
     }
-    if let Some(idx) = attr.find("cfg(") {
+    if (path == "cfg" || path.ends_with("::cfg"))
+        && let Some(idx) = attr.find("cfg(")
+    {
         let rest = &attr[idx + 4..];
         if let Some(pred) = extract_balanced_parens(rest) {
             // Strictly test-only iff the predicate CANNOT hold when `test` is false.
@@ -532,7 +544,9 @@ fn extract_rust_attr_args_refs(
                                 }
                             }
                         }
-                        "default" | "serialize_with" | "deserialize_with"
+                        "default"
+                        | "serialize_with"
+                        | "deserialize_with"
                         | "skip_serializing_if" => {
                             emit_scoped_call_ref(from_id, &path, impl_type, line, refs);
                             emit_path_generic_type_args(&path, from_id, impl_type, line, refs);
@@ -568,7 +582,15 @@ fn extract_rust_attr_args_refs(
                             _ => {}
                         }
                     } else if key == "transform" {
-                        scan_rust_token_slice(&entry[2..], src, from_id, impl_type, env, refs, bridges);
+                        scan_rust_token_slice(
+                            &entry[2..],
+                            src,
+                            from_id,
+                            impl_type,
+                            env,
+                            refs,
+                            bridges,
+                        );
                     }
                 }
             }
@@ -609,9 +631,7 @@ fn extract_rust_attr_args_refs(
                 } else if entry.len() >= 2 && entry[1].kind() == "token_tree" {
                     let key = node_text(entry[0], src);
                     if matches!(key, "defer" | "value_parser") {
-                        scan_rust_token_tree(
-                            entry[1], src, from_id, impl_type, env, refs, bridges,
-                        );
+                        scan_rust_token_tree(entry[1], src, from_id, impl_type, env, refs, bridges);
                     }
                 }
             }
@@ -639,15 +659,7 @@ fn extract_rust_attr_args_refs(
                     && node_text(entry[0], src) == "target"
                     && entry[1].kind() == "="
                 {
-                    scan_rust_token_slice(
-                        &entry[2..],
-                        src,
-                        from_id,
-                        impl_type,
-                        env,
-                        refs,
-                        bridges,
-                    );
+                    scan_rust_token_slice(&entry[2..], src, from_id, impl_type, env, refs, bridges);
                 }
             }
         }
@@ -777,7 +789,10 @@ fn emit_scoped_call_ref(
     };
     if let Some(&type_seg) = prefix_parts.last()
         && type_seg != "Self"
-        && type_seg.chars().next().is_some_and(|c| c.is_ascii_uppercase())
+        && type_seg
+            .chars()
+            .next()
+            .is_some_and(|c| c.is_ascii_uppercase())
         && !is_rust_builtin_type(type_seg)
     {
         let type_qual = if prefix_parts.len() >= 2 {
@@ -2094,15 +2109,20 @@ fn chain_with_err_result(chain: Option<&[ReceiverStep]>) -> Option<Vec<ReceiverS
             } => {
                 if matches!(
                     name.as_str(),
+                    "map_err" | "context" | "with_context" | "or_else" | "or"
+                ) {
+                    return None;
+                }
+                if matches!(
+                    name.as_str(),
                     "as_ref"
                         | "as_mut"
                         | "as_deref"
                         | "as_deref_mut"
                         | "inspect"
                         | "inspect_err"
-                        | "map_err"
-                        | "context"
-                        | "with_context"
+                        | "map"
+                        | "and_then"
                 ) {
                     continue;
                 }
@@ -2877,8 +2897,9 @@ fn extract_rust_receiver_chain(
                 }
                 if ch.kind() == "let_declaration" {
                     let tuple_chains = if ch.child_by_field_name("type").is_none() {
-                        ch.child_by_field_name("value")
-                            .and_then(|v| extract_rust_tuple_expr_chains(v, src, &block_env, impl_type))
+                        ch.child_by_field_name("value").and_then(|v| {
+                            extract_rust_tuple_expr_chains(v, src, &block_env, impl_type)
+                        })
                     } else {
                         None
                     };
@@ -2893,12 +2914,19 @@ fn extract_rust_receiver_chain(
                             }
                         })
                         .or_else(|| {
-                            ch.child_by_field_name("value")
-                                .and_then(|v| extract_rust_receiver_chain(v, src, &block_env, impl_type))
+                            ch.child_by_field_name("value").and_then(|v| {
+                                extract_rust_receiver_chain(v, src, &block_env, impl_type)
+                            })
                         });
                     if let Some(pat) = ch.child_by_field_name("pattern") {
                         let handled = tuple_chains.as_deref().is_some_and(|elems| {
-                            bind_rust_tuple_pattern_elements(pat, src, elems, impl_type, &mut block_env)
+                            bind_rust_tuple_pattern_elements(
+                                pat,
+                                src,
+                                elems,
+                                impl_type,
+                                &mut block_env,
+                            )
                         });
                         if !handled {
                             bind_rust_pattern(pat, src, inferred, impl_type, &mut block_env);
@@ -2949,7 +2977,13 @@ fn extract_rust_receiver_chain(
                     arm_env.push_scope();
                     if let Some(pat) = ch.child_by_field_name("pattern") {
                         let handled = tuple_scrutinee.as_deref().is_some_and(|elems| {
-                            bind_rust_tuple_pattern_elements(pat, src, elems, impl_type, &mut arm_env)
+                            bind_rust_tuple_pattern_elements(
+                                pat,
+                                src,
+                                elems,
+                                impl_type,
+                                &mut arm_env,
+                            )
                         });
                         if !handled {
                             bind_rust_pattern(pat, src, scrutinee.clone(), impl_type, &mut arm_env);
@@ -2994,9 +3028,7 @@ fn extract_rust_receiver_chain(
                         result_index: 0,
                     }]);
                 }
-                if prev == "Self"
-                    || prev.chars().next().is_some_and(|c| c.is_ascii_uppercase())
-                {
+                if prev == "Self" || prev.chars().next().is_some_and(|c| c.is_ascii_uppercase()) {
                     let enum_path = parts[..parts.len() - 1].join("::");
                     let norm = normalize_rust_type_text(&enum_path, impl_type);
                     let resolved = norm.trim_start_matches("[]").to_string();
@@ -3095,8 +3127,7 @@ fn extract_rust_receiver_chain(
                 "field_expression" => {
                     let recv = func.child_by_field_name("value")?;
                     let mname = node_text(func.child_by_field_name("field")?, src);
-                    if let Some(mut chain) =
-                        extract_rust_receiver_chain(recv, src, env, impl_type)
+                    if let Some(mut chain) = extract_rust_receiver_chain(recv, src, env, impl_type)
                     {
                         chain.push(ReceiverStep::MethodCall {
                             name: mname.to_string(),
@@ -3360,7 +3391,9 @@ fn walk_rust_expr(
             }
         }
         "match_arm" => {
-            walk_rust_match_arm(node, src, from_id, impl_type, None, None, env, refs, bridges);
+            walk_rust_match_arm(
+                node, src, from_id, impl_type, None, None, env, refs, bridges,
+            );
         }
         "call_expression" => {
             let mut closure_param_hint: Option<(usize, Vec<ReceiverStep>)> = None;
@@ -4037,15 +4070,11 @@ fn split_rust_scoped_callee(
     let clean = strip_balanced_generics(ftxt);
     let parts: Vec<&str> = clean.split("::").filter(|p| !p.is_empty()).collect();
     let last = *parts.last()?;
-    let raw_qual = if parts.len() >= 2 {
-        Some(parts[parts.len() - 2])
-    } else {
-        None
-    };
-    let qual = match raw_qual {
-        Some("Self") => impl_type.map(|t| t.to_string()),
-        Some("crate") | Some("super") | Some("self") | None => None,
-        Some(q) => Some(q.to_string()),
+    let qual = match &parts[..parts.len() - 1] {
+        [] => None,
+        ["Self"] => impl_type.map(|t| t.to_string()),
+        ["crate"] | ["super"] | ["self"] => None,
+        prefix => Some(prefix.join("::")),
     };
     Some((qual, last.to_string()))
 }
@@ -4273,7 +4302,10 @@ fn walk_rust_reparsed_snippet(
     bridges: &mut Vec<BridgeHint>,
 ) -> bool {
     let mut parser = Parser::new();
-    if parser.set_language(&tree_sitter_rust::LANGUAGE.into()).is_err() {
+    if parser
+        .set_language(&tree_sitter_rust::LANGUAGE.into())
+        .is_err()
+    {
         return false;
     }
     let Some(tree) = parser.parse(snippet, None) else {
@@ -4292,7 +4324,15 @@ fn walk_rust_reparsed_snippet(
     let refs_before = refs.len();
     let bridges_before = bridges.len();
     let mut local_env = env.clone();
-    walk_rust_expr(body, snippet, from_id, impl_type, &mut local_env, refs, bridges);
+    walk_rust_expr(
+        body,
+        snippet,
+        from_id,
+        impl_type,
+        &mut local_env,
+        refs,
+        bridges,
+    );
     let line_offset = base_line.saturating_sub(1);
     for r in &mut refs[refs_before..] {
         r.line = r.line.saturating_add(line_offset);
@@ -4385,10 +4425,7 @@ fn walk_rust_select_macro(
             // Stop future expression before `, if <guard>` if present.
             let mut fut_end_idx = hdr.len() - 1;
             for k in (eq_idx + 1)..hdr.len() {
-                if hdr[k].kind() == ","
-                    && k + 1 < hdr.len()
-                    && node_text(hdr[k + 1], src) == "if"
-                {
+                if hdr[k].kind() == "," && k + 1 < hdr.len() && node_text(hdr[k + 1], src) == "if" {
                     fut_end_idx = k - 1;
                     break;
                 }
@@ -4447,7 +4484,15 @@ fn walk_rust_select_macro(
         arm_start = i;
     }
     if arm_start < len {
-        scan_rust_token_slice(&tokens[arm_start..], src, from_id, impl_type, env, refs, bridges);
+        scan_rust_token_slice(
+            &tokens[arm_start..],
+            src,
+            from_id,
+            impl_type,
+            env,
+            refs,
+            bridges,
+        );
     }
 }
 
@@ -4488,10 +4533,7 @@ fn reconstruct_token_slice_chain(
             j -= 1;
             continue;
         }
-        if j >= 2
-            && children[j - 2].kind() == "."
-            && node_text(children[j - 1], src) == "await"
-        {
+        if j >= 2 && children[j - 2].kind() == "." && node_text(children[j - 1], src) == "await" {
             j -= 2;
             continue;
         }

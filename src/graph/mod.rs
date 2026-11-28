@@ -2017,8 +2017,7 @@ fn resolve_ref(
         }
 
         // Rust module-qualified function/const/type refs (e.g. auth::connect, types::Config)
-        if is_rust_path_qual && qual.chars().next().is_some_and(|c| c.is_ascii_lowercase())
-        {
+        if is_rust_path_qual && qual.chars().next().is_some_and(|c| c.is_ascii_lowercase()) {
             let caller_is_test = symbols
                 .get(&r.from_symbol_id)
                 .map(|s| s.is_test)
@@ -2297,6 +2296,12 @@ fn resolve_ref(
                     .collect();
             }
         }
+        if cands.len() <= 3 && r.target_name.len() >= 5 {
+            return cands
+                .iter()
+                .map(|id| ((*id).clone(), Confidence::Heuristic))
+                .collect();
+        }
         if matches!(
             ext.lang,
             Language::TypeScript | Language::JavaScript | Language::Svelte
@@ -2333,12 +2338,6 @@ fn resolve_ref(
                     return vec![(same_dir[0].clone(), Confidence::Heuristic)];
                 }
             }
-        }
-        if cands.len() <= 3 && r.target_name.len() >= 5 {
-            return cands
-                .iter()
-                .map(|id| ((*id).clone(), Confidence::Heuristic))
-                .collect();
         }
     }
 

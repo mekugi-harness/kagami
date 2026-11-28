@@ -5020,6 +5020,8 @@ fn test_ts_generators_tests_dir_and_qualifier_disambiguation() {
     let root = dir.path();
     fs::create_dir_all(root.join("sdk/src")).unwrap();
     fs::create_dir_all(root.join("sdk/tests")).unwrap();
+    fs::create_dir_all(root.join("src/routes/tests")).unwrap();
+    fs::create_dir_all(root.join("src/lib")).unwrap();
 
     fs::write(
         root.join("sdk/src/thread.ts"),
@@ -5028,7 +5030,61 @@ export class Thread {
   run(): string {
     return "ok";
   }
+  start(): void {}
   unusedThreadMethod(): void {}
+}
+"#,
+    )
+    .unwrap();
+
+    fs::write(
+        root.join("sdk/src/worker.ts"),
+        r#"
+export class Worker {
+  start(): void {}
+}
+export function makeWorker(): any {
+  return new Worker();
+}
+"#,
+    )
+    .unwrap();
+
+    fs::write(
+        root.join("sdk/src/gen.ts"),
+        r#"
+export function* prodGenLive() {
+  yield 1;
+}
+export function* prodGenDead() {
+  yield 2;
+}
+"#,
+    )
+    .unwrap();
+
+    fs::write(
+        root.join("src/lib/results.ts"),
+        r#"
+import { makeWorker } from "../../sdk/src/worker";
+import { prodGenLive } from "../../sdk/src/gen";
+
+export function fetchResults() {
+  const thread = makeWorker();
+  thread.start();
+  return [...prodGenLive()];
+}
+"#,
+    )
+    .unwrap();
+
+    fs::write(
+        root.join("src/routes/tests/+page.ts"),
+        r#"
+import { fetchResults } from "../../lib/results";
+
+export function load() {
+  return fetchResults();
 }
 "#,
     )
@@ -5092,8 +5148,35 @@ testRun({});
     let is_dead_all = |sym: &str| dead_all.symbols.iter().any(|s| s.symbol == sym);
 
     assert!(
+        graph.symbols.values().any(|s| s.name == "genStream"),
+        "Expected generator function genStream to be extracted into graph.symbols"
+    );
+    assert!(
+        graph.symbols.values().any(|s| s.name == "prodGenLive"),
+        "Expected generator function prodGenLive to be extracted into graph.symbols"
+    );
+    assert!(
+        graph.symbols.values().any(|s| s.name == "prodGenDead"),
+        "Expected generator function prodGenDead to be extracted into graph.symbols"
+    );
+    assert!(
         !is_dead_all("genStream"),
         "Expected generator function genStream to be live; dead={:?}",
+        dead_all.symbols
+    );
+    assert!(
+        !is_dead_all("prodGenLive"),
+        "Expected called production generator prodGenLive to be live; dead={:?}",
+        dead_all.symbols
+    );
+    assert!(
+        is_dead_all("prodGenDead"),
+        "Expected uncalled production generator prodGenDead to be dead; dead={:?}",
+        dead_all.symbols
+    );
+    assert!(
+        !is_dead_all("Worker.start"),
+        "Expected Worker.start to stay live when variable named thread holds a Worker; dead={:?}",
         dead_all.symbols
     );
     assert!(
@@ -5128,10 +5211,224 @@ testRun({});
         !dead_prod
             .symbols
             .iter()
-            .any(|s| s.file.contains("/tests/")),
-        "Expected files under /tests/ to be excluded from --scope prod; dead={:?}",
+            .any(|s| s.file.contains("sdk/tests/")),
+        "Expected files under sdk/tests/ to be excluded from --scope prod; dead={:?}",
+        dead_prod.symbols
+    );
+    assert!(
+        !dead_prod.symbols.iter().any(|s| s.symbol == "fetchResults"),
+        "Expected helper called by SvelteKit route src/routes/tests/+page.ts to stay live in --scope prod; dead={:?}",
+        dead_prod.symbols
+    );
+    assert!(
+        !dead_prod.symbols.iter().any(|s| s.symbol == "prodGenLive"),
+        "Expected prodGenLive called via src/routes/tests/+page.ts to stay live in --scope prod; dead={:?}",
+        dead_prod.symbols
+    );
+    assert!(
+        dead_prod.symbols.iter().any(|s| s.symbol == "prodGenDead"),
+        "Expected uncalled prodGenDead to be dead in --scope prod; dead={:?}",
         dead_prod.symbols
     );
 }
 
+#[test]
+fn test_rust_pr20_review_regressions() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    fs::create_dir_all(root.join("src/outer/inner")).unwrap();
 
+    fs::write(
+        root.join("Cargo.toml"),
+        r#"[package]
+name = "review_reg"
+version = "0.1.0"
+edition = "2024"
+"#,
+    )
+    .unwrap();
+
+    // Nested inline module inside non-root file outer.rs -> outer/inner/fixtures.rs
+    fs::write(
+        root.join("src/outer.rs"),
+        r#"
+pub mod inner {
+    #[cfg(test)]
+    mod fixtures;
+}
+"#,
+    )
+    .unwrap();
+
+    fs::write(
+        root.join("src/outer/inner/fixtures.rs"),
+        r#"
+pub fn nested_fixture_helper() {}
+"#,
+    )
+    .unwrap();
+
+    // Multi-platform constructor with short method name go() (below 5-char fallback)
+    fs::write(
+        root.join("src/plat_unix.rs"),
+        r#"
+pub struct Plat;
+impl Plat {
+    pub fn open() -> Self { Self }
+    pub fn go(&self) {}
+}
+"#,
+    )
+    .unwrap();
+    fs::write(
+        root.join("src/plat_win.rs"),
+        r#"
+pub struct Plat;
+impl Plat {
+    pub fn open() -> Self { Self }
+    pub fn go(&self) {}
+}
+"#,
+    )
+    .unwrap();
+    fs::write(
+        root.join("src/plat_mac.rs"),
+        r#"
+pub struct Plat;
+impl Plat {
+    pub fn open() -> Self { Self }
+    pub fn go(&self) {}
+}
+"#,
+    )
+    .unwrap();
+
+    // Re-exported platform function
+    fs::write(
+        root.join("src/windows.rs"),
+        r#"
+pub fn run_windows() {}
+"#,
+    )
+    .unwrap();
+
+    // Separate modules for map_err error-type test
+    fs::write(
+        root.join("src/raw_err.rs"),
+        r#"
+pub struct RawError;
+impl RawError {
+    pub fn report(&self) {}
+}
+pub fn parse_raw() -> Result<(), RawError> {
+    Err(RawError)
+}
+"#,
+    )
+    .unwrap();
+    fs::write(
+        root.join("src/pub_err.rs"),
+        r#"
+pub struct PublicError;
+impl PublicError {
+    pub fn report(&self) {}
+}
+"#,
+    )
+    .unwrap();
+
+    fs::write(
+        root.join("src/main.rs"),
+        r#"
+mod outer;
+mod windows;
+mod raw_err;
+mod pub_err;
+
+#[cfg_attr(target_os = "linux", path = "plat_unix.rs")]
+#[cfg_attr(target_os = "windows", path = "plat_win.rs")]
+#[cfg_attr(target_os = "macos", path = "plat_mac.rs")]
+mod plat;
+
+#[cfg(unix)]
+mod imp {
+    pub fn run() {}
+}
+#[cfg(windows)]
+mod imp {
+    pub use crate::windows::run_windows as run;
+}
+
+// Doc mentioning "criterion" must NOT mark prod code as test
+#[doc = "Updates the selection criterion."]
+fn update_criterion() {
+    criterion_prod_helper();
+}
+fn criterion_prod_helper() {}
+
+// Out-of-scope inline module trait must NOT be kept live by stdlib text.trim()
+mod legacy {
+    pub trait Trim {
+        fn trim(&self) {
+            legacy_cleanup();
+        }
+    }
+    fn legacy_cleanup() {}
+}
+
+fn main() {
+    update_criterion();
+    imp::run();
+    let p = plat::Plat::open();
+    p.go();
+    let text = String::from(" hi ");
+    let _ = text.trim();
+    if let Err(err) = raw_err::parse_raw().map_err(|_| pub_err::PublicError) {
+        err.report();
+    }
+}
+"#,
+    )
+    .unwrap();
+
+    let dead_prod = analyze_rust_dead(root);
+    let is_dead = |file_suffix: &str, sym: &str| {
+        dead_prod
+            .symbols
+            .iter()
+            .any(|s| s.file.ends_with(file_suffix) && s.symbol == sym)
+    };
+
+    assert!(
+        !is_dead("src/outer/inner/fixtures.rs", "nested_fixture_helper"),
+        "Expected nested #[cfg(test)] fixture under outer/inner/ to be excluded from prod; dead={:?}",
+        dead_prod.symbols
+    );
+    assert!(
+        !is_dead("src/main.rs", "criterion_prod_helper"),
+        "Expected helper called by #[doc = \"...criterion...\"] fn to stay live in prod; dead={:?}",
+        dead_prod.symbols
+    );
+    assert!(
+        !is_dead("src/windows.rs", "run_windows"),
+        "Expected Windows inline mod re-export run_windows to stay live; dead={:?}",
+        dead_prod.symbols
+    );
+    for f in ["src/plat_unix.rs", "src/plat_win.rs", "src/plat_mac.rs"] {
+        assert!(
+            !is_dead(f, "Plat::go"),
+            "Expected platform variant {f} Plat::go to stay live; dead={:?}",
+            dead_prod.symbols
+        );
+    }
+    assert!(
+        is_dead("src/main.rs", "legacy_cleanup"),
+        "Expected out-of-scope legacy::Trim helper legacy_cleanup to remain dead; dead={:?}",
+        dead_prod.symbols
+    );
+    assert!(
+        !is_dead("src/pub_err.rs", "PublicError::report"),
+        "Expected PublicError::report to stay live after map_err; dead={:?}",
+        dead_prod.symbols
+    );
+}

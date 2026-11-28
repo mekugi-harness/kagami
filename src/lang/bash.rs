@@ -214,12 +214,7 @@ fn is_simple_bash_ident(s: &str) -> bool {
             .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
 }
 
-fn extract_bash_trap_refs(
-    args: &[String],
-    from_id: &str,
-    line: usize,
-    refs: &mut Vec<RawRef>,
-) {
+fn extract_bash_trap_refs(args: &[String], from_id: &str, line: usize, refs: &mut Vec<RawRef>) {
     let mut idx = 0;
     while idx < args.len() {
         let a = args[idx].as_str();
@@ -256,7 +251,9 @@ fn extract_bash_trap_refs(
         return;
     }
     let mut parser = Parser::new();
-    if parser.set_language(&tree_sitter_bash::LANGUAGE.into()).is_ok()
+    if parser
+        .set_language(&tree_sitter_bash::LANGUAGE.into())
+        .is_ok()
         && let Some(tree) = parser.parse(action, None)
     {
         collect_bash_command_names(tree.root_node(), action, from_id, line, refs);
