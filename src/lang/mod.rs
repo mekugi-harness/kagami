@@ -172,6 +172,7 @@ fn extract_json_schema(rel_path: &str, src: &str, blake3_hex: String) -> Result<
         rust_uses: Vec::new(),
         symbol_mod_scopes: std::collections::HashMap::new(),
         func_callback_params: std::collections::HashMap::new(),
+        ts_star_reexports: Vec::new(),
     })
 }
 

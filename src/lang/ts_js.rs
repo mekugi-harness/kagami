@@ -474,7 +474,11 @@ pub(crate) fn collect_svelte_script_context(
     ctx.type_namespace_imports
         .extend(ts_imports.type_namespaces);
     ctx.local_callables
-        .extend(collect_ts_local_callables(tree.root_node(), script_src));
+        .extend(collect_ts_local_callables(
+            tree.root_node(),
+            script_src,
+            false,
+        ));
     ctx.local_classes
         .extend(collect_ts_local_classes(tree.root_node(), script_src));
     Ok(())
@@ -580,12 +584,14 @@ pub(crate) fn extract_with_context(
     let mut bridges = Vec::new();
     let mut ir_funcs = Vec::new();
     let mut embedded_types: HashMap<String, Vec<String>> = HashMap::new();
+    let mut ts_star_reexports: Vec<String> = Vec::new();
     let ts_imports = collect_ts_imports(tree.root_node(), src, rel_path);
     let mut imported_bindings = ts_imports.bindings;
     let mut type_imported_bindings = ts_imports.type_bindings;
     let mut namespace_imports = ts_imports.namespaces;
     let mut type_namespace_imports = ts_imports.type_namespaces;
-    let mut local_callables = collect_ts_local_callables(tree.root_node(), src);
+    let mut local_callables =
+        collect_ts_local_callables(tree.root_node(), src, lang != Language::Svelte);
     let mut local_classes = collect_ts_local_classes(tree.root_node(), src);
     let mut svelte_bind_this = HashMap::new();
     if let Some(extra) = extra_ctx {
@@ -677,6 +683,7 @@ pub(crate) fn extract_with_context(
                     if collect_ts_non_func_var_inits(
                         ch,
                         src,
+                        lang,
                         line_offset,
                         &mod_id,
                         &ctx,
@@ -693,6 +700,7 @@ pub(crate) fn extract_with_context(
                             && collect_ts_non_func_var_inits(
                                 ech,
                                 src,
+                                lang,
                                 line_offset,
                                 &mod_id,
                                 &ctx,
@@ -744,6 +752,7 @@ pub(crate) fn extract_with_context(
         &mut bridges,
         &mut ir_funcs,
         &mut embedded_types,
+        &mut ts_star_reexports,
     );
 
     Ok(FileExtract {
@@ -767,6 +776,7 @@ pub(crate) fn extract_with_context(
         rust_uses: Vec::new(),
         symbol_mod_scopes: std::collections::HashMap::new(),
         func_callback_params: std::collections::HashMap::new(),
+        ts_star_reexports,
     })
 }
 
@@ -975,14 +985,26 @@ fn collect_ts_local_classes(root: Node<'_>, src: &str) -> HashSet<String> {
     classes
 }
 
-fn collect_ts_local_callables(root: Node<'_>, src: &str) -> HashSet<String> {
+fn collect_ts_local_callables(
+    root: Node<'_>,
+    src: &str,
+    include_non_func_vars: bool,
+) -> HashSet<String> {
     let mut callables = HashSet::new();
-    fn visit_top(node: Node<'_>, src: &str, out: &mut HashSet<String>) {
+    fn visit_top(
+        node: Node<'_>,
+        src: &str,
+        include_non_func_vars: bool,
+        out: &mut HashSet<String>,
+    ) {
         let mut c = node.walk();
         for ch in node.children(&mut c) {
             match ch.kind() {
-                "export_statement" => visit_top(ch, src, out),
-                "function_declaration" | "class_declaration" => {
+                "export_statement" => visit_top(ch, src, include_non_func_vars, out),
+                "function_declaration"
+                | "class_declaration"
+                | "abstract_class_declaration"
+                | "enum_declaration" => {
                     if let Some(name_node) = ch.child_by_field_name("name") {
                         out.insert(node_text(name_node, src).to_string());
                     }
@@ -991,12 +1013,13 @@ fn collect_ts_local_callables(root: Node<'_>, src: &str) -> HashSet<String> {
                     let mut vc = ch.walk();
                     for decl in ch.children(&mut vc) {
                         if decl.kind() == "variable_declarator"
-                            && let (Some(name_node), Some(val)) = (
-                                decl.child_by_field_name("name"),
-                                decl.child_by_field_name("value"),
-                            )
+                            && let Some(name_node) = decl.child_by_field_name("name")
                             && name_node.kind() == "identifier"
-                            && unwrap_ts_function_value(val).is_some()
+                            && (include_non_func_vars
+                                || decl
+                                    .child_by_field_name("value")
+                                    .and_then(unwrap_ts_function_value)
+                                    .is_some())
                         {
                             out.insert(node_text(name_node, src).to_string());
                         }
@@ -1006,7 +1029,7 @@ fn collect_ts_local_callables(root: Node<'_>, src: &str) -> HashSet<String> {
             }
         }
     }
-    visit_top(root, src, &mut callables);
+    visit_top(root, src, include_non_func_vars, &mut callables);
     callables
 }
 
@@ -1017,9 +1040,27 @@ fn unwrap_ts_function_value(mut node: Node<'_>) -> Option<Node<'_>> {
     matches!(node.kind(), "arrow_function" | "function_expression").then_some(node)
 }
 
+fn contains_ts_call_outside_fn(node: Node<'_>) -> bool {
+    let mut stack = vec![node];
+    while let Some(n) = stack.pop() {
+        match n.kind() {
+            "call_expression" | "new_expression" | "member_expression" => return true,
+            "arrow_function" | "function_expression" | "class" => continue,
+            _ => {}
+        }
+        let mut c = n.walk();
+        for ch in n.children(&mut c) {
+            stack.push(ch);
+        }
+    }
+    false
+}
+
+#[allow(clippy::too_many_arguments)]
 fn collect_ts_non_func_var_inits(
     decl_node: Node<'_>,
     src: &str,
+    lang: Language,
     line_offset: usize,
     mod_id: &str,
     ctx: &TsRefContext,
@@ -1029,23 +1070,28 @@ fn collect_ts_non_func_var_inits(
     let mut found = false;
     let mut vc = decl_node.walk();
     for decl in decl_node.children(&mut vc) {
-        if decl.kind() == "variable_declarator" {
-            if let Some(val) = decl.child_by_field_name("value") {
-                if unwrap_ts_function_value(val).is_none() {
-                    found = true;
-                    collect_ts_refs_and_bridges(
-                        decl,
-                        src,
-                        line_offset,
-                        mod_id,
-                        ctx,
-                        &[],
-                        None,
-                        refs,
-                        bridges,
-                    );
-                }
+        if decl.kind() == "variable_declarator"
+            && let Some(val) = decl.child_by_field_name("value")
+            && unwrap_ts_function_value(val).is_none()
+        {
+            let is_named_ident = decl
+                .child_by_field_name("name")
+                .is_some_and(|n| n.kind() == "identifier");
+            if lang != Language::Svelte && is_named_ident {
+                continue;
             }
+            found = true;
+            collect_ts_refs_and_bridges(
+                decl,
+                src,
+                line_offset,
+                mod_id,
+                ctx,
+                &[],
+                None,
+                refs,
+                bridges,
+            );
         }
     }
     found
@@ -1068,6 +1114,7 @@ fn walk_ts_nodes(
     bridges: &mut Vec<BridgeHint>,
     ir_funcs: &mut Vec<IrFunc>,
     embedded_types: &mut HashMap<String, Vec<String>>,
+    ts_star_reexports: &mut Vec<String>,
 ) {
     let mut cursor = parent.walk();
     for child in parent.children(&mut cursor) {
@@ -1099,6 +1146,7 @@ fn walk_ts_nodes(
                     bridges,
                     ir_funcs,
                     embedded_types,
+                    ts_star_reexports,
                 );
                 if is_default {
                     let span = node_span(child, line_offset);
@@ -1178,6 +1226,15 @@ fn walk_ts_nodes(
                         .map(|s| strip_quotes(node_text(s, src)));
                     if let Some(ref spath) = reexport_source {
                         imports.push(spath.clone());
+                        let is_star_export = {
+                            let mut ec = child.walk();
+                            child.children(&mut ec).any(|k| k.kind() == "*")
+                        };
+                        if is_star_export
+                            && let Some(resolved_file) = resolve_relative_path(rel_path, spath)
+                        {
+                            ts_star_reexports.push(resolved_file);
+                        }
                     }
                     let mut ec = child.walk();
                     for clause in child.children(&mut ec) {
@@ -1187,13 +1244,6 @@ fn walk_ts_nodes(
                         let mut sc = clause.walk();
                         for spec in clause.children(&mut sc) {
                             if spec.kind() != "export_specifier" {
-                                continue;
-                            }
-                            let spec_is_type = {
-                                let mut tc = spec.walk();
-                                spec.children(&mut tc).any(|k| k.kind() == "type")
-                            };
-                            if spec_is_type {
                                 continue;
                             }
                             let Some(orig) = spec.child_by_field_name("name") else {
@@ -1211,6 +1261,7 @@ fn walk_ts_nodes(
                             if reexport_source.is_none()
                                 && export_name == ident
                                 && !ctx.imported_bindings.contains_key(ident)
+                                && !ctx.type_imported_bindings.contains_key(ident)
                             {
                                 continue;
                             }
@@ -1258,6 +1309,7 @@ fn walk_ts_nodes(
                                 let (target_name, qualifier) = ctx
                                     .imported_bindings
                                     .get(ident)
+                                    .or_else(|| ctx.type_imported_bindings.get(ident))
                                     .map(|b| (b.target_name.clone(), b.resolved_file.clone()))
                                     .unwrap_or_else(|| (ident.to_string(), None));
                                 refs.push(RawRef {
@@ -1294,6 +1346,11 @@ fn walk_ts_nodes(
                         is_dynamic_candidate: false,
                         package_or_module: rel_path.to_string(),
                     });
+                    for field in ["type_parameters", "return_type"] {
+                        if let Some(tn) = child.child_by_field_name(field) {
+                            collect_ts_refs_and_bridges(tn, src, line_offset, &id, ctx, &[], None, refs, bridges);
+                        }
+                    }
                     if let Some(body) = child.child_by_field_name("body") {
                         let params = extract_ts_params(child, src);
                         let mut param_names = HashSet::new();
@@ -1316,13 +1373,18 @@ fn walk_ts_nodes(
                 }
             }
             "lexical_declaration" | "variable_declaration" => {
+                let is_const_decl = {
+                    let mut dc = child.walk();
+                    child.children(&mut dc).any(|k| k.kind() == "const")
+                };
                 let mut vc = child.walk();
                 for decl in child.children(&mut vc) {
                     if decl.kind() == "variable_declarator" {
-                        if let (Some(name_node), Some(val)) =
-                            (decl.child_by_field_name("name"), decl.child_by_field_name("value"))
-                        {
-                            if let Some(fn_val) = unwrap_ts_function_value(val) {
+                        if let Some(name_node) = decl.child_by_field_name("name") {
+                            let val_opt = decl.child_by_field_name("value");
+                            if let Some(val) = val_opt
+                                && let Some(fn_val) = unwrap_ts_function_value(val)
+                            {
                                 let name = node_text(name_node, src).to_string();
                                 let span = node_span(decl, line_offset);
                                 let id = make_symbol_id(rel_path, &name, span.start_line);
@@ -1342,6 +1404,14 @@ fn walk_ts_nodes(
                                     is_dynamic_candidate: false,
                                     package_or_module: rel_path.to_string(),
                                 });
+                                if let Some(ty) = decl.child_by_field_name("type") {
+                                    collect_ts_refs_and_bridges(ty, src, line_offset, &id, ctx, &[], None, refs, bridges);
+                                }
+                                for field in ["type_parameters", "return_type"] {
+                                    if let Some(tn) = fn_val.child_by_field_name(field) {
+                                        collect_ts_refs_and_bridges(tn, src, line_offset, &id, ctx, &[], None, refs, bridges);
+                                    }
+                                }
                                 let params = extract_ts_params(fn_val, src);
                                 let mut param_names = HashSet::new();
                                 if let Some(p) = fn_val.child_by_field_name("parameter") {
@@ -1364,12 +1434,59 @@ fn walk_ts_nodes(
                                         body: lower_ts_node(body, src),
                                     });
                                 }
+                            } else if lang != Language::Svelte && name_node.kind() == "identifier" {
+                                let name = node_text(name_node, src).to_string();
+                                let span = node_span(decl, line_offset);
+                                let id = make_symbol_id(rel_path, &name, span.start_line);
+                                let is_entry = is_sveltekit_route
+                                    && exported
+                                    && matches!(
+                                        name.as_str(),
+                                        "load"
+                                            | "GET"
+                                            | "POST"
+                                            | "PUT"
+                                            | "DELETE"
+                                            | "PATCH"
+                                            | "actions"
+                                            | "prerender"
+                                            | "ssr"
+                                            | "csr"
+                                            | "trailingSlash"
+                                            | "config"
+                                    );
+                                let is_module_init_call = !is_test_file
+                                    && val_opt.is_some_and(contains_ts_call_outside_fn);
+                                symbols.push(Symbol {
+                                    id: id.clone(),
+                                    name: name.clone(),
+                                    qualified_name: name.clone(),
+                                    kind: if is_const_decl {
+                                        SymbolKind::Const
+                                    } else {
+                                        SymbolKind::Var
+                                    },
+                                    lang,
+                                    file: rel_path.to_string(),
+                                    span,
+                                    visibility: if exported { Visibility::Public } else { Visibility::Private },
+                                    is_test: is_test_file,
+                                    is_entrypoint: is_entry || is_module_init_call,
+                                    is_dynamic_candidate: false,
+                                    package_or_module: rel_path.to_string(),
+                                });
+                                if let Some(ty) = decl.child_by_field_name("type") {
+                                    collect_ts_refs_and_bridges(ty, src, line_offset, &id, ctx, &[], None, refs, bridges);
+                                }
+                                if let Some(val) = val_opt {
+                                    collect_ts_refs_and_bridges(val, src, line_offset, &id, ctx, &[], None, refs, bridges);
+                                }
                             }
                         }
                     }
                 }
             }
-            "class_declaration" => {
+            "class_declaration" | "abstract_class_declaration" => {
                 if let Some(name_node) = child.child_by_field_name("name") {
                     let cls = node_text(name_node, src).to_string();
                     let span = node_span(child, line_offset);
@@ -1388,6 +1505,24 @@ fn walk_ts_nodes(
                         is_dynamic_candidate: false,
                         package_or_module: rel_path.to_string(),
                     });
+                    {
+                        let mut hc = child.walk();
+                        for hch in child.children(&mut hc) {
+                            if matches!(hch.kind(), "class_heritage" | "type_parameters") {
+                                collect_ts_refs_and_bridges(
+                                    hch,
+                                    src,
+                                    line_offset,
+                                    &cls_id,
+                                    ctx,
+                                    &[],
+                                    None,
+                                    refs,
+                                    bridges,
+                                );
+                            }
+                        }
+                    }
                     if let Some(body) = child.child_by_field_name("body") {
                         let mut declared_methods = HashSet::new();
                         {
@@ -1419,6 +1554,32 @@ fn walk_ts_nodes(
                         };
                         let mut bc = body.walk();
                         for member in body.children(&mut bc) {
+                            if matches!(
+                                member.kind(),
+                                "public_field_definition" | "field_definition"
+                            ) {
+                                let static_field_cls_info;
+                                let field_cls_info = if has_child_kind(member, "static") {
+                                    static_field_cls_info = EnclosingClassInfo {
+                                        in_static_method: true,
+                                        ..cls_info.clone()
+                                    };
+                                    &static_field_cls_info
+                                } else {
+                                    &cls_info
+                                };
+                                collect_ts_refs_and_bridges(
+                                    member,
+                                    src,
+                                    line_offset,
+                                    &cls_id,
+                                    ctx,
+                                    &[],
+                                    Some(field_cls_info),
+                                    refs,
+                                    bridges,
+                                );
+                            }
                             if member.kind() == "method_definition" {
                                 if let Some(mname) = member.child_by_field_name("name") {
                                     let m = node_text(mname, src).to_string();
@@ -1439,6 +1600,11 @@ fn walk_ts_nodes(
                                         is_dynamic_candidate: true,
                                         package_or_module: rel_path.to_string(),
                                     });
+                                    for field in ["type_parameters", "return_type"] {
+                                        if let Some(tn) = member.child_by_field_name(field) {
+                                            collect_ts_refs_and_bridges(tn, src, line_offset, &mid, ctx, &[], Some(&cls_info), refs, bridges);
+                                        }
+                                    }
                                     if let Some(mbody) = member.child_by_field_name("body") {
                                         let static_cls_info;
                                         let method_cls_info = if has_child_kind(member, "static") {
@@ -1491,6 +1657,30 @@ fn walk_ts_nodes(
                                 }
                             }
                         }
+                    }
+                }
+            }
+            "enum_declaration" => {
+                if let Some(name_node) = child.child_by_field_name("name") {
+                    let name = node_text(name_node, src).to_string();
+                    let span = node_span(child, line_offset);
+                    let id = make_symbol_id(rel_path, &name, span.start_line);
+                    symbols.push(Symbol {
+                        id: id.clone(),
+                        name: name.clone(),
+                        qualified_name: name.clone(),
+                        kind: SymbolKind::Enum,
+                        lang,
+                        file: rel_path.to_string(),
+                        span,
+                        visibility: if exported { Visibility::Public } else { Visibility::Private },
+                        is_test: is_test_file,
+                        is_entrypoint: false,
+                        is_dynamic_candidate: false,
+                        package_or_module: rel_path.to_string(),
+                    });
+                    if let Some(body) = child.child_by_field_name("body") {
+                        collect_ts_refs_and_bridges(body, src, line_offset, &id, ctx, &[], None, refs, bridges);
                     }
                 }
             }
@@ -2345,9 +2535,141 @@ fn walk_ts_expr_refs(
             }
             return;
         }
+        "type_query" => {
+            let mut tc = n.walk();
+            for ch in n.children(&mut tc) {
+                match ch.kind() {
+                    "identifier" => {
+                        let ident = node_text(ch, src);
+                        if !is_shadowed(scopes, ident) {
+                            if let Some(binding) = ctx
+                                .imported_bindings
+                                .get(ident)
+                                .or_else(|| ctx.type_imported_bindings.get(ident))
+                            {
+                                refs.push(RawRef {
+                                    from_symbol_id: from_id.to_string(),
+                                    target_name: binding.target_name.clone(),
+                                    qualifier: binding.resolved_file.clone(),
+                                    kind: EdgeKind::TypeRef,
+                                    line,
+                                    receiver_chain: None,
+                                });
+                            } else if ctx.local_callables.contains(ident) {
+                                refs.push(RawRef {
+                                    from_symbol_id: from_id.to_string(),
+                                    target_name: ident.to_string(),
+                                    qualifier: None,
+                                    kind: EdgeKind::TypeRef,
+                                    line,
+                                    receiver_chain: None,
+                                });
+                            }
+                        }
+                    }
+                    "member_expression" | "nested_identifier" => {
+                        let raw = node_text(ch, src);
+                        let parts: Vec<&str> = raw.split('.').map(str::trim).collect();
+                        if parts.len() >= 2 {
+                            if let Some(ns_file) = ctx
+                                .namespace_imports
+                                .get(parts[0])
+                                .or_else(|| ctx.type_namespace_imports.get(parts[0]))
+                            {
+                                refs.push(RawRef {
+                                    from_symbol_id: from_id.to_string(),
+                                    target_name: parts[1].to_string(),
+                                    qualifier: Some(ns_file.clone()),
+                                    kind: EdgeKind::TypeRef,
+                                    line,
+                                    receiver_chain: None,
+                                });
+                            } else if let Some(binding) = ctx
+                                .imported_bindings
+                                .get(parts[0])
+                                .or_else(|| ctx.type_imported_bindings.get(parts[0]))
+                            {
+                                refs.push(RawRef {
+                                    from_symbol_id: from_id.to_string(),
+                                    target_name: binding.target_name.clone(),
+                                    qualifier: binding.resolved_file.clone(),
+                                    kind: EdgeKind::TypeRef,
+                                    line,
+                                    receiver_chain: None,
+                                });
+                            } else if ctx.local_callables.contains(parts[0]) {
+                                refs.push(RawRef {
+                                    from_symbol_id: from_id.to_string(),
+                                    target_name: parts[0].to_string(),
+                                    qualifier: None,
+                                    kind: EdgeKind::TypeRef,
+                                    line,
+                                    receiver_chain: None,
+                                });
+                            }
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            return;
+        }
+        "nested_type_identifier" => {
+            if let (Some(mod_node), Some(name_node)) = (
+                n.child_by_field_name("module"),
+                n.child_by_field_name("name"),
+            ) {
+                let mod_name = node_text(mod_node, src);
+                let target = node_text(name_node, src);
+                if let Some(ns_file) = ctx
+                    .type_namespace_imports
+                    .get(mod_name)
+                    .or_else(|| ctx.namespace_imports.get(mod_name))
+                {
+                    refs.push(RawRef {
+                        from_symbol_id: from_id.to_string(),
+                        target_name: target.to_string(),
+                        qualifier: Some(ns_file.clone()),
+                        kind: EdgeKind::TypeRef,
+                        line,
+                        receiver_chain: None,
+                    });
+                    return;
+                }
+                if let Some(binding) = ctx
+                    .type_imported_bindings
+                    .get(mod_name)
+                    .or_else(|| ctx.imported_bindings.get(mod_name))
+                {
+                    refs.push(RawRef {
+                        from_symbol_id: from_id.to_string(),
+                        target_name: binding.target_name.clone(),
+                        qualifier: binding.resolved_file.clone(),
+                        kind: EdgeKind::TypeRef,
+                        line,
+                        receiver_chain: None,
+                    });
+                    return;
+                }
+            }
+            return;
+        }
         "type_identifier" => {
             let t = node_text(n, src);
-            if !matches!(
+            if let Some(binding) = ctx
+                .type_imported_bindings
+                .get(t)
+                .or_else(|| ctx.imported_bindings.get(t))
+            {
+                refs.push(RawRef {
+                    from_symbol_id: from_id.to_string(),
+                    target_name: binding.target_name.clone(),
+                    qualifier: binding.resolved_file.clone(),
+                    kind: EdgeKind::TypeRef,
+                    line,
+                    receiver_chain: None,
+                });
+            } else if !matches!(
                 t,
                 "string"
                     | "number"
@@ -2360,6 +2682,16 @@ fn walk_ts_expr_refs(
                     | "Array"
                     | "Record"
                     | "Partial"
+                    | "Required"
+                    | "Readonly"
+                    | "Pick"
+                    | "Omit"
+                    | "Exclude"
+                    | "Extract"
+                    | "NonNullable"
+                    | "ReturnType"
+                    | "Parameters"
+                    | "Awaited"
             ) {
                 refs.push(RawRef {
                     from_symbol_id: from_id.to_string(),

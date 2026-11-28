@@ -184,6 +184,7 @@ pub fn extract(rel_path: &str, src: &str, blake3_hex: String) -> Result<FileExtr
         rust_uses: Vec::new(),
         symbol_mod_scopes: HashMap::new(),
         func_callback_params: HashMap::new(),
+        ts_star_reexports: Vec::new(),
     })
 }
 

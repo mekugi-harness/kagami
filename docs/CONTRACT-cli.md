@@ -28,6 +28,7 @@ Returns symbols with no reachable call site.
 - `--allowlist <path>`: Allowlist file (auto-detects `.deadcode-allowlist` at repo root if present).
 - `--include-clusters`: Also report unreachable call cycles (`unreachable_cluster`, default: `true`).
 - `--min-confidence <heuristic|resolved|exact>`: Minimum confidence level to report (default: `heuristic`; use `resolved` to filter out dynamic-dispatch / interface / trait `Heuristic` candidates; `dead` currently emits `Heuristic` and `Resolved` findings).
+- `--kinds <callables|types|all>`: Symbol kinds to report (default: `callables`, reporting functions, methods, recipes, and components; `types` reports types, structs, interfaces, enums, traits, consts, and vars; `all` reports both).
 - `--format <md|json>`: Output format (default: `md`).
 
 ### 3. `kagami similar`

@@ -146,6 +146,7 @@ pub fn extract(rel_path: &str, src: &str, blake3_hex: String) -> Result<FileExtr
         type_aliases: ctx.type_aliases,
         rust_uses: ctx.rust_uses,
         symbol_mod_scopes: ctx.symbol_mod_scopes,
+        ts_star_reexports: Vec::new(),
         package_or_module: pkg,
     })
 }
@@ -428,10 +429,17 @@ fn emit_scoped_call_ref(
         && q.chars().next().is_some_and(|c| c.is_ascii_uppercase())
         && !is_rust_builtin_type(q)
     {
+        let type_qual = if prefix_parts.len() >= 2
+            && prefix_parts.last() == Some(&q.as_str())
+        {
+            Some(prefix_parts[..prefix_parts.len() - 1].join("::"))
+        } else {
+            None
+        };
         refs.push(RawRef {
             from_symbol_id: from_id.to_string(),
             target_name: q.clone(),
-            qualifier: None,
+            qualifier: type_qual,
             kind: EdgeKind::TypeRef,
             line,
             receiver_chain: None,
@@ -445,6 +453,83 @@ fn emit_scoped_call_ref(
         line,
         receiver_chain: None,
     });
+}
+
+fn emit_scoped_type_ref(
+    path: &str,
+    from_id: &str,
+    impl_type: Option<&str>,
+    line: usize,
+    refs: &mut Vec<RawRef>,
+) {
+    let clean = strip_balanced_generics(path);
+    let parts: Vec<&str> = clean.split("::").filter(|p| !p.is_empty()).collect();
+    let Some(&last) = parts.last() else {
+        return;
+    };
+    let prefix_parts: Vec<&str> = parts[..parts.len() - 1]
+        .iter()
+        .copied()
+        .filter(|p| *p != "self")
+        .collect();
+    if prefix_parts.is_empty() {
+        if !is_rust_builtin_type(last) {
+            refs.push(RawRef {
+                from_symbol_id: from_id.to_string(),
+                target_name: last.to_string(),
+                qualifier: None,
+                kind: EdgeKind::TypeRef,
+                line,
+                receiver_chain: None,
+            });
+        }
+        return;
+    }
+    if prefix_parts.last() == Some(&"Self") {
+        if let Some(t) = impl_type
+            && !is_rust_builtin_type(t)
+        {
+            refs.push(RawRef {
+                from_symbol_id: from_id.to_string(),
+                target_name: t.to_string(),
+                qualifier: None,
+                kind: EdgeKind::TypeRef,
+                line,
+                receiver_chain: None,
+            });
+        }
+        return;
+    }
+    if let Some(&prev) = prefix_parts.last()
+        && prev.chars().next().is_some_and(|c| c.is_ascii_uppercase())
+    {
+        if !is_rust_builtin_type(prev) {
+            let qual = if prefix_parts.len() >= 2 {
+                Some(prefix_parts[..prefix_parts.len() - 1].join("::"))
+            } else {
+                None
+            };
+            refs.push(RawRef {
+                from_symbol_id: from_id.to_string(),
+                target_name: prev.to_string(),
+                qualifier: qual,
+                kind: EdgeKind::TypeRef,
+                line,
+                receiver_chain: None,
+            });
+        }
+        return;
+    }
+    if !is_rust_builtin_type(last) {
+        refs.push(RawRef {
+            from_symbol_id: from_id.to_string(),
+            target_name: last.to_string(),
+            qualifier: Some(prefix_parts.join("::")),
+            kind: EdgeKind::TypeRef,
+            line,
+            receiver_chain: None,
+        });
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -570,6 +655,24 @@ fn walk_rust_items(
                         &mut impl_methods,
                     );
                 }
+                // Propagate generic bounds / where-clause type refs on impl blocks to their methods
+                if !impl_methods.is_empty() {
+                    let mut ic = child.walk();
+                    for ch in child.children(&mut ic) {
+                        if matches!(ch.kind(), "type_parameters" | "where_clause") {
+                            for mid in &impl_methods {
+                                collect_type_refs(
+                                    ch,
+                                    ctx.src,
+                                    mid,
+                                    ty.as_deref(),
+                                    &mut ctx.refs,
+                                    &mut ctx.bridges,
+                                );
+                            }
+                        }
+                    }
+                }
 
                 if let (Some(tnode), Some(type_name)) = (trait_node, ty) {
                     let raw_trait = node_text(tnode, ctx.src).trim().to_string();
@@ -668,6 +771,9 @@ fn walk_rust_items(
                         let span = node_span(child, 0);
                         let id = make_symbol_id(ctx.rel_path, &qname, span.start_line);
                         let is_test = in_test_mod || has_test_attr;
+                        if in_trait_impl {
+                            collected_methods.push(id.clone());
+                        }
                         if !mod_path.is_empty() {
                             ctx.symbol_mod_scopes
                                 .insert(id.clone(), mod_path.to_string());
@@ -676,7 +782,11 @@ fn walk_rust_items(
                             id: id.clone(),
                             name,
                             qualified_name: qname,
-                            kind: SymbolKind::Const,
+                            kind: if child.kind() == "static_item" {
+                                SymbolKind::Var
+                            } else {
+                                SymbolKind::Const
+                            },
                             lang: Language::Rust,
                             file: ctx.rel_path.to_string(),
                             span,
@@ -782,6 +892,31 @@ fn walk_rust_items(
                             ctx.func_return_types.insert(id.clone(), vec![norm]);
                         }
                     }
+                    for field in ["type_parameters", "where_clause"] {
+                        if let Some(n) = child.child_by_field_name(field) {
+                            collect_type_refs(
+                                n,
+                                ctx.src,
+                                &id,
+                                impl_type,
+                                &mut ctx.refs,
+                                &mut ctx.bridges,
+                            );
+                        }
+                    }
+                    let mut fc = child.walk();
+                    for ch in child.children(&mut fc) {
+                        if ch.kind() == "where_clause" {
+                            collect_type_refs(
+                                ch,
+                                ctx.src,
+                                &id,
+                                impl_type,
+                                &mut ctx.refs,
+                                &mut ctx.bridges,
+                            );
+                        }
+                    }
 
                     let cb_params = extract_rust_callback_params(child, ctx.src, impl_type);
                     if !cb_params.is_empty() {
@@ -825,8 +960,16 @@ fn walk_rust_items(
             "struct_item" | "enum_item" | "trait_item" | "type_item" => {
                 if let Some(name_node) = child.child_by_field_name("name") {
                     let name = node_text(name_node, ctx.src).to_string();
+                    let qname = if child.kind() == "type_item"
+                        && let Some(t) = impl_type
+                        && !t.is_empty()
+                    {
+                        format!("{}::{}", t, name)
+                    } else {
+                        name.clone()
+                    };
                     let span = node_span(child, 0);
-                    let id = make_symbol_id(ctx.rel_path, &name, span.start_line);
+                    let id = make_symbol_id(ctx.rel_path, &qname, span.start_line);
                     let kind = match child.kind() {
                         "struct_item" => SymbolKind::Struct,
                         "enum_item" => SymbolKind::Enum,
@@ -834,6 +977,9 @@ fn walk_rust_items(
                         _ => SymbolKind::Type,
                     };
                     let is_test = in_test_mod || has_test_attr;
+                    if child.kind() == "type_item" && in_trait_impl {
+                        collected_methods.push(id.clone());
+                    }
                     if !mod_path.is_empty() {
                         ctx.symbol_mod_scopes
                             .insert(id.clone(), mod_path.to_string());
@@ -841,7 +987,7 @@ fn walk_rust_items(
                     ctx.symbols.push(Symbol {
                         id: id.clone(),
                         name: name.clone(),
-                        qualified_name: name.clone(),
+                        qualified_name: qname,
                         kind,
                         lang: Language::Rust,
                         file: ctx.rel_path.to_string(),
@@ -1994,6 +2140,16 @@ fn collect_type_refs(
     let mut stack = vec![node];
     while let Some(n) = stack.pop() {
         match n.kind() {
+            "scoped_type_identifier" => {
+                emit_scoped_type_ref(
+                    node_text(n, src),
+                    from_id,
+                    impl_type,
+                    n.start_position().row + 1,
+                    refs,
+                );
+                continue;
+            }
             "type_identifier" => {
                 let t = node_text(n, src);
                 if !is_rust_builtin_type(t) {
@@ -2356,6 +2512,9 @@ fn walk_rust_expr(
         }
         "scoped_identifier" => {
             emit_scoped_call_ref(from_id, node_text(node, src), impl_type, line, refs);
+        }
+        "scoped_type_identifier" => {
+            emit_scoped_type_ref(node_text(node, src), from_id, impl_type, line, refs);
         }
         "identifier" => {
             let name = node_text(node, src);
