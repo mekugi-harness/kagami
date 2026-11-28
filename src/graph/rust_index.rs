@@ -1362,6 +1362,19 @@ impl<'a> RustTypeIndex<'a> {
                         }
                     }
                 }
+                if out.is_empty() && target_scope.is_empty() {
+                    let mut visited = HashSet::new();
+                    for hit in self.resolve_symbol_in_module(
+                        caller_file,
+                        target_name,
+                        filter,
+                        symbols,
+                        0,
+                        &mut visited,
+                    ) {
+                        push_unique(&mut out, hit);
+                    }
+                }
                 if !out.is_empty() {
                     return out
                         .into_iter()
