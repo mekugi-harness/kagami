@@ -173,7 +173,9 @@ pub fn discover_cargo_crates(
 fn rust_mod_base_dirs(file: &str, mod_scope: &str, has_explicit_path: bool) -> Vec<String> {
     let file_dir = file.rsplit_once('/').map(|(d, _)| d).unwrap_or("");
     let file_name = file.rsplit('/').next().unwrap_or(file);
-    let is_dir_mod = matches!(file_name, "lib.rs" | "mod.rs" | "main.rs");
+    let is_dir_mod = matches!(file_name, "lib.rs" | "mod.rs" | "main.rs")
+        || file.contains("/bin/")
+        || file.starts_with("bin/");
     let mod_root_dir = if is_dir_mod {
         file_dir.to_string()
     } else {
@@ -195,7 +197,19 @@ fn rust_mod_base_dirs(file: &str, mod_scope: &str, has_explicit_path: bool) -> V
         }
     };
     if !has_explicit_path {
-        return vec![scoped_dir];
+        let mut dirs = vec![scoped_dir];
+        // Fallback for custom Cargo [[bin]] targets not named main.rs and not under bin/
+        // (e.g. app/entry.rs with `mod tools { mod fixtures; }` -> app/tools/fixtures.rs).
+        if !mod_scope.is_empty() && !is_dir_mod {
+            let scope_rel = mod_scope.replace("::", "/");
+            let file_scoped = if file_dir.is_empty() {
+                scope_rel
+            } else {
+                format!("{}/{}", file_dir, scope_rel)
+            };
+            push_unique(&mut dirs, file_scoped);
+        }
+        return dirs;
     }
     let mut dirs = vec![scoped_dir];
     push_unique(&mut dirs, mod_root_dir);
@@ -1773,6 +1787,27 @@ impl<'a> RustTypeIndex<'a> {
                 base_file, inline_rel, sym_name, filter, symbols, depth, visited, out,
             );
         }
+        // Custom binary crate roots (e.g. app/entry.rs) may reference their own inline modules
+        // via `crate::api::make`; fall back to base_file's inline scope when no file matched.
+        if out.len() == before
+            && let Some(crate_inline) = mod_path.strip_prefix("crate::")
+            && !crate_inline.is_empty()
+            && self
+                .file_inline_scopes
+                .get(base_file)
+                .is_some_and(|scopes| scopes.contains(crate_inline))
+        {
+            self.resolve_symbol_in_inline_mod(
+                base_file,
+                crate_inline,
+                sym_name,
+                filter,
+                symbols,
+                depth,
+                visited,
+                out,
+            );
+        }
         // Check cross-file inline module (e.g. `crate::foo::inline_mod::helper`).
         if out.len() == before && mod_segs.len() >= 2 {
             let last_mod = mod_segs[mod_segs.len() - 1];
@@ -2340,6 +2375,14 @@ impl<'a> RustTypeIndex<'a> {
                         || (!caller_scope.is_empty() && u.mod_scope.is_empty());
                     if !scope_ok || (u.is_test && !caller_is_test) || u.local_name == tsym.name {
                         continue;
+                    }
+                    if let Some(parent_scope) = same_file_super_scope
+                        && u.mod_scope == caller_scope
+                        && trait_scope == parent_scope
+                        && u.target_path == format!("super::{}", tsym.name)
+                    {
+                        in_scope = true;
+                        break;
                     }
                     if let Some((mod_path, target_sym)) = u.target_path.rsplit_once("::")
                         && target_sym == tsym.name

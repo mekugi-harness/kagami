@@ -5079,12 +5079,24 @@ export function fetchResults() {
     .unwrap();
 
     fs::write(
-        root.join("src/routes/tests/+page.ts"),
+        root.join("src/routes/tests/queries.ts"),
         r#"
 import { fetchResults } from "../../lib/results";
 
-export function load() {
+export function loadTestQueries() {
   return fetchResults();
+}
+"#,
+    )
+    .unwrap();
+
+    fs::write(
+        root.join("src/routes/tests/+page.ts"),
+        r#"
+import { loadTestQueries } from "./queries";
+
+export function load() {
+  return loadTestQueries();
 }
 "#,
     )
@@ -5216,6 +5228,14 @@ testRun({});
         dead_prod.symbols
     );
     assert!(
+        !dead_prod
+            .symbols
+            .iter()
+            .any(|s| s.symbol == "loadTestQueries"),
+        "Expected colocated helper src/routes/tests/queries.ts to stay live in --scope prod; dead={:?}",
+        dead_prod.symbols
+    );
+    assert!(
         !dead_prod.symbols.iter().any(|s| s.symbol == "fetchResults"),
         "Expected helper called by SvelteKit route src/routes/tests/+page.ts to stay live in --scope prod; dead={:?}",
         dead_prod.symbols
@@ -5237,6 +5257,8 @@ fn test_rust_pr20_review_regressions() {
     let dir = tempfile::tempdir().unwrap();
     let root = dir.path();
     fs::create_dir_all(root.join("src/outer/inner")).unwrap();
+    fs::create_dir_all(root.join("src/bin/tools")).unwrap();
+    fs::create_dir_all(root.join("app")).unwrap();
 
     fs::write(
         root.join("Cargo.toml"),
@@ -5244,6 +5266,52 @@ fn test_rust_pr20_review_regressions() {
 name = "review_reg"
 version = "0.1.0"
 edition = "2024"
+
+[[bin]]
+name = "custom_app"
+path = "app/entry.rs"
+"#,
+    )
+    .unwrap();
+
+    // Binary crate root src/bin/admin.rs -> src/bin/tools/fixtures.rs
+    fs::write(
+        root.join("src/bin/admin.rs"),
+        r#"
+mod tools {
+    #[cfg(test)]
+    mod fixtures;
+}
+fn main() {}
+"#,
+    )
+    .unwrap();
+    fs::write(
+        root.join("src/bin/tools/fixtures.rs"),
+        r#"
+pub fn bin_fixture_helper() {}
+"#,
+    )
+    .unwrap();
+
+    // Custom [[bin]] root app/entry.rs calling crate::api::make().go()
+    fs::write(
+        root.join("app/entry.rs"),
+        r#"
+pub struct CustomClient;
+impl CustomClient {
+    pub fn go(&self) {}
+}
+mod api {
+    use super::CustomClient;
+    pub fn make() -> CustomClient {
+        CustomClient
+    }
+}
+fn main() {
+    let c = crate::api::make();
+    c.go();
+}
 "#,
     )
     .unwrap();
@@ -5376,9 +5444,28 @@ mod legacy {
     fn legacy_cleanup() {}
 }
 
+// Aliased parent extension trait import (`use super::Ext as Alias;`)
+mod ext_parent {
+    pub trait CheckExt {
+        fn check_val(&self) {
+            record_check();
+        }
+    }
+    impl CheckExt for str {}
+    fn record_check() {}
+
+    pub mod inner {
+        use super::CheckExt as Alias;
+        pub fn run_check() {
+            "text".check_val();
+        }
+    }
+}
+
 fn main() {
     update_criterion();
     imp::run();
+    ext_parent::inner::run_check();
     let p = plat::Plat::open();
     p.go();
     let text = String::from(" hi ");
@@ -5402,6 +5489,21 @@ fn main() {
     assert!(
         !is_dead("src/outer/inner/fixtures.rs", "nested_fixture_helper"),
         "Expected nested #[cfg(test)] fixture under outer/inner/ to be excluded from prod; dead={:?}",
+        dead_prod.symbols
+    );
+    assert!(
+        !is_dead("src/bin/tools/fixtures.rs", "bin_fixture_helper"),
+        "Expected src/bin/admin.rs #[cfg(test)] fixture under src/bin/tools/ to be excluded from prod; dead={:?}",
+        dead_prod.symbols
+    );
+    assert!(
+        !is_dead("app/entry.rs", "CustomClient::go"),
+        "Expected crate::api::make().go() in custom [[bin]] app/entry.rs to keep CustomClient::go live; dead={:?}",
+        dead_prod.symbols
+    );
+    assert!(
+        !is_dead("src/main.rs", "record_check"),
+        "Expected aliased parent trait import (use super::CheckExt as Alias) to keep record_check live; dead={:?}",
         dead_prod.symbols
     );
     assert!(
