@@ -565,7 +565,9 @@ pub(crate) fn extract_with_context(
 
     let is_test_file = rel_path.contains(".test.")
         || rel_path.contains(".spec.")
-        || rel_path.contains("/__tests__/");
+        || rel_path.contains("/__tests__/")
+        || rel_path.starts_with("tests/")
+        || rel_path.contains("/tests/");
     let is_sveltekit_route = rel_path.contains("/routes/")
         && (rel_path.ends_with("+page.ts")
             || rel_path.ends_with("+layout.ts")
@@ -760,6 +762,7 @@ pub(crate) fn extract_with_context(
         lang,
         blake3: blake3_hex,
         package_or_module: rel_path.to_string(),
+        is_test_file,
         imports,
         symbols,
         refs,
@@ -774,6 +777,9 @@ pub(crate) fn extract_with_context(
         cfg_gated_symbols: std::collections::HashMap::new(),
         type_aliases: std::collections::HashMap::new(),
         rust_uses: Vec::new(),
+        rust_mod_paths: Vec::new(),
+        rust_macro_defs: std::collections::HashMap::new(),
+        rust_top_level_macros: Vec::new(),
         symbol_mod_scopes: std::collections::HashMap::new(),
         func_callback_params: std::collections::HashMap::new(),
         ts_star_reexports,
@@ -1002,6 +1008,7 @@ fn collect_ts_local_callables(
             match ch.kind() {
                 "export_statement" => visit_top(ch, src, include_non_func_vars, out),
                 "function_declaration"
+                | "generator_function_declaration"
                 | "class_declaration"
                 | "abstract_class_declaration"
                 | "enum_declaration" => {
@@ -1325,7 +1332,7 @@ fn walk_ts_nodes(
                     }
                 }
             }
-            "function_declaration" => {
+            "function_declaration" | "generator_function_declaration" => {
                 if let Some(name_node) = child.child_by_field_name("name") {
                     let name = node_text(name_node, src).to_string();
                     let span = node_span(child, line_offset);
@@ -1787,6 +1794,7 @@ fn is_ts_value_identifier(n: Node<'_>) -> bool {
         }
         "variable_declarator"
         | "function_declaration"
+        | "generator_function_declaration"
         | "class_declaration"
         | "method_definition" => {
             parent.child_by_field_name("name").map(|nm| nm.id()) != Some(n.id())
@@ -1930,8 +1938,10 @@ fn collect_hoisted_var_bindings(node: Node<'_>, src: &str, out: &mut HashSet<Str
 fn collect_block_hoisted_fns(block: Node<'_>, src: &str, out: &mut HashSet<String>) {
     let mut c = block.walk();
     for ch in block.children(&mut c) {
-        if ch.kind() == "function_declaration"
-            && let Some(name_node) = ch.child_by_field_name("name")
+        if matches!(
+            ch.kind(),
+            "function_declaration" | "generator_function_declaration"
+        ) && let Some(name_node) = ch.child_by_field_name("name")
             && name_node.kind() == "identifier"
         {
             out.insert(node_text(name_node, src).to_string());
@@ -2209,8 +2219,10 @@ fn walk_ts_expr_refs(
                     );
                 } else if name_node.kind() == "identifier" {
                     let name = node_text(name_node, src).to_string();
-                    if n.kind() == "function_declaration"
-                        && let Some(parent_scope) = scopes.last_mut()
+                    if matches!(
+                        n.kind(),
+                        "function_declaration" | "generator_function_declaration"
+                    ) && let Some(parent_scope) = scopes.last_mut()
                     {
                         parent_scope.insert(name.clone());
                     }

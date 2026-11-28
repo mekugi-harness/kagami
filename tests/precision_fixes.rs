@@ -4147,3 +4147,991 @@ new Consumer().run();
         );
     }
 }
+
+#[test]
+fn test_bash_trap_just_default_and_dead_sort_order() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    fs::create_dir_all(root.join("scripts")).unwrap();
+
+    fs::write(
+        root.join("scripts/run.sh"),
+        r#"#!/usr/bin/env bash
+cleanup_simple() { echo "simple"; }
+cleanup_compound_a() { echo "a"; }
+cleanup_compound_b() { echo "b"; }
+cleanup_dashdash() { echo "dd"; }
+dead_helper() { echo "dead"; }
+cycle_x() { cycle_y; }
+cycle_y() { cycle_x; }
+
+trap cleanup_simple EXIT INT TERM
+trap 'cleanup_compound_a "$1"; cleanup_compound_b' HUP
+trap -- cleanup_dashdash ERR
+trap - EXIT
+trap '' INT
+trap -p EXIT
+"#,
+    )
+    .unwrap();
+
+    fs::write(
+        root.join("justfile"),
+        r#"
+[private]
+default:
+    echo "first private recipe is bare just entrypoint"
+
+build:
+    ./scripts/run.sh
+
+[private, default]
+explicit_default:
+    echo "explicit [default]"
+
+[private]
+unused_private_helper:
+    echo "should stay dead"
+"#,
+    )
+    .unwrap();
+
+    let ignores = KagamiConfig::default().build_ignore_globset().unwrap();
+    let files = discover_files(root, &ignores, None).unwrap();
+    let graph = CodeGraph::build_for_graph(root, &files, true).unwrap();
+    let opts = DeadOptions {
+        scope: DeadScope::Prod,
+        langs: None,
+        allowlist: std::collections::HashSet::new(),
+        include_clusters: true,
+        path_filter: None,
+        min_confidence: Confidence::Heuristic,
+        kinds: DeadKinds::Callables,
+    };
+
+    let dead = analyze_dead(&graph, &opts);
+    let snap = CodeGraph::try_load_cached_snapshot(root, &files).expect("cached snapshot");
+    let dead_snap = kagami::graph::dead::analyze_dead_snapshot(&snap, &opts);
+
+    for report in [&dead, &dead_snap] {
+        let names: Vec<&str> = report.symbols.iter().map(|s| s.symbol.as_str()).collect();
+        for live in [
+            "cleanup_simple",
+            "cleanup_compound_a",
+            "cleanup_compound_b",
+            "cleanup_dashdash",
+            "default",
+            "explicit_default",
+        ] {
+            assert!(
+                !names.contains(&live),
+                "Expected {live} to be live; dead={:?}",
+                report.symbols
+            );
+        }
+        for expected_dead in ["dead_helper", "unused_private_helper", "cycle_x", "cycle_y"] {
+            assert!(
+                names.contains(&expected_dead),
+                "Expected {expected_dead} to be dead; dead={:?}",
+                report.symbols
+            );
+        }
+        // Verify unreferenced symbols sort strictly before unreachable_cluster symbols
+        let first_cluster = report
+            .symbols
+            .iter()
+            .position(|s| s.reason == "unreachable_cluster")
+            .expect("expected unreachable_cluster entries");
+        let last_unreferenced = report
+            .symbols
+            .iter()
+            .rposition(|s| s.reason == "unreferenced")
+            .expect("expected unreferenced entries");
+        assert!(
+            last_unreferenced < first_cluster,
+            "Expected all unreferenced entries before unreachable_cluster; got {:?}",
+            report.symbols
+        );
+    }
+}
+
+#[test]
+fn test_rust_attr_callbacks_mod_path_and_top_level_macros() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    fs::create_dir_all(root.join("crate-a/src")).unwrap();
+
+    fs::write(
+        root.join("crate-a/Cargo.toml"),
+        "[package]\nname = \"crate-a\"\nversion = \"0.1.0\"\n",
+    )
+    .unwrap();
+
+    fs::write(
+        root.join("crate-a/src/custom_framing.rs"),
+        r#"
+pub(crate) fn contains_envelope(s: &str) -> bool { !s.is_empty() }
+pub(crate) fn unused_framing_fn() {}
+"#,
+    )
+    .unwrap();
+
+    fs::write(
+        root.join("crate-a/src/telemetry.rs"),
+        r#"
+pub(crate) fn trace_process_id(id: &str) -> &str { id }
+pub(crate) fn dead_telemetry_fn() {}
+"#,
+    )
+    .unwrap();
+
+    fs::write(
+        root.join("crate-a/src/main.rs"),
+        r#"
+#[path = "custom_framing.rs"]
+mod framing;
+mod telemetry;
+
+pub(crate) use framing::contains_envelope as contains_source_envelope;
+
+fn parse_socket_path(s: &str) -> String { s.to_string() }
+fn configure_help() {}
+fn positive_budget_limit_schema() {}
+fn positive_count() {}
+fn nullable<T>() {}
+fn hook_scope_label(s: &str) -> &str { s }
+fn unused_attr_callback() {}
+
+struct Handler {
+    event: String,
+}
+impl Handler {
+    fn execution_mode(&self) -> &str { &self.event }
+}
+
+#[command(defer(configure_help))]
+struct CliArgs {
+    #[arg(long = "sock", value_parser = parse_socket_path)]
+    sock: String,
+    #[schemars(schema_with = "positive_budget_limit_schema")]
+    budget: f64,
+}
+
+struct UnusedCliArgs {
+    #[arg(value_parser = unused_attr_callback)]
+    x: String,
+}
+
+#[derive(Deserialize)]
+struct HistoryListWindows {
+    #[serde(default, deserialize_with = "positive_count")]
+    limit: Option<usize>,
+    #[schemars(default, schema_with = "nullable::<String>")]
+    name: Option<String>,
+}
+
+#[tracing::instrument(
+    level = "trace",
+    skip_all,
+    fields(
+        process.id = crate::telemetry::trace_process_id(id),
+        hook.scope = hook_scope_label(handler.execution_mode()),
+    )
+)]
+fn run_hook(id: &str, handler: &Handler) {
+    let _ = contains_source_envelope(id);
+}
+
+fn merge_otel_metadata() {}
+fn dead_macro_helper() {}
+
+struct HelperTargets;
+impl HelperTargets {
+    fn merge_layer(&self) {}
+}
+
+macro_rules! otel_merge_functions {
+    ($($field:ident),+ $(,)?) => {
+        pub(crate) fn merge_otel_requirements(targets: &HelperTargets) {
+            merge_otel_metadata();
+            targets.merge_layer();
+        }
+    };
+}
+
+otel_merge_functions!(a, b);
+
+macro_rules! unused_gen_macro {
+    () => {
+        fn never_called_generated() {
+            dead_macro_helper();
+        }
+    };
+}
+
+unused_gen_macro!();
+
+macro_rules! register_tools {
+    ($($req:ty),+ $(,)?) => {
+        pub(crate) fn history_notes_tools() {
+            tool_spec();
+        }
+    };
+}
+
+fn tool_spec() {}
+
+register_tools!(HistoryListWindows);
+
+fn main() {
+    let _args = CliArgs { sock: String::new(), budget: 1.0 };
+    let h = Handler { event: "ok".into() };
+    run_hook("1", &h);
+    let t = HelperTargets;
+    merge_otel_requirements(&t);
+    history_notes_tools();
+}
+"#,
+    )
+    .unwrap();
+
+    let dead = analyze_rust_dead(root);
+    let is_dead = |sym: &str| dead.symbols.iter().any(|s| s.symbol == sym);
+
+    for live_sym in [
+        "contains_envelope",
+        "trace_process_id",
+        "parse_socket_path",
+        "configure_help",
+        "positive_budget_limit_schema",
+        "positive_count",
+        "nullable",
+        "hook_scope_label",
+        "Handler::execution_mode",
+        "merge_otel_metadata",
+        "HelperTargets::merge_layer",
+        "tool_spec",
+    ] {
+        assert!(
+            !is_dead(live_sym),
+            "Expected {live_sym} to be live; dead={:?}",
+            dead.symbols
+        );
+    }
+
+    for dead_sym in [
+        "unused_framing_fn",
+        "dead_telemetry_fn",
+        "unused_attr_callback",
+        "dead_macro_helper",
+    ] {
+        assert!(
+            is_dead(dead_sym),
+            "Expected {dead_sym} to remain dead; dead={:?}",
+            dead.symbols
+        );
+    }
+}
+
+#[test]
+fn test_rust_cfg_test_propagation_type_lookup_and_attrs() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    fs::create_dir_all(root.join("src/a")).unwrap();
+    fs::create_dir_all(root.join("src/b")).unwrap();
+    fs::create_dir_all(root.join("src/sub")).unwrap();
+    fs::create_dir_all(root.join("src/test_support")).unwrap();
+    fs::create_dir_all(root.join("benches")).unwrap();
+
+    fs::write(
+        root.join("Cargo.toml"),
+        r#"
+[package]
+name = "cfg_prop_demo"
+version = "0.1.0"
+"#,
+    )
+    .unwrap();
+
+    fs::write(
+        root.join("src/test_support.rs"),
+        r#"
+mod nested_fixture;
+pub fn make_test_env() {
+    nested_fixture::seed();
+}
+"#,
+    )
+    .unwrap();
+
+    fs::write(
+        root.join("src/test_support/nested_fixture.rs"),
+        r#"
+pub fn seed() {}
+"#,
+    )
+    .unwrap();
+
+    fs::write(
+        root.join("src/inner_cfg_test.rs"),
+        r#"
+#![cfg(test)]
+pub fn inner_test_helper() {}
+"#,
+    )
+    .unwrap();
+
+    // Associated type `type Selection` in module a must not shadow `struct Selection` in module b.
+    fs::write(
+        root.join("src/a/mod.rs"),
+        r#"
+pub trait HasSelection {
+    type Selection;
+}
+pub struct Decoy;
+impl HasSelection for Decoy {
+    type Selection = u8;
+}
+pub struct Session;
+impl Session {
+    pub fn decoy_run(&self) {}
+}
+"#,
+    )
+    .unwrap();
+
+    fs::write(
+        root.join("src/b/mod.rs"),
+        r#"
+pub struct Selection;
+impl Selection {
+    pub fn apply(&self) {}
+    pub fn unused_sel(&self) {}
+}
+pub struct Session;
+impl Session {
+    pub fn real_run(&self) {}
+}
+"#,
+    )
+    .unwrap();
+
+    // Parent module with private `use ... as SessionAlias;` inherited by submodule via `use super::*;`.
+    fs::write(
+        root.join("src/sub/mod.rs"),
+        r#"
+use crate::b::Session as SessionAlias;
+pub mod child;
+pub fn run_parent() {
+    let s = SessionAlias;
+    child::drive(&s);
+}
+"#,
+    )
+    .unwrap();
+
+    fs::write(
+        root.join("src/sub/child.rs"),
+        r#"
+use super::*;
+pub fn drive(s: &SessionAlias) {
+    s.real_run();
+}
+"#,
+    )
+    .unwrap();
+
+    fs::write(
+        root.join("src/platform.rs"),
+        r#"
+pub struct Platform;
+impl Platform {
+    pub fn open() -> Self { Self }
+    pub fn service(&self) {}
+}
+"#,
+    )
+    .unwrap();
+
+    fs::write(
+        root.join("src/platform_fallback.rs"),
+        r#"
+pub struct Platform;
+impl Platform {
+    pub fn open() -> Self { Self }
+    pub fn service(&self) {}
+}
+"#,
+    )
+    .unwrap();
+
+    fs::write(
+        root.join("src/platform_win.rs"),
+        r#"
+pub struct Platform;
+impl Platform {
+    pub fn open() -> Self { Self }
+    pub fn service(&self) {}
+}
+"#,
+    )
+    .unwrap();
+
+    fs::write(
+        root.join("src/linux_warn.rs"),
+        r#"
+pub fn system_warning() {}
+"#,
+    )
+    .unwrap();
+
+    fs::write(
+        root.join("benches/perf.rs"),
+        r#"
+fn bench_helper() {}
+#[divan::bench]
+fn bench_entry() {
+    bench_helper();
+}
+"#,
+    )
+    .unwrap();
+
+    fs::write(
+        root.join("src/main.rs"),
+        r#"
+mod a;
+mod b;
+mod sub;
+mod linux_warn;
+#[cfg(test)]
+// Comment between #[cfg(test)] and mod item must not wipe pending_attrs!
+mod test_support;
+mod inner_cfg_test;
+
+#[cfg_attr(target_os = "macos", path = "platform_fallback.rs")]
+#[cfg_attr(target_os = "windows", path = "platform_win.rs")]
+mod platform;
+
+#[cfg(target_os = "linux")]
+pub use linux_warn::system_warning;
+#[cfg(not(target_os = "linux"))]
+pub fn system_warning() {}
+
+#[ctor::ctor]
+fn init_global() {
+    ctor_helper();
+}
+fn ctor_helper() {}
+
+fn use_selection(sel: &crate::b::Selection) {
+    sel.apply();
+}
+
+fn dead_prod_fn() {}
+
+fn main() {
+    use_selection(&b::Selection);
+    sub::run_parent();
+    let p = platform::Platform::open();
+    p.service();
+    system_warning();
+}
+"#,
+    )
+    .unwrap();
+
+    let dead_prod = analyze_rust_dead(root);
+    let is_dead_prod = |file_suffix: &str, sym: &str| {
+        dead_prod
+            .symbols
+            .iter()
+            .any(|s| s.file.ends_with(file_suffix) && s.symbol == sym)
+    };
+
+    for (file, sym) in [
+        ("src/test_support.rs", "make_test_env"),
+        ("src/test_support/nested_fixture.rs", "seed"),
+        ("src/inner_cfg_test.rs", "inner_test_helper"),
+        ("benches/perf.rs", "bench_entry"),
+        ("benches/perf.rs", "bench_helper"),
+        ("src/b/mod.rs", "Selection::apply"),
+        ("src/b/mod.rs", "Session::real_run"),
+        ("src/platform.rs", "Platform::open"),
+        ("src/platform.rs", "Platform::service"),
+        ("src/platform_fallback.rs", "Platform::open"),
+        ("src/platform_fallback.rs", "Platform::service"),
+        ("src/platform_win.rs", "Platform::open"),
+        ("src/platform_win.rs", "Platform::service"),
+        ("src/linux_warn.rs", "system_warning"),
+        ("src/main.rs", "system_warning"),
+        ("src/main.rs", "init_global"),
+        ("src/main.rs", "ctor_helper"),
+    ] {
+        assert!(
+            !is_dead_prod(file, sym),
+            "Expected {file}::{sym} to be live/excluded in prod; dead={:?}",
+            dead_prod.symbols
+        );
+    }
+
+    for (file, sym) in [
+        ("src/a/mod.rs", "Session::decoy_run"),
+        ("src/b/mod.rs", "Selection::unused_sel"),
+        ("src/main.rs", "dead_prod_fn"),
+    ] {
+        assert!(
+            is_dead_prod(file, sym),
+            "Expected {file}::{sym} to remain dead in prod; dead={:?}",
+            dead_prod.symbols
+        );
+    }
+}
+
+#[test]
+fn test_rust_tuples_generics_select_cfg_and_ext_traits() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    fs::create_dir_all(root.join("src")).unwrap();
+
+    fs::write(
+        root.join("Cargo.toml"),
+        r#"
+[package]
+name = "rust_batch3_demo"
+version = "0.1.0"
+"#,
+    )
+    .unwrap();
+
+    fs::write(
+        root.join("src/ext.rs"),
+        r#"
+pub trait ForeignConnExt {
+    fn write_query(&self);
+}
+impl ForeignConnExt for external_db::Conn {
+    fn write_query(&self) {
+        ext_impl_helper();
+    }
+}
+fn ext_impl_helper() {}
+
+pub trait AccessBase {
+    fn base_call(&self);
+}
+pub trait AccessExt: AccessBase {
+    fn get_env_var(&self);
+}
+impl<T: AccessBase + ?Sized> AccessExt for T {
+    fn get_env_var(&self) {
+        blanket_ext_helper();
+    }
+}
+fn blanket_ext_helper() {}
+"#,
+    )
+    .unwrap();
+
+    fs::write(
+        root.join("src/unix_obs.rs"),
+        r#"
+pub struct UnixObserver;
+impl UnixObserver {
+    pub fn observe(&self) {}
+}
+"#,
+    )
+    .unwrap();
+
+    fs::write(
+        root.join("src/win_obs.rs"),
+        r#"
+pub struct WinObserver;
+impl WinObserver {
+    pub fn observe(&self) {}
+}
+"#,
+    )
+    .unwrap();
+
+    fs::write(
+        root.join("src/main.rs"),
+        r#"
+mod ext;
+mod unix_obs;
+mod win_obs;
+
+use ext::{AccessBase, AccessExt, ForeignConnExt};
+use std::sync::Arc;
+
+#[cfg(unix)]
+use unix_obs as imp;
+#[cfg(windows)]
+use win_obs as imp;
+
+pub struct CustomError;
+impl CustomError {
+    pub fn sub_error_type(&self) {}
+}
+
+pub struct ViewSpec;
+impl ViewSpec {
+    pub fn label(&self) {}
+}
+
+const VIEWS: [ViewSpec; 1] = [ViewSpec];
+
+pub enum DisplayTab {
+    Analytics,
+}
+impl DisplayTab {
+    pub fn tab_title(&self) {}
+}
+
+pub struct HintItem;
+impl HintItem {
+    pub fn render_hint(&self) {}
+}
+
+pub struct FieldEntry;
+impl FieldEntry {
+    pub fn field_key(&self) {}
+}
+
+pub struct InputEntry;
+impl InputEntry {
+    pub fn input_text(&self) {}
+}
+
+pub struct NetPerms;
+impl NetPerms {
+    pub fn is_empty(&self) -> bool { false }
+}
+
+pub struct TypeMapItem;
+impl TypeMapItem {
+    pub fn from_typemap(&self) {}
+    pub fn from_init(&self) {}
+}
+
+pub struct Value;
+impl Value {
+    pub fn render_val(&self) {}
+}
+
+pub trait DiffConsumer {
+    fn consume_diff(&mut self);
+}
+#[derive(Default)]
+pub struct PatchConsumer;
+impl DiffConsumer for PatchConsumer {
+    fn consume_diff(&mut self) {
+        patch_consumer_helper();
+    }
+}
+fn patch_consumer_helper() {}
+
+pub struct Watcher {
+    #[cfg(unix)]
+    inner: unix_obs::UnixObserver,
+    #[cfg(windows)]
+    inner: win_obs::WinObserver,
+}
+impl Watcher {
+    fn poll(&self) {
+        self.inner.observe();
+    }
+}
+
+pub struct Client {
+    label: String,
+}
+impl Client {
+    fn fail_fast(&self) {}
+}
+
+pub struct SessionHolder {
+    cached: Option<Client>,
+}
+impl SessionHolder {
+    fn cached_client(&self) -> Option<Client> { None }
+    fn run_fail_fast(&self) {
+        let client = match self.cached_client() {
+            Some(c) => c,
+            None => return,
+        };
+        client.fail_fast();
+    }
+}
+
+pub struct SelectTarget;
+impl SelectTarget {
+    fn on_select(&self) {}
+    fn needs_refresh(&self) -> bool { true }
+}
+
+pub struct SelectWrapper {
+    inner: std::cell::RefCell<SelectTarget>,
+}
+
+mod inline_serde {
+    pub fn serialize() {}
+    pub fn deserialize() {}
+}
+
+#[derive(serde::Serialize)]
+pub struct TupleModel(#[serde(with = "inline_serde")] u64);
+
+fn make_tooltip_data() {}
+lazy_static::lazy_static! {
+    static ref ALL_TOOLTIPS: Vec<&'static str> = {
+        make_tooltip_data();
+        vec![]
+    };
+}
+
+fn fallible_op() -> Result<NetPerms, CustomError> {
+    Err(CustomError)
+}
+
+fn get_pair() -> Option<(u64, Arc<HintItem>)> {
+    None
+}
+
+fn get_entries() -> Vec<(FieldEntry, InputEntry)> {
+    Vec::new()
+}
+
+fn run_ext_conn(conn: &external_db::Conn, access: &dyn AccessBase) {
+    conn.write_query();
+    access.get_env_var();
+}
+
+fn use_typemap(ext: &external::Extensions) {
+    if let Some(item) = ext.get::<TypeMapItem>() {
+        item.from_typemap();
+    }
+    let init = ext.get_or_insert_with(TypeMapItem::default);
+    init.from_init();
+}
+
+fn unused_fn_marker() {}
+
+fn main() {
+    let _ = ALL_TOOLTIPS.len();
+    let _ = TupleModel(1);
+    VIEWS[0].label();
+    DisplayTab::Analytics.tab_title();
+    let v = Value;
+    v.render_val();
+
+    if let Err(err) = fallible_op() {
+        err.sub_error_type();
+    }
+    let _ = fallible_op().ok().filter(|p| !p.is_empty());
+
+    let pair = get_pair();
+    match (pair, Some(HintItem)) {
+        (Some((_, h1)), Some(h2)) => {
+            h1.render_hint();
+            h2.render_hint();
+        }
+        _ => {}
+    }
+    for (_i, (f, inp)) in get_entries().iter().enumerate() {
+        f.field_key();
+        inp.input_text();
+    }
+
+    let mut consumer: Option<(u64, Box<dyn DiffConsumer>)> =
+        Some((0, Box::<PatchConsumer>::default()));
+    if let Some((_, c)) = consumer.as_mut() {
+        c.consume_diff();
+    }
+
+    let w = Watcher { inner: unix_obs::UnixObserver };
+    w.poll();
+    let _ = imp::UnixObserver;
+
+    let sh = SessionHolder { cached: None };
+    sh.run_fail_fast();
+
+    let sel_wrap = SelectWrapper {
+        inner: std::cell::RefCell::new(SelectTarget),
+    };
+    let sel_target = SelectTarget;
+    tokio::select! {
+        _ = async {} => {
+            sel_target.on_select();
+        }
+    }
+    let _ = matches!(sel_wrap.inner.borrow().needs_refresh(), true);
+    let _ = (run_ext_conn, use_typemap);
+}
+"#,
+    )
+    .unwrap();
+
+    let dead = analyze_rust_dead(root);
+    let is_dead = |sym: &str| dead.symbols.iter().any(|s| s.symbol == sym);
+
+    for live_sym in [
+        "CustomError::sub_error_type",
+        "ViewSpec::label",
+        "DisplayTab::tab_title",
+        "HintItem::render_hint",
+        "FieldEntry::field_key",
+        "InputEntry::input_text",
+        "NetPerms::is_empty",
+        "TypeMapItem::from_typemap",
+        "TypeMapItem::from_init",
+        "Value::render_val",
+        "PatchConsumer::consume_diff",
+        "patch_consumer_helper",
+        "UnixObserver::observe",
+        "WinObserver::observe",
+        "Client::fail_fast",
+        "SelectTarget::on_select",
+        "SelectTarget::needs_refresh",
+        "serialize",
+        "deserialize",
+        "make_tooltip_data",
+        "ext_impl_helper",
+        "blanket_ext_helper",
+    ] {
+        assert!(
+            !is_dead(live_sym),
+            "Expected {live_sym} to be live; dead={:?}",
+            dead.symbols
+        );
+    }
+
+    assert!(
+        is_dead("unused_fn_marker"),
+        "Expected unused_fn_marker to remain dead; dead={:?}",
+        dead.symbols
+    );
+}
+
+#[test]
+fn test_ts_generators_tests_dir_and_qualifier_disambiguation() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    fs::create_dir_all(root.join("sdk/src")).unwrap();
+    fs::create_dir_all(root.join("sdk/tests")).unwrap();
+
+    fs::write(
+        root.join("sdk/src/thread.ts"),
+        r#"
+export class Thread {
+  run(): string {
+    return "ok";
+  }
+  unusedThreadMethod(): void {}
+}
+"#,
+    )
+    .unwrap();
+
+    fs::write(
+        root.join("sdk/src/exec.ts"),
+        r#"
+export class CodexExec {
+  run(): string {
+    return "exec";
+  }
+}
+"#,
+    )
+    .unwrap();
+
+    fs::write(
+        root.join("sdk/tests/proxy.ts"),
+        r#"
+export function* genStream() {
+  yield 1;
+}
+export function helperInTestsDir() {
+  return [...genStream()];
+}
+"#,
+    )
+    .unwrap();
+
+    fs::write(
+        root.join("sdk/tests/run.test.ts"),
+        r#"
+import { helperInTestsDir } from "./proxy";
+
+function testRun(thread: any) {
+  helperInTestsDir();
+  return thread.run();
+}
+testRun({});
+"#,
+    )
+    .unwrap();
+
+    let ignores = KagamiConfig::default().build_ignore_globset().unwrap();
+    let files = discover_files(root, &ignores, None).unwrap();
+    let graph = CodeGraph::build(root, &files, false).unwrap();
+
+    let dead_all = analyze_dead(
+        &graph,
+        &DeadOptions {
+            scope: DeadScope::All,
+            langs: None,
+            allowlist: std::collections::HashSet::new(),
+            include_clusters: true,
+            path_filter: None,
+            min_confidence: Confidence::Heuristic,
+            kinds: DeadKinds::Callables,
+        },
+    );
+    let is_dead_all = |sym: &str| dead_all.symbols.iter().any(|s| s.symbol == sym);
+
+    assert!(
+        !is_dead_all("genStream"),
+        "Expected generator function genStream to be live; dead={:?}",
+        dead_all.symbols
+    );
+    assert!(
+        !is_dead_all("Thread.run"),
+        "Expected Thread.run to be resolved via qualifier disambiguation; dead={:?}",
+        dead_all.symbols
+    );
+    assert!(
+        is_dead_all("CodexExec.run"),
+        "Expected CodexExec.run to remain dead when only thread.run() is called; dead={:?}",
+        dead_all.symbols
+    );
+    assert!(
+        is_dead_all("Thread.unusedThreadMethod"),
+        "Expected Thread.unusedThreadMethod to remain dead; dead={:?}",
+        dead_all.symbols
+    );
+
+    let dead_prod = analyze_dead(
+        &graph,
+        &DeadOptions {
+            scope: DeadScope::Prod,
+            langs: None,
+            allowlist: std::collections::HashSet::new(),
+            include_clusters: true,
+            path_filter: None,
+            min_confidence: Confidence::Heuristic,
+            kinds: DeadKinds::Callables,
+        },
+    );
+    assert!(
+        !dead_prod
+            .symbols
+            .iter()
+            .any(|s| s.file.contains("/tests/")),
+        "Expected files under /tests/ to be excluded from --scope prod; dead={:?}",
+        dead_prod.symbols
+    );
+}
+
+

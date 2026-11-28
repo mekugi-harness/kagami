@@ -6,7 +6,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::UNIX_EPOCH;
 
-pub const PARSER_VERSION: u32 = 13;
+pub const PARSER_VERSION: u32 = 14;
 
 const CACHE_MAGIC: &[u8; 8] = b"KAGAMI01";
 const MANIFEST_MAGIC: &[u8; 8] = b"KAGAMIM1";
