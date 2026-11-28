@@ -775,6 +775,7 @@ fn emit_scoped_call_ref(
     let Some(&last) = parts.last() else {
         return;
     };
+    let has_crate_root = parts.len() >= 3 && parts[0] == "crate";
     let prefix_parts: Vec<&str> = parts[..parts.len() - 1]
         .iter()
         .copied()
@@ -784,6 +785,8 @@ fn emit_scoped_call_ref(
         None
     } else if prefix_parts.last() == Some(&"Self") {
         impl_type.map(|t| t.to_string())
+    } else if has_crate_root {
+        Some(format!("crate::{}", prefix_parts.join("::")))
     } else {
         Some(prefix_parts.join("::"))
     };

@@ -267,7 +267,7 @@ impl CodeGraph {
     ) -> Self {
         let prof = std::env::var_os("KAGAMI_PROFILE").is_some();
         let t0 = std::time::Instant::now();
-        crate::graph::rust_index::propagate_rust_cfg_test_modules(&mut extracts);
+        crate::graph::rust_index::propagate_rust_cfg_test_modules(&mut extracts, &crate_roots);
         let total_syms: usize = extracts.iter().map(|e| e.symbols.len()).sum();
         let mut symbols: HashMap<String, Symbol> = HashMap::with_capacity(total_syms);
         let mut known_files: HashSet<&str> = HashSet::with_capacity(extracts.len());

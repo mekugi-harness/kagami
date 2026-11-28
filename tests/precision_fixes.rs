@@ -5022,6 +5022,7 @@ fn test_ts_generators_tests_dir_and_qualifier_disambiguation() {
     fs::create_dir_all(root.join("sdk/tests")).unwrap();
     fs::create_dir_all(root.join("src/routes/tests")).unwrap();
     fs::create_dir_all(root.join("src/lib")).unwrap();
+    fs::create_dir_all(root.join("tests/routes")).unwrap();
 
     fs::write(
         root.join("sdk/src/thread.ts"),
@@ -5074,6 +5075,25 @@ export function fetchResults() {
   thread.start();
   return [...prodGenLive()];
 }
+"#,
+    )
+    .unwrap();
+
+    fs::write(
+        root.join("src/lib/route_builder.ts"),
+        r#"
+export function buildRoute() {
+  return "/tests";
+}
+"#,
+    )
+    .unwrap();
+
+    fs::write(
+        root.join("tests/routes/setup.ts"),
+        r#"
+import { buildRoute } from "../../src/lib/route_builder";
+buildRoute();
 "#,
     )
     .unwrap();
@@ -5250,6 +5270,11 @@ testRun({});
         "Expected uncalled prodGenDead to be dead in --scope prod; dead={:?}",
         dead_prod.symbols
     );
+    assert!(
+        dead_prod.symbols.iter().any(|s| s.symbol == "buildRoute"),
+        "Expected tests/routes/setup.ts to stay classified as test so buildRoute is dead in --scope prod; dead={:?}",
+        dead_prod.symbols
+    );
 }
 
 #[test]
@@ -5258,6 +5283,9 @@ fn test_rust_pr20_review_regressions() {
     let root = dir.path();
     fs::create_dir_all(root.join("src/outer/inner")).unwrap();
     fs::create_dir_all(root.join("src/bin/tools")).unwrap();
+    fs::create_dir_all(root.join("src/bin/subbin/tools")).unwrap();
+    fs::create_dir_all(root.join("src/helpers")).unwrap();
+    fs::create_dir_all(root.join("src/feature/helpers")).unwrap();
     fs::create_dir_all(root.join("app")).unwrap();
 
     fs::write(
@@ -5298,6 +5326,9 @@ pub fn bin_fixture_helper() {}
     fs::write(
         root.join("app/entry.rs"),
         r#"
+#[cfg(test)]
+mod fixtures;
+
 pub struct CustomClient;
 impl CustomClient {
     pub fn go(&self) {}
@@ -5311,6 +5342,89 @@ mod api {
 fn main() {
     let c = crate::api::make();
     c.go();
+}
+"#,
+    )
+    .unwrap();
+    fs::write(
+        root.join("app/fixtures.rs"),
+        r#"
+pub fn custom_bin_fixture() {}
+"#,
+    )
+    .unwrap();
+
+    // Binary child module src/bin/subbin/main.rs -> tools.rs -> tools/fixtures.rs
+    fs::write(
+        root.join("src/bin/subbin/main.rs"),
+        r#"
+mod tools;
+fn main() {}
+"#,
+    )
+    .unwrap();
+    fs::write(
+        root.join("src/bin/subbin/tools.rs"),
+        r#"
+#[cfg(test)]
+mod fixtures;
+"#,
+    )
+    .unwrap();
+    fs::write(
+        root.join("src/bin/subbin/tools/fixtures.rs"),
+        r#"
+pub fn subbin_tool_fixture() {}
+"#,
+    )
+    .unwrap();
+
+    // Disjoint same-named fixtures: src/helpers/fixtures.rs (test-only from main.rs)
+    // vs src/feature/helpers/fixtures.rs (prod from feature.rs)
+    fs::write(
+        root.join("src/helpers/fixtures.rs"),
+        r#"
+pub fn root_test_fixture() {}
+"#,
+    )
+    .unwrap();
+    fs::write(
+        root.join("src/feature.rs"),
+        r#"
+pub mod helpers {
+    pub mod fixtures;
+}
+"#,
+    )
+    .unwrap();
+    fs::write(
+        root.join("src/feature/helpers/fixtures.rs"),
+        r#"
+pub fn feature_prod_fixture() {}
+"#,
+    )
+    .unwrap();
+
+    // Cross-file crate::api::nested::make() must resolve to src/api.rs, not worker.rs's inline api::nested
+    fs::write(
+        root.join("src/api.rs"),
+        r#"
+pub mod nested {
+    pub fn make() {}
+}
+"#,
+    )
+    .unwrap();
+    fs::write(
+        root.join("src/worker.rs"),
+        r#"
+mod api {
+    pub mod nested {
+        pub fn make() {}
+    }
+}
+pub fn run_worker() {
+    crate::api::nested::make();
 }
 "#,
     )
@@ -5412,6 +5526,14 @@ mod outer;
 mod windows;
 mod raw_err;
 mod pub_err;
+mod feature;
+mod api;
+mod worker;
+
+mod helpers {
+    #[cfg(test)]
+    mod fixtures;
+}
 
 #[cfg_attr(target_os = "linux", path = "plat_unix.rs")]
 #[cfg_attr(target_os = "windows", path = "plat_win.rs")]
@@ -5466,6 +5588,8 @@ fn main() {
     update_criterion();
     imp::run();
     ext_parent::inner::run_check();
+    worker::run_worker();
+    feature::helpers::fixtures::feature_prod_fixture();
     let p = plat::Plat::open();
     p.go();
     let text = String::from(" hi ");
@@ -5499,6 +5623,31 @@ fn main() {
     assert!(
         !is_dead("app/entry.rs", "CustomClient::go"),
         "Expected crate::api::make().go() in custom [[bin]] app/entry.rs to keep CustomClient::go live; dead={:?}",
+        dead_prod.symbols
+    );
+    assert!(
+        !is_dead("app/fixtures.rs", "custom_bin_fixture"),
+        "Expected custom [[bin]] top-level #[cfg(test)] mod fixtures to exclude app/fixtures.rs from prod; dead={:?}",
+        dead_prod.symbols
+    );
+    assert!(
+        !is_dead("src/bin/subbin/tools/fixtures.rs", "subbin_tool_fixture"),
+        "Expected binary child module src/bin/subbin/tools.rs #[cfg(test)] fixture to be excluded from prod; dead={:?}",
+        dead_prod.symbols
+    );
+    assert!(
+        !is_dead("src/helpers/fixtures.rs", "root_test_fixture"),
+        "Expected src/helpers/fixtures.rs to remain test-only and not be adopted by src/feature.rs; dead={:?}",
+        dead_prod.symbols
+    );
+    assert!(
+        !is_dead("src/api.rs", "make"),
+        "Expected crate::api::nested::make() from worker.rs to resolve to src/api.rs; dead={:?}",
+        dead_prod.symbols
+    );
+    assert!(
+        is_dead("src/worker.rs", "make"),
+        "Expected shadowing inline worker::api::nested::make to remain dead; dead={:?}",
         dead_prod.symbols
     );
     assert!(

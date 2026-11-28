@@ -574,11 +574,20 @@ pub(crate) fn extract_with_context(
             || rel_path.ends_with("+server.js")
             || rel_path.ends_with("+page.server.js")
             || rel_path.ends_with("+layout.server.js"));
-    let in_routes_dir = rel_path.contains("/routes/") || rel_path.starts_with("routes/");
     let is_test_file = rel_path.contains(".test.")
         || rel_path.contains(".spec.")
         || rel_path.contains("/__tests__/")
-        || (!in_routes_dir && (rel_path.starts_with("tests/") || rel_path.contains("/tests/")));
+        || {
+            let mut in_routes = false;
+            rel_path.split('/').any(|seg| {
+                if seg == "routes" {
+                    in_routes = true;
+                    false
+                } else {
+                    seg == "tests" && !in_routes
+                }
+            })
+        };
 
     let mut imports = Vec::new();
     let mut symbols = Vec::new();

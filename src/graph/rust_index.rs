@@ -37,6 +37,8 @@ pub struct CargoCrateInfo {
     pub src_dir: String,
     /// Normalized library entry file path relative to repo root (e.g. "codex-rs/app-server-daemon/src/lib.rs").
     pub lib_file: String,
+    /// Explicit Cargo target root files declared in Cargo.toml ([lib], [[bin]], [[example]], [[test]], [[bench]]).
+    pub target_roots: Vec<String>,
 }
 
 /// Discover Rust crate names from Cargo.toml files ([lib].name and [package].name)
@@ -131,6 +133,27 @@ pub fn discover_cargo_crates(
                     } else {
                         format!("{}/{}", dir, clean_lib_path)
                     };
+                    let mut target_roots = Vec::new();
+                    if val.get("lib").and_then(|t| t.get("path")).is_some() {
+                        push_unique(&mut target_roots, lib_file.clone());
+                    }
+                    for section in ["bin", "example", "test", "bench"] {
+                        if let Some(items) = val.get(section).and_then(|v| v.as_array()) {
+                            for item in items {
+                                if let Some(p) = item.get("path").and_then(|v| v.as_str()) {
+                                    let clean = p.trim_start_matches("./").trim_matches('/');
+                                    if !clean.is_empty() {
+                                        let full = if dir.is_empty() {
+                                            clean.to_string()
+                                        } else {
+                                            format!("{}/{}", dir, clean)
+                                        };
+                                        push_unique(&mut target_roots, full);
+                                    }
+                                }
+                            }
+                        }
+                    }
                     let lib_dir = clean_lib_path
                         .rsplit_once('/')
                         .map(|(d, _)| d.trim_matches('/'))
@@ -144,6 +167,7 @@ pub fn discover_cargo_crates(
                     let info = CargoCrateInfo {
                         src_dir: src_root,
                         lib_file,
+                        target_roots,
                     };
                     if let Some(ln) = lib_name {
                         crate_roots.insert(ln.replace('-', "_"), info.clone());
@@ -168,14 +192,32 @@ pub fn discover_cargo_crates(
     crate_roots
 }
 
-/// Computes candidate base directories for an external mod declaration inside file
-/// within inline module scope mod_scope.
-fn rust_mod_base_dirs(file: &str, mod_scope: &str, has_explicit_path: bool) -> Vec<String> {
+/// Returns true when file is a Cargo target root (lib.rs, main.rs, mod.rs,
+/// direct child of src/bin/, tests/, examples/, benches/, or an explicit Cargo.toml target path).
+fn is_rust_crate_root_file(file: &str, target_roots: &FxHashSet<String>) -> bool {
     let file_dir = file.rsplit_once('/').map(|(d, _)| d).unwrap_or("");
     let file_name = file.rsplit('/').next().unwrap_or(file);
-    let is_dir_mod = matches!(file_name, "lib.rs" | "mod.rs" | "main.rs")
-        || file.contains("/bin/")
-        || file.starts_with("bin/");
+    matches!(file_name, "lib.rs" | "mod.rs" | "main.rs")
+        || target_roots.contains(file)
+        || file_dir == "src/bin"
+        || file_dir.ends_with("/src/bin")
+        || matches!(file_dir, "tests" | "examples" | "benches")
+        || file_dir.ends_with("/tests")
+        || file_dir.ends_with("/examples")
+        || file_dir.ends_with("/benches")
+}
+
+/// Computes candidate base directories for an external mod declaration inside file
+/// within inline module scope mod_scope.
+fn rust_mod_base_dirs(
+    file: &str,
+    mod_scope: &str,
+    has_explicit_path: bool,
+    target_roots: &FxHashSet<String>,
+) -> Vec<String> {
+    let file_dir = file.rsplit_once('/').map(|(d, _)| d).unwrap_or("");
+    let file_name = file.rsplit('/').next().unwrap_or(file);
+    let is_dir_mod = is_rust_crate_root_file(file, target_roots);
     let mod_root_dir = if is_dir_mod {
         file_dir.to_string()
     } else {
@@ -197,19 +239,7 @@ fn rust_mod_base_dirs(file: &str, mod_scope: &str, has_explicit_path: bool) -> V
         }
     };
     if !has_explicit_path {
-        let mut dirs = vec![scoped_dir];
-        // Fallback for custom Cargo [[bin]] targets not named main.rs and not under bin/
-        // (e.g. app/entry.rs with `mod tools { mod fixtures; }` -> app/tools/fixtures.rs).
-        if !mod_scope.is_empty() && !is_dir_mod {
-            let scope_rel = mod_scope.replace("::", "/");
-            let file_scoped = if file_dir.is_empty() {
-                scope_rel
-            } else {
-                format!("{}/{}", file_dir, scope_rel)
-            };
-            push_unique(&mut dirs, file_scoped);
-        }
-        return dirs;
+        return vec![scoped_dir];
     }
     let mut dirs = vec![scoped_dir];
     push_unique(&mut dirs, mod_root_dir);
@@ -230,7 +260,14 @@ fn rust_mod_base_dirs(file: &str, mod_scope: &str, has_explicit_path: bool) -> V
 /// (both `mod foo;` and `#[path = "..."] mod foo;`). Any Rust module file that has incoming `mod`
 /// declarations and is not reachable from any non-test crate/file root via non-test `mod` edges
 /// is marked test-only.
-pub fn propagate_rust_cfg_test_modules(extracts: &mut [FileExtract]) {
+pub fn propagate_rust_cfg_test_modules(
+    extracts: &mut [FileExtract],
+    crate_roots: &HashMap<String, CargoCrateInfo>,
+) {
+    let target_roots: FxHashSet<String> = crate_roots
+        .values()
+        .flat_map(|info| info.target_roots.iter().cloned())
+        .collect();
     let known_rust_files: FxHashSet<String> = extracts
         .iter()
         .filter(|e| e.lang == Language::Rust)
@@ -249,7 +286,8 @@ pub fn propagate_rust_cfg_test_modules(extracts: &mut [FileExtract]) {
         }
         for mp in &ext.rust_mod_paths {
             let mut targets: Vec<String> = Vec::new();
-            let base_dirs = rust_mod_base_dirs(&ext.file, &mp.mod_scope, mp.path.is_some());
+            let base_dirs =
+                rust_mod_base_dirs(&ext.file, &mp.mod_scope, mp.path.is_some(), &target_roots);
             if let Some(ref raw_path) = mp.path {
                 for bd in base_dirs {
                     let cand = normalize_rel_path_join(&bd, raw_path);
@@ -371,6 +409,7 @@ pub struct RustTypeIndex<'a> {
     pub trait_methods: HashMap<String, HashSet<String>>,
     traits_by_method_name: FxHashMap<&'a str, Vec<String>>,
     cfg_sibling_groups: HashMap<String, Vec<String>>,
+    target_roots: FxHashSet<String>,
 }
 
 impl<'a> RustTypeIndex<'a> {
@@ -395,6 +434,10 @@ impl<'a> RustTypeIndex<'a> {
                 .or_default()
                 .push(ident.clone());
         }
+        let target_roots: FxHashSet<String> = crate_roots
+            .values()
+            .flat_map(|info| info.target_roots.iter().cloned())
+            .collect();
         let mut file_to_crate_root: HashMap<&'a str, String> = HashMap::new();
         for &file in &known_files {
             let mut best: Option<&str> = None;
@@ -622,7 +665,7 @@ impl<'a> RustTypeIndex<'a> {
                     let Some(ref raw_path) = mp.path else {
                         continue;
                     };
-                    for bd in rust_mod_base_dirs(&ext.file, &mp.mod_scope, true) {
+                    for bd in rust_mod_base_dirs(&ext.file, &mp.mod_scope, true, &target_roots) {
                         let cand = normalize_rel_path_join(&bd, raw_path);
                         if known_files.contains(cand.as_str()) {
                             mod_path_names.insert(mp.mod_name.as_str());
@@ -702,6 +745,7 @@ impl<'a> RustTypeIndex<'a> {
             trait_methods,
             traits_by_method_name,
             cfg_sibling_groups: HashMap::new(),
+            target_roots,
         };
 
         // Resolve Deref targets in the impl Deref block's own module scope.
@@ -1790,6 +1834,7 @@ impl<'a> RustTypeIndex<'a> {
         // Custom binary crate roots (e.g. app/entry.rs) may reference their own inline modules
         // via `crate::api::make`; fall back to base_file's inline scope when no file matched.
         if out.len() == before
+            && is_rust_crate_root_file(base_file, &self.target_roots)
             && let Some(crate_inline) = mod_path.strip_prefix("crate::")
             && !crate_inline.is_empty()
             && self
