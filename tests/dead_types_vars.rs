@@ -692,3 +692,176 @@ func main() {}
     assert!(all.contains(&"deadVar".to_string()));
     assert!(all.contains(&"deadFunc".to_string()));
 }
+
+#[test]
+fn test_go_array_type_length_refs() {
+    let dir = TempDir::new().unwrap();
+    let root = dir.path();
+
+    fs::create_dir_all(root.join("pkg")).unwrap();
+    fs::write(
+        root.join("go.mod"),
+        "module example.com/arrdemo\n\ngo 1.22\n",
+    )
+    .unwrap();
+
+    fs::write(
+        root.join("pkg/sizes.go"),
+        r#"package pkg
+
+const CrossPkgN = 3
+const UnusedCrossPkgN = 9
+"#,
+    )
+    .unwrap();
+
+    fs::write(
+        root.join("main.go"),
+        r#"package main
+
+import "example.com/arrdemo/pkg"
+
+const SigParamN = 3
+const SigRetN = 4
+const BodyVarN = 5
+const SliceElemN = 6
+const ExprN = 2
+const StructFieldN = 7
+const LenTarget = "abcd"
+const TestOnlyN = 8
+const UnusedLocalN = 9
+
+type Holder struct {
+	buf [StructFieldN]byte
+}
+
+func sigRetOnly() (out [SigRetN]string) {
+	return out
+}
+
+func consumeRows(
+	p *[SigParamN]int,
+	rows [][SliceElemN]string,
+	cross *[pkg.CrossPkgN]int,
+	expr *[ExprN + 1]int,
+	sized *[len(LenTarget)]byte,
+) int {
+	var parts [BodyVarN]string
+	_, _, _, _ = p, cross, expr, sized
+	return len(rows) + len(parts)
+}
+
+func main() {
+	var h Holder
+	_ = h
+	_ = sigRetOnly()
+	_ = consumeRows(nil, nil, nil, nil, nil)
+}
+"#,
+    )
+    .unwrap();
+
+    fs::write(
+        root.join("main_test.go"),
+        r#"package main
+
+import "testing"
+
+func TestArrayLengthConst(t *testing.T) {
+	var onlyInTest [TestOnlyN]string
+	_ = onlyInTest
+}
+"#,
+    )
+    .unwrap();
+
+    let dead = run_dead(root, DeadKinds::Types, DeadScope::Prod);
+    let has = |name: &str| dead.iter().any(|(_, s, _)| s == name);
+
+    for live in [
+        "SigParamN",
+        "SigRetN",
+        "BodyVarN",
+        "SliceElemN",
+        "CrossPkgN",
+        "ExprN",
+        "StructFieldN",
+        "LenTarget",
+    ] {
+        assert!(
+            !has(live),
+            "Go constant {} used in array_type length must stay live: {:?}",
+            live,
+            dead
+        );
+    }
+
+    assert!(
+        has("UnusedLocalN"),
+        "unused local Go const must be dead: {:?}",
+        dead
+    );
+    assert!(
+        has("UnusedCrossPkgN"),
+        "unused cross-package Go const must be dead: {:?}",
+        dead
+    );
+    assert!(
+        has("TestOnlyN"),
+        "test-only Go const used in [TestOnlyN]T in *_test.go must stay dead: {:?}",
+        dead
+    );
+}
+
+#[test]
+fn test_rust_array_type_length_refs() {
+    let dir = TempDir::new().unwrap();
+    let root = dir.path();
+
+    fs::create_dir_all(root.join("src")).unwrap();
+    fs::write(
+        root.join("Cargo.toml"),
+        "[package]\nname = \"arrdemo\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+    )
+    .unwrap();
+    fs::write(
+        root.join("src/main.rs"),
+        r#"const LIVE_LEN: usize = 4;
+const EXPR_LEN: usize = 2;
+const UNUSED_LEN: usize = 9;
+const TEST_ONLY_LEN: usize = 3;
+
+fn accept(a: [u8; LIVE_LEN], b: [u8; EXPR_LEN + 1]) -> usize {
+    a.len() + b.len()
+}
+
+fn main() {
+    let a: [u8; LIVE_LEN] = [0; LIVE_LEN];
+    let b: [u8; EXPR_LEN + 1] = [0; EXPR_LEN + 1];
+    let _ = accept(a, b);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn uses_test_only() {
+        let _arr: [u8; TEST_ONLY_LEN] = [0; TEST_ONLY_LEN];
+    }
+}
+"#,
+    )
+    .unwrap();
+
+    let dead = run_dead(root, DeadKinds::Types, DeadScope::Prod);
+    let has = |name: &str| dead.iter().any(|(_, s, _)| s == name);
+
+    assert!(!has("LIVE_LEN"), "LIVE_LEN must stay live: {:?}", dead);
+    assert!(!has("EXPR_LEN"), "EXPR_LEN must stay live: {:?}", dead);
+    assert!(has("UNUSED_LEN"), "UNUSED_LEN must be dead: {:?}", dead);
+    assert!(
+        has("TEST_ONLY_LEN"),
+        "TEST_ONLY_LEN used only in #[cfg(test)] must be dead: {:?}",
+        dead
+    );
+}

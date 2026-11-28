@@ -107,13 +107,13 @@ pub fn extract(rel_path: &str, src: &str, blake3_hex: String) -> Result<FileExtr
                     if ret_types.iter().any(|t| !t.is_empty()) {
                         func_return_types.insert(id.clone(), ret_types);
                     }
-                    collect_signature_type_refs(child, src, &id, &mut refs);
+                    let mut env = GoLocalEnv::new(&pkg_aliases, &pkg_var_types);
+                    collect_signature_type_refs(child, src, &id, &env, &mut refs, &mut bridges);
                     if let Some(body) = child.child_by_field_name("body") {
                         let params = extract_go_params(child, src);
                         let mut seed_locals = params.clone();
                         seed_locals.extend(extract_go_named_results(child, src));
                         let locals = collect_go_locals(body, src, &seed_locals);
-                        let mut env = GoLocalEnv::new(&pkg_aliases, &pkg_var_types);
                         env.seed_typed_params(child, src, body.end_byte());
                         env.seed_typed_named_results(child, src, body.end_byte());
                         env.collect_body(body, src, body.end_byte());
@@ -169,12 +169,12 @@ pub fn extract(rel_path: &str, src: &str, blake3_hex: String) -> Result<FileExtr
                     if ret_types.iter().any(|t| !t.is_empty()) {
                         func_return_types.insert(id.clone(), ret_types);
                     }
-                    collect_signature_type_refs(child, src, &id, &mut refs);
+                    let mut env = GoLocalEnv::new(&pkg_aliases, &pkg_var_types);
+                    collect_signature_type_refs(child, src, &id, &env, &mut refs, &mut bridges);
                     if let Some(body) = child.child_by_field_name("body") {
                         let params = extract_go_params(child, src);
                         let mut seed_locals = params.clone();
                         seed_locals.extend(extract_go_named_results(child, src));
-                        let mut env = GoLocalEnv::new(&pkg_aliases, &pkg_var_types);
                         if let Some(recv_name) = extract_receiver_var_name(child, src) {
                             if !recv.is_empty() {
                                 env.bind(
@@ -798,35 +798,18 @@ fn extract_go_return_types(node: Node<'_>, src: &str) -> Vec<String> {
     out
 }
 
-fn collect_signature_type_refs(node: Node<'_>, src: &str, from_id: &str, refs: &mut Vec<RawRef>) {
-    let mut stack = Vec::new();
-    if let Some(r) = node.child_by_field_name("receiver") {
-        stack.push(r);
-    }
-    if let Some(tp) = node.child_by_field_name("type_parameters") {
-        stack.push(tp);
-    }
-    if let Some(p) = node.child_by_field_name("parameters") {
-        stack.push(p);
-    }
-    if let Some(r) = node.child_by_field_name("result") {
-        stack.push(r);
-    }
-    while let Some(n) = stack.pop() {
-        match n.kind() {
-            "qualified_type" => {
-                emit_qualified_type_ref(n, src, from_id, refs);
-                continue;
-            }
-            "type_identifier" => {
-                emit_type_identifier_ref(n, src, from_id, refs);
-                continue;
-            }
-            _ => {}
-        }
-        let mut c = n.walk();
-        for ch in n.children(&mut c) {
-            stack.push(ch);
+fn collect_signature_type_refs(
+    node: Node<'_>,
+    src: &str,
+    from_id: &str,
+    env: &GoLocalEnv<'_>,
+    refs: &mut Vec<RawRef>,
+    bridges: &mut Vec<BridgeHint>,
+) {
+    let empty_locals = HashMap::new();
+    for field in ["receiver", "type_parameters", "parameters", "result"] {
+        if let Some(ch) = node.child_by_field_name(field) {
+            collect_refs_and_bridges(ch, src, from_id, &empty_locals, env, refs, bridges);
         }
     }
 }
@@ -1743,6 +1726,11 @@ fn collect_refs_and_bridges(
                     if ch.is_named() {
                         emit_value_ref(ch, src, from_id, locals, env, refs);
                     }
+                }
+            }
+            "array_type" => {
+                if let Some(len) = n.child_by_field_name("length") {
+                    emit_value_ref(len, src, from_id, locals, env, refs);
                 }
             }
             "qualified_type" => {
