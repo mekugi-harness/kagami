@@ -7,6 +7,28 @@ use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::path::Path;
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RustSymFilter {
+    TypesOnly,
+    ValuesOnly,
+    TypesAndValues,
+}
+
+impl RustSymFilter {
+    fn matches(self, kind: SymbolKind) -> bool {
+        let is_type = matches!(
+            kind,
+            SymbolKind::Struct | SymbolKind::Enum | SymbolKind::Type | SymbolKind::Trait
+        );
+        let is_val = matches!(kind, SymbolKind::Function | SymbolKind::Const | SymbolKind::Var);
+        match self {
+            RustSymFilter::TypesOnly => is_type,
+            RustSymFilter::ValuesOnly => is_val,
+            RustSymFilter::TypesAndValues => is_type || is_val,
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct CargoCrateInfo {
     /// Directory containing the crate's root module (e.g. "codex-rs/app-server-daemon/src").
@@ -503,7 +525,7 @@ impl<'a> RustTypeIndex<'a> {
                     let hits = self.resolve_symbol_in_module(
                         &mf,
                         short_name,
-                        true,
+                        RustSymFilter::TypesOnly,
                         symbols,
                         0,
                         &mut visited,
@@ -637,7 +659,7 @@ impl<'a> RustTypeIndex<'a> {
                     owner_file,
                     mod_path,
                     target_sym,
-                    true,
+                    RustSymFilter::TypesOnly,
                     symbols,
                     0,
                     &mut visited,
@@ -957,7 +979,7 @@ impl<'a> RustTypeIndex<'a> {
         base_file: &str,
         mod_path: &str,
         sym_name: &str,
-        only_types: bool,
+        filter: RustSymFilter,
         symbols: &HashMap<String, Symbol>,
         depth: usize,
         visited: &mut HashSet<(String, String)>,
@@ -966,7 +988,7 @@ impl<'a> RustTypeIndex<'a> {
         let mod_segs: Vec<&str> = mod_path.split("::").filter(|s| !s.is_empty()).collect();
         for mf in self.resolve_module_files(base_file, &mod_segs) {
             for hit in
-                self.resolve_symbol_in_module(&mf, sym_name, only_types, symbols, depth, visited)
+                self.resolve_symbol_in_module(&mf, sym_name, filter, symbols, depth, visited)
             {
                 push_unique(out, hit);
             }
@@ -977,7 +999,7 @@ impl<'a> RustTypeIndex<'a> {
         &self,
         mod_file: &str,
         sym_name: &str,
-        only_types: bool,
+        filter: RustSymFilter,
         symbols: &HashMap<String, Symbol>,
         depth: usize,
         visited: &mut HashSet<(String, String)>,
@@ -985,16 +1007,7 @@ impl<'a> RustTypeIndex<'a> {
         if depth > 4 || !visited.insert((mod_file.to_string(), sym_name.to_string())) {
             return Vec::new();
         }
-        let kind_matches = |s: &Symbol| -> bool {
-            if only_types {
-                matches!(
-                    s.kind,
-                    SymbolKind::Struct | SymbolKind::Enum | SymbolKind::Type | SymbolKind::Trait
-                )
-            } else {
-                matches!(s.kind, SymbolKind::Function | SymbolKind::Const)
-            }
-        };
+        let kind_matches = |s: &Symbol| -> bool { filter.matches(s.kind) };
         if let Some(ids) = self.file_non_method_syms.get(&(mod_file, sym_name)) {
             let hits: Vec<String> = ids
                 .iter()
@@ -1027,7 +1040,7 @@ impl<'a> RustTypeIndex<'a> {
                     mod_file,
                     mod_path,
                     target_sym,
-                    only_types,
+                    filter,
                     symbols,
                     depth + 1,
                     visited,
@@ -1037,7 +1050,7 @@ impl<'a> RustTypeIndex<'a> {
                 for hit in self.resolve_symbol_in_module(
                     mod_file,
                     &u.target_path,
-                    only_types,
+                    filter,
                     symbols,
                     depth + 1,
                     visited,
@@ -1057,7 +1070,7 @@ impl<'a> RustTypeIndex<'a> {
                 mod_file,
                 &u.target_path,
                 sym_name,
-                only_types,
+                filter,
                 symbols,
                 depth + 1,
                 visited,
@@ -1076,8 +1089,14 @@ impl<'a> RustTypeIndex<'a> {
         caller_id: &str,
         target_name: &str,
         caller_is_test: bool,
+        include_types: bool,
         symbols: &HashMap<String, Symbol>,
     ) -> Vec<(String, Confidence)> {
+        let filter = if include_types {
+            RustSymFilter::TypesAndValues
+        } else {
+            RustSymFilter::ValuesOnly
+        };
         let mut out: Vec<String> = Vec::new();
         let caller_scope = self
             .symbol_mod_scopes
@@ -1097,8 +1116,7 @@ impl<'a> RustTypeIndex<'a> {
             for id in ids {
                 if sym_in_scope(id)
                     && symbols.get(id).is_some_and(|s| {
-                        matches!(s.kind, SymbolKind::Function | SymbolKind::Const)
-                            && (!s.is_test || caller_is_test)
+                        filter.matches(s.kind) && (!s.is_test || caller_is_test)
                     })
                 {
                     push_unique(&mut out, id.clone());
@@ -1133,8 +1151,7 @@ impl<'a> RustTypeIndex<'a> {
                             for id in ids {
                                 if sym_in_scope(id)
                                     && symbols.get(id).is_some_and(|s| {
-                                        matches!(s.kind, SymbolKind::Function | SymbolKind::Const)
-                                            && (!s.is_test || caller_is_test)
+                                        filter.matches(s.kind) && (!s.is_test || caller_is_test)
                                     })
                                 {
                                     push_unique(&mut out, id.clone());
@@ -1172,11 +1189,8 @@ impl<'a> RustTypeIndex<'a> {
                                                     .unwrap_or("");
                                                 if sc == parent_scope
                                                     && symbols.get(id).is_some_and(|s| {
-                                                        matches!(
-                                                            s.kind,
-                                                            SymbolKind::Function
-                                                                | SymbolKind::Const
-                                                        ) && (!s.is_test || caller_is_test)
+                                                        filter.matches(s.kind)
+                                                            && (!s.is_test || caller_is_test)
                                                     })
                                                 {
                                                     push_unique(&mut out, id.clone());
@@ -1194,7 +1208,7 @@ impl<'a> RustTypeIndex<'a> {
                                             caller_file,
                                             mp2,
                                             &ts2_full,
-                                            false,
+                                            filter,
                                             symbols,
                                             0,
                                             &mut visited,
@@ -1211,7 +1225,7 @@ impl<'a> RustTypeIndex<'a> {
                         caller_file,
                         mod_path,
                         &target_sym_full,
-                        false,
+                        filter,
                         symbols,
                         0,
                         &mut visited,
@@ -1230,8 +1244,7 @@ impl<'a> RustTypeIndex<'a> {
                         for id in ids {
                             if sym_in_scope(id)
                                 && symbols.get(id).is_some_and(|s| {
-                                    matches!(s.kind, SymbolKind::Function | SymbolKind::Const)
-                                        && (!s.is_test || caller_is_test)
+                                    filter.matches(s.kind) && (!s.is_test || caller_is_test)
                                 })
                             {
                                 push_unique(&mut out, id.clone());
@@ -1253,7 +1266,7 @@ impl<'a> RustTypeIndex<'a> {
                         caller_file,
                         &u.target_path,
                         target_name,
-                        false,
+                        filter,
                         symbols,
                         0,
                         &mut visited,
@@ -1271,6 +1284,7 @@ impl<'a> RustTypeIndex<'a> {
     /// Resolve a module- or crate-qualified Rust call (e.g. `codex_app_server_daemon::run`,
     /// `codex_app_server_daemon::start_with_features`, `auth::connect`) using Cargo.toml
     /// crate roots, local `use` module aliases, and `pub use` re-exports.
+    #[allow(clippy::too_many_arguments)]
     pub fn resolve_qualified_path(
         &self,
         caller_file: &str,
@@ -1278,8 +1292,14 @@ impl<'a> RustTypeIndex<'a> {
         qual: &str,
         target_name: &str,
         caller_is_test: bool,
+        include_types: bool,
         symbols: &HashMap<String, Symbol>,
     ) -> Vec<(String, Confidence)> {
+        let filter = if include_types {
+            RustSymFilter::TypesAndValues
+        } else {
+            RustSymFilter::ValuesOnly
+        };
         let raw_segs: Vec<&str> = qual.split("::").filter(|s| !s.is_empty()).collect();
         if raw_segs.is_empty() {
             return Vec::new();
@@ -1317,7 +1337,7 @@ impl<'a> RustTypeIndex<'a> {
             let mut visited = HashSet::new();
             for mf in self.resolve_module_files(caller_file, &segs) {
                 for hit in
-                    self.resolve_symbol_in_module(&mf, target_name, false, symbols, 0, &mut visited)
+                    self.resolve_symbol_in_module(&mf, target_name, filter, symbols, 0, &mut visited)
                 {
                     push_unique(&mut out, hit);
                 }
@@ -1328,7 +1348,7 @@ impl<'a> RustTypeIndex<'a> {
             let mut visited = HashSet::new();
             for mf in self.resolve_module_files(caller_file, &raw_segs) {
                 for hit in
-                    self.resolve_symbol_in_module(&mf, target_name, false, symbols, 0, &mut visited)
+                    self.resolve_symbol_in_module(&mf, target_name, filter, symbols, 0, &mut visited)
                 {
                     push_unique(&mut out, hit);
                 }
@@ -1600,7 +1620,7 @@ impl<'a> RustTypeIndex<'a> {
             }
             if q.chars().next().is_some_and(|c| c.is_ascii_lowercase()) {
                 let hits =
-                    self.resolve_qualified_path(&ext.file, caller_id, q, name, false, symbols);
+                    self.resolve_qualified_path(&ext.file, caller_id, q, name, false, false, symbols);
                 if let Some((fn_id, _)) = hits.first() {
                     return Some(fn_id.clone());
                 }
@@ -1635,7 +1655,7 @@ impl<'a> RustTypeIndex<'a> {
             return None;
         }
 
-        self.resolve_bare_call(&ext.file, caller_id, name, false, symbols)
+        self.resolve_bare_call(&ext.file, caller_id, name, false, false, symbols)
             .into_iter()
             .map(|(id, _)| id)
             .find(|id| {
@@ -2046,8 +2066,14 @@ pub fn resolve_rust_module_qualified(
     target_name: &str,
     by_pkg_name: &HashMap<(Language, &str, &str), Vec<String>>,
     by_lang_name: &HashMap<(Language, &str), Vec<String>>,
+    include_types: bool,
     symbols: &HashMap<String, Symbol>,
 ) -> Vec<(String, Confidence)> {
+    let filter = if include_types {
+        RustSymFilter::TypesAndValues
+    } else {
+        RustSymFilter::ValuesOnly
+    };
     if !ext.package_or_module.is_empty()
         && let Some(ids) =
             by_pkg_name.get(&(Language::Rust, ext.package_or_module.as_str(), target_name))
@@ -2058,8 +2084,7 @@ pub fn resolve_rust_module_qualified(
                 symbols
                     .get(*id)
                     .map(|s| {
-                        matches!(s.kind, SymbolKind::Function | SymbolKind::Const)
-                            && symbol_matches_rust_mod_qual(s, qual)
+                        filter.matches(s.kind) && symbol_matches_rust_mod_qual(s, qual)
                     })
                     .unwrap_or(false)
             })
@@ -2080,8 +2105,7 @@ pub fn resolve_rust_module_qualified(
                 symbols
                     .get(*id)
                     .map(|s| {
-                        matches!(s.kind, SymbolKind::Function | SymbolKind::Const)
-                            && symbol_matches_rust_mod_qual(s, qual)
+                        filter.matches(s.kind) && symbol_matches_rust_mod_qual(s, qual)
                     })
                     .unwrap_or(false)
             })
@@ -2103,7 +2127,7 @@ pub fn resolve_rust_module_qualified(
             .iter()
             .filter(|s| {
                 s.name == target_name
-                    && matches!(s.kind, SymbolKind::Function | SymbolKind::Const)
+                    && filter.matches(s.kind)
                     && ext
                         .cfg_gated_symbols
                         .get(&s.id)
@@ -2181,6 +2205,18 @@ pub fn materialize_rust_trait_and_macro_edges(
 
             match (type_id, local_trait_id) {
                 (Some(tid), Some(tr_id)) => {
+                    // Calling an explicit trait-impl method directly on a concrete receiver
+                    // (e.g. `h.run()`) uses both the trait and the receiver type.
+                    for mid in &imp.method_ids {
+                        if symbols
+                            .get(mid)
+                            .is_some_and(|s| s.kind == SymbolKind::Method)
+                        {
+                            let line = symbols.get(mid).map(|s| s.span.start_line).unwrap_or(1);
+                            push_edge(mid, &tr_id, EdgeKind::TypeRef, Confidence::Resolved, &ext.file, line);
+                            push_edge(mid, &tid, EdgeKind::TypeRef, Confidence::Resolved, &ext.file, line);
+                        }
+                    }
                     interface_impls.push(InterfaceImpl {
                         receiver_type_id: tid,
                         interface_id: tr_id,

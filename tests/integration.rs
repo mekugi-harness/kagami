@@ -1,6 +1,6 @@
 use kagami::config::{build_path_filter, load_allowlist, KagamiConfig};
 use kagami::graph::blast::{analyze_blast_radius, BlastOptions, Direction};
-use kagami::graph::dead::{analyze_dead, DeadOptions, DeadScope};
+use kagami::graph::dead::{analyze_dead, DeadKinds, DeadOptions, DeadScope};
 use kagami::graph::CodeGraph;
 use kagami::ir::similar::{find_similar, pair_similarity, SimilarOptions};
 use kagami::lang;
@@ -261,6 +261,7 @@ echo ok
             include_clusters: true,
             path_filter: build_path_filter(&[]).unwrap(),
             min_confidence: Confidence::Heuristic,
+            kinds: DeadKinds::Callables,
         },
     );
 

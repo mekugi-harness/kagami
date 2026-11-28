@@ -11,6 +11,41 @@ pub enum DeadScope {
     All,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum DeadKinds {
+    #[default]
+    Callables,
+    Types,
+    All,
+}
+
+impl DeadKinds {
+    pub fn matches(self, kind: SymbolKind) -> bool {
+        let is_callable = matches!(
+            kind,
+            SymbolKind::Function
+                | SymbolKind::Method
+                | SymbolKind::Recipe
+                | SymbolKind::Component
+        );
+        let is_type_or_val = matches!(
+            kind,
+            SymbolKind::Type
+                | SymbolKind::Interface
+                | SymbolKind::Struct
+                | SymbolKind::Enum
+                | SymbolKind::Trait
+                | SymbolKind::Const
+                | SymbolKind::Var
+        );
+        match self {
+            DeadKinds::Callables => is_callable,
+            DeadKinds::Types => is_type_or_val,
+            DeadKinds::All => is_callable || is_type_or_val,
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct DeadOptions {
     pub scope: DeadScope,
@@ -19,6 +54,7 @@ pub struct DeadOptions {
     pub include_clusters: bool,
     pub path_filter: Option<GlobSet>,
     pub min_confidence: Confidence,
+    pub kinds: DeadKinds,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -98,20 +134,20 @@ pub fn analyze_dead(graph: &CodeGraph, opts: &DeadOptions) -> DeadReport {
         }
     }
 
-    // 3. Collect dead callable symbols
+    // 3. Collect dead symbols matching the requested kind filter
     let mut dead_list = Vec::new();
     let mut unreferenced = 0usize;
     let mut unreachable_clusters = 0usize;
 
     for sym in graph.symbols.values() {
-        if is_virtual_kind(sym.kind) || sym.is_entrypoint {
+        if is_virtual_kind(sym.kind) || sym.is_entrypoint || sym.name == "_" {
             continue;
         }
-        // Only report callable/actionable symbols (functions, methods, recipes, components)
-        if !matches!(
-            sym.kind,
-            SymbolKind::Function | SymbolKind::Method | SymbolKind::Recipe | SymbolKind::Component
-        ) {
+        // Skip internal Rust macro_rules! symbols (stored as Const with trailing '!')
+        if sym.lang == Language::Rust && sym.name.ends_with('!') {
+            continue;
+        }
+        if !opts.kinds.matches(sym.kind) {
             continue;
         }
         if opts.scope == DeadScope::Prod && sym.is_test {
@@ -131,7 +167,7 @@ pub fn analyze_dead(graph: &CodeGraph, opts: &DeadOptions) -> DeadReport {
             continue;
         }
 
-        // Count active incoming call sites
+        // Count active incoming references (excluding self-edges, EnvRef, and Implements)
         let caller_count = graph
             .incoming
             .get(&sym.id)
@@ -140,7 +176,10 @@ pub fn analyze_dead(graph: &CodeGraph, opts: &DeadOptions) -> DeadReport {
                     .iter()
                     .filter(|&&eidx| {
                         let e = &graph.edges[eidx];
-                        if e.kind == EdgeKind::EnvRef || e.kind == EdgeKind::Implements {
+                        if e.from == sym.id
+                            || e.kind == EdgeKind::EnvRef
+                            || e.kind == EdgeKind::Implements
+                        {
                             return false;
                         }
                         if opts.scope == DeadScope::Prod {

@@ -1,6 +1,6 @@
 use kagami::config::KagamiConfig;
 use kagami::graph::CodeGraph;
-use kagami::graph::dead::{DeadOptions, DeadScope, analyze_dead};
+use kagami::graph::dead::{DeadKinds, DeadOptions, DeadScope, analyze_dead};
 use kagami::ir::IrNode;
 use kagami::ir::similar::pair_similarity;
 use kagami::lang;
@@ -72,6 +72,7 @@ fn test_vite_spa_main_ts_links_svelte_app() {
             include_clusters: true,
             path_filter: None,
             min_confidence: Confidence::Heuristic,
+            kinds: DeadKinds::Callables,
         },
     );
     let has = |sym: &str| dead.symbols.iter().any(|s| s.symbol == sym);
@@ -147,6 +148,7 @@ fn test_go_cross_pkg_receiver_var_method_and_testsupport() {
             include_clusters: true,
             path_filter: None,
             min_confidence: Confidence::Heuristic,
+            kinds: DeadKinds::Callables,
         },
     );
     let has = |sym: &str| dead.symbols.iter().any(|s| s.symbol == sym);
@@ -190,6 +192,7 @@ fn test_dead_min_confidence_filters_heuristic() {
             include_clusters: true,
             path_filter: None,
             min_confidence: Confidence::Heuristic,
+            kinds: DeadKinds::Callables,
         },
     );
     assert_eq!(
@@ -218,6 +221,7 @@ fn test_dead_min_confidence_filters_heuristic() {
             include_clusters: true,
             path_filter: None,
             min_confidence: Confidence::Resolved,
+            kinds: DeadKinds::Callables,
         },
     );
     assert_eq!(
@@ -246,6 +250,7 @@ fn test_dead_min_confidence_filters_heuristic() {
             include_clusters: true,
             path_filter: None,
             min_confidence: Confidence::Exact,
+            kinds: DeadKinds::Callables,
         },
     );
     assert_eq!(exact_only.total_dead, 0);
@@ -348,6 +353,7 @@ fn test_review_fixes_default_export_shadowing_typeof_and_computed_key() {
             include_clusters: true,
             path_filter: None,
             min_confidence: Confidence::Heuristic,
+            kinds: DeadKinds::Callables,
         },
     );
     let has = |file: &str, sym: &str| {
@@ -421,6 +427,7 @@ fn test_review_fixes_js_specifier_default_list_and_external_default() {
             include_clusters: true,
             path_filter: None,
             min_confidence: Confidence::Heuristic,
+            kinds: DeadKinds::Callables,
         },
     );
     let has = |file: &str, sym: &str| {
@@ -521,6 +528,7 @@ func main() {
             include_clusters: true,
             path_filter: None,
             min_confidence: Confidence::Heuristic,
+            kinds: DeadKinds::Callables,
         },
     );
     let is_dead = |sym: &str| dead.symbols.iter().any(|s| s.symbol == sym);
@@ -663,6 +671,7 @@ func main() {
             include_clusters: true,
             path_filter: None,
             min_confidence: Confidence::Heuristic,
+            kinds: DeadKinds::Callables,
         },
     );
     let is_dead = |sym: &str| dead.symbols.iter().any(|s| s.symbol == sym);
@@ -817,6 +826,7 @@ func main() {
             include_clusters: true,
             path_filter: None,
             min_confidence: Confidence::Heuristic,
+            kinds: DeadKinds::Callables,
         },
     );
     let is_dead = |sym: &str| dead.symbols.iter().any(|s| s.symbol == sym);
@@ -1015,6 +1025,7 @@ func main() {
             include_clusters: true,
             path_filter: None,
             min_confidence: Confidence::Heuristic,
+            kinds: DeadKinds::Callables,
         },
     );
     let is_dead = |sym: &str| dead.symbols.iter().any(|s| s.symbol == sym);
@@ -1259,6 +1270,7 @@ func main() {
             include_clusters: true,
             path_filter: None,
             min_confidence: Confidence::Heuristic,
+            kinds: DeadKinds::Callables,
         },
     );
     let is_dead = |sym: &str| dead.symbols.iter().any(|s| s.symbol == sym);
@@ -1310,6 +1322,7 @@ fn analyze_rust_dead(root: &std::path::Path) -> kagami::graph::dead::DeadReport 
             include_clusters: true,
             path_filter: None,
             min_confidence: Confidence::Heuristic,
+            kinds: DeadKinds::Callables,
         },
     )
 }
@@ -3131,6 +3144,7 @@ testOnlyProdFn();
             include_clusters: true,
             path_filter: None,
             min_confidence: Confidence::Heuristic,
+            kinds: DeadKinds::Callables,
         },
     );
 
@@ -3320,6 +3334,7 @@ testOnlyHelper();
             include_clusters: true,
             path_filter: None,
             min_confidence: Confidence::Heuristic,
+            kinds: DeadKinds::Callables,
         },
     );
 
@@ -3596,6 +3611,7 @@ boot({ sameFileFormat: "x" }, [], []);
             include_clusters: true,
             path_filter: None,
             min_confidence: Confidence::Heuristic,
+            kinds: DeadKinds::Callables,
         },
     );
 
@@ -3876,6 +3892,7 @@ testOnlyHelper();
             include_clusters: true,
             path_filter: None,
             min_confidence: Confidence::Heuristic,
+            kinds: DeadKinds::Callables,
         },
     );
 
@@ -4090,6 +4107,7 @@ new Consumer().run();
             include_clusters: true,
             path_filter: None,
             min_confidence: Confidence::Heuristic,
+            kinds: DeadKinds::Callables,
         },
     );
 

@@ -152,6 +152,11 @@ impl CodeGraph {
         let go_index = GoTypeIndex::build(&extracts, &symbols, &by_pkg_name);
         let rust_index = RustTypeIndex::build(&extracts, &symbols, crate_roots);
         let ts_index = TsClassIndex::build(&extracts, &known_files, &symbols);
+        let ts_star_reexports: HashMap<&str, &[String]> = extracts
+            .iter()
+            .filter(|e| !e.ts_star_reexports.is_empty())
+            .map(|e| (e.file.as_str(), e.ts_star_reexports.as_slice()))
+            .collect();
 
         for ext in &extracts {
             let alias_map = build_import_alias_map(&ext.imports);
@@ -187,6 +192,7 @@ impl CodeGraph {
                     &go_index,
                     &rust_index,
                     &ts_index,
+                    &ts_star_reexports,
                 );
                 let resolved = if ext.lang == Language::Rust && r.kind == EdgeKind::Calls {
                     rust_index.expand_cfg_siblings(resolved)
@@ -1076,7 +1082,7 @@ fn push_const_qualifier_refs(
     if let Some(id) = by_file_name.get(&(ext.file.as_str(), qual)) {
         if symbols
             .get(id)
-            .map(|s| s.kind == SymbolKind::Const)
+            .map(|s| matches!(s.kind, SymbolKind::Const | SymbolKind::Var))
             .unwrap_or(false)
         {
             results.push((id.clone(), Confidence::Resolved));
@@ -1087,13 +1093,49 @@ fn push_const_qualifier_refs(
         for id in ids {
             if symbols
                 .get(id)
-                .map(|s| s.kind == SymbolKind::Const)
+                .map(|s| matches!(s.kind, SymbolKind::Const | SymbolKind::Var))
                 .unwrap_or(false)
             {
                 results.push((id.clone(), Confidence::Resolved));
             }
         }
     }
+}
+
+fn resolve_ts_exported_symbol(
+    start_file: &str,
+    target_name: &str,
+    known_files: &HashSet<&str>,
+    by_file_name: &HashMap<(&str, &str), String>,
+    ts_star_reexports: &HashMap<&str, &[String]>,
+) -> Option<String> {
+    if let Some(id) = by_file_name.get(&(start_file, target_name)) {
+        return Some(id.clone());
+    }
+    let mut visited: HashSet<String> = HashSet::new();
+    visited.insert(start_file.to_string());
+    let mut queue: std::collections::VecDeque<(String, usize)> = std::collections::VecDeque::new();
+    queue.push_back((start_file.to_string(), 0));
+    while let Some((curr, depth)) = queue.pop_front() {
+        if depth >= 4 {
+            continue;
+        }
+        if let Some(targets) = ts_star_reexports.get(curr.as_str()) {
+            for raw_target in *targets {
+                let Some(tf) = resolve_ts_module_file(raw_target, known_files) else {
+                    continue;
+                };
+                if !visited.insert(tf.clone()) {
+                    continue;
+                }
+                if let Some(id) = by_file_name.get(&(tf.as_str(), target_name)) {
+                    return Some(id.clone());
+                }
+                queue.push_back((tf, depth + 1));
+            }
+        }
+    }
+    None
 }
 
 fn resolve_ts_module_file(qual: &str, known_files: &HashSet<&str>) -> Option<String> {
@@ -1283,6 +1325,7 @@ fn resolve_ref(
     go_index: &GoTypeIndex<'_>,
     rust_index: &RustTypeIndex<'_>,
     ts_index: &TsClassIndex,
+    ts_star_reexports: &HashMap<&str, &[String]>,
 ) -> Vec<(String, Confidence)> {
     // 0. Direct symbol ID match (e.g. Svelte component -> <module> script block)
     if r.qualifier.is_none() && symbols.contains_key(&r.target_name) {
@@ -1390,7 +1433,7 @@ fn resolve_ref(
 
     // 1. O(1) same-file match
     if r.qualifier.is_none() {
-        if ext.lang == Language::Rust && r.kind == EdgeKind::Calls {
+        if ext.lang == Language::Rust && matches!(r.kind, EdgeKind::Calls | EdgeKind::TypeRef) {
             let caller_is_test = symbols
                 .get(&r.from_symbol_id)
                 .map(|s| s.is_test)
@@ -1400,6 +1443,7 @@ fn resolve_ref(
                 &r.from_symbol_id,
                 &r.target_name,
                 caller_is_test,
+                r.kind == EdgeKind::TypeRef,
                 symbols,
             );
             if !bare.is_empty() {
@@ -1440,8 +1484,14 @@ fn resolve_ref(
             // so we never fall through to a lower-priority file (e.g. worker/index.ts when worker.ts exists).
             let target_file = resolve_ts_module_file(qual, known_files);
             if let Some(tf) = target_file {
-                if let Some(id) = by_file_name.get(&(tf.as_str(), r.target_name.as_str())) {
-                    return vec![(id.clone(), Confidence::Resolved)];
+                if let Some(id) = resolve_ts_exported_symbol(
+                    &tf,
+                    &r.target_name,
+                    known_files,
+                    by_file_name,
+                    ts_star_reexports,
+                ) {
+                    return vec![(id, Confidence::Resolved)];
                 }
                 if matches!(
                     ext.lang,
@@ -1494,19 +1544,21 @@ fn resolve_ref(
                 .collect();
         }
 
-        // Rust module-qualified function/const calls (e.g. auth::connect, reducer::helper)
+        // Rust module-qualified function/const/type refs (e.g. auth::connect, types::Config)
         if ext.lang == Language::Rust && qual.chars().next().is_some_and(|c| c.is_ascii_lowercase())
         {
             let caller_is_test = symbols
                 .get(&r.from_symbol_id)
                 .map(|s| s.is_test)
                 .unwrap_or(false);
+            let include_types = r.kind == EdgeKind::TypeRef;
             let path_matches = rust_index.resolve_qualified_path(
                 &ext.file,
                 &r.from_symbol_id,
                 qual,
                 &r.target_name,
                 caller_is_test,
+                include_types,
                 symbols,
             );
             if !path_matches.is_empty() {
@@ -1518,6 +1570,7 @@ fn resolve_ref(
                 &r.target_name,
                 by_pkg_name,
                 by_lang_name,
+                include_types,
                 symbols,
             );
             if !mod_matches.is_empty() {

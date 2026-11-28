@@ -55,6 +55,7 @@ pub enum SymbolKind {
     Enum,
     Trait,
     Const,
+    Var,
     Recipe,
     Component,
     Script,
@@ -254,6 +255,9 @@ pub struct FileExtract {
     /// Symbol ID -> inline module path where the symbol was defined (non-empty only inside inline `mod`).
     #[serde(default)]
     pub symbol_mod_scopes: HashMap<String, String>,
+    /// Resolved relative file paths re-exported via TS/JS `export * from '...'` barrels.
+    #[serde(default)]
+    pub ts_star_reexports: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

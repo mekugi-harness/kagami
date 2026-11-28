@@ -107,6 +107,7 @@ pub fn extract(rel_path: &str, src: &str, blake3_hex: String) -> Result<FileExtr
                     if ret_types.iter().any(|t| !t.is_empty()) {
                         func_return_types.insert(id.clone(), ret_types);
                     }
+                    collect_signature_type_refs(child, src, &id, &mut refs);
                     if let Some(body) = child.child_by_field_name("body") {
                         let params = extract_go_params(child, src);
                         let mut seed_locals = params.clone();
@@ -116,7 +117,6 @@ pub fn extract(rel_path: &str, src: &str, blake3_hex: String) -> Result<FileExtr
                         env.seed_typed_params(child, src, body.end_byte());
                         env.seed_typed_named_results(child, src, body.end_byte());
                         env.collect_body(body, src, body.end_byte());
-                        collect_signature_type_refs(child, src, &id, &mut refs);
                         collect_refs_and_bridges(
                             body,
                             src,
@@ -169,6 +169,7 @@ pub fn extract(rel_path: &str, src: &str, blake3_hex: String) -> Result<FileExtr
                     if ret_types.iter().any(|t| !t.is_empty()) {
                         func_return_types.insert(id.clone(), ret_types);
                     }
+                    collect_signature_type_refs(child, src, &id, &mut refs);
                     if let Some(body) = child.child_by_field_name("body") {
                         let params = extract_go_params(child, src);
                         let mut seed_locals = params.clone();
@@ -189,7 +190,6 @@ pub fn extract(rel_path: &str, src: &str, blake3_hex: String) -> Result<FileExtr
                         env.seed_typed_params(child, src, body.end_byte());
                         env.seed_typed_named_results(child, src, body.end_byte());
                         env.collect_body(body, src, body.end_byte());
-                        collect_signature_type_refs(child, src, &id, &mut refs);
                         collect_refs_and_bridges(
                             body,
                             src,
@@ -215,7 +215,7 @@ pub fn extract(rel_path: &str, src: &str, blake3_hex: String) -> Result<FileExtr
             "type_declaration" => {
                 let mut tc = child.walk();
                 for spec in child.children(&mut tc) {
-                    if spec.kind() == "type_spec" {
+                    if matches!(spec.kind(), "type_spec" | "type_alias") {
                         if let Some(name_node) = spec.child_by_field_name("name") {
                             let name = node_text(name_node, src).to_string();
                             let span = node_span(spec, 0);
@@ -280,36 +280,62 @@ pub fn extract(rel_path: &str, src: &str, blake3_hex: String) -> Result<FileExtr
                             }
                             let empty_locals = HashMap::new();
                             let empty_env = GoLocalEnv::new(&pkg_aliases, &pkg_var_types);
-                            collect_refs_and_bridges(
-                                spec,
-                                src,
-                                &id,
-                                &empty_locals,
-                                &empty_env,
-                                &mut refs,
-                                &mut bridges,
-                            );
+                            if let Some(tp) = spec.child_by_field_name("type_parameters") {
+                                collect_refs_and_bridges(
+                                    tp,
+                                    src,
+                                    &id,
+                                    &empty_locals,
+                                    &empty_env,
+                                    &mut refs,
+                                    &mut bridges,
+                                );
+                            }
+                            if let Some(type_node) = spec.child_by_field_name("type") {
+                                collect_refs_and_bridges(
+                                    type_node,
+                                    src,
+                                    &id,
+                                    &empty_locals,
+                                    &empty_env,
+                                    &mut refs,
+                                    &mut bridges,
+                                );
+                            }
                         }
                     }
                 }
             }
             "const_declaration" | "var_declaration" => {
                 let specs = collect_var_const_specs(child);
+                let mut inherited_const_type: Option<Node<'_>> = None;
                 for spec in specs {
-                    if let Some(name_node) = spec.child_by_field_name("name") {
-                        let name = node_text(name_node, src).to_string();
+                    let is_var = spec.kind() == "var_spec";
+                    if !is_var {
+                        if let Some(t) = spec.child_by_field_name("type") {
+                            inherited_const_type = Some(t);
+                        } else if spec.child_by_field_name("value").is_some() {
+                            inherited_const_type = None;
+                        }
+                    }
+                    let names = collect_spec_names(spec, src);
+                    let is_pkg_init_var = is_var
+                        && spec
+                            .child_by_field_name("value")
+                            .map(contains_call_outside_func_literal)
+                            .unwrap_or(false);
+                    for name in names {
                         let span = node_span(spec, 0);
                         let id = make_symbol_id(rel_path, &name, span.start_line);
-                        let is_pkg_init_var = spec.kind() == "var_spec"
-                            && spec
-                                .child_by_field_name("value")
-                                .map(contains_call_outside_func_literal)
-                                .unwrap_or(false);
                         symbols.push(Symbol {
                             id: id.clone(),
                             name: name.clone(),
                             qualified_name: name.clone(),
-                            kind: SymbolKind::Const,
+                            kind: if is_var {
+                                SymbolKind::Var
+                            } else {
+                                SymbolKind::Const
+                            },
                             lang: Language::Go,
                             file: rel_path.to_string(),
                             span,
@@ -321,6 +347,20 @@ pub fn extract(rel_path: &str, src: &str, blake3_hex: String) -> Result<FileExtr
                         });
                         let empty_locals = HashMap::new();
                         let empty_env = GoLocalEnv::new(&pkg_aliases, &pkg_var_types);
+                        if let Some(ty) = spec
+                            .child_by_field_name("type")
+                            .or(if !is_var { inherited_const_type } else { None })
+                        {
+                            collect_refs_and_bridges(
+                                ty,
+                                src,
+                                &id,
+                                &empty_locals,
+                                &empty_env,
+                                &mut refs,
+                                &mut bridges,
+                            );
+                        }
                         collect_refs_and_bridges(
                             spec,
                             src,
@@ -358,6 +398,7 @@ pub fn extract(rel_path: &str, src: &str, blake3_hex: String) -> Result<FileExtr
         rust_uses: Vec::new(),
         symbol_mod_scopes: HashMap::new(),
         func_callback_params: HashMap::new(),
+        ts_star_reexports: Vec::new(),
     })
 }
 
@@ -403,7 +444,20 @@ fn contains_call_outside_func_literal(node: Node<'_>) -> bool {
     let mut stack = vec![node];
     while let Some(n) = stack.pop() {
         match n.kind() {
-            "call_expression" => return true,
+            "call_expression" => {
+                // Ignore compile-time pointer type conversions like `(*MyStruct)(nil)`
+                // used in `var _ MyInterface = (*MyStruct)(nil)`.
+                let is_ptr_conversion = n
+                    .child_by_field_name("function")
+                    .filter(|f| f.kind() == "parenthesized_expression")
+                    .and_then(|p| p.named_child(0))
+                    .is_some_and(|inner| {
+                        matches!(inner.kind(), "pointer_type" | "unary_expression")
+                    });
+                if !is_ptr_conversion {
+                    return true;
+                }
+            }
             "func_literal" => continue,
             _ => {
                 let mut c = n.walk();
@@ -714,6 +768,12 @@ fn extract_go_return_types(node: Node<'_>, src: &str) -> Vec<String> {
 
 fn collect_signature_type_refs(node: Node<'_>, src: &str, from_id: &str, refs: &mut Vec<RawRef>) {
     let mut stack = Vec::new();
+    if let Some(r) = node.child_by_field_name("receiver") {
+        stack.push(r);
+    }
+    if let Some(tp) = node.child_by_field_name("type_parameters") {
+        stack.push(tp);
+    }
     if let Some(p) = node.child_by_field_name("parameters") {
         stack.push(p);
     }
@@ -1446,6 +1506,13 @@ fn collect_refs_and_bridges(
             "call_expression" => {
                 if let Some(func) = n.child_by_field_name("function") {
                     let line = n.start_position().row + 1;
+                    let func = if func.kind() == "type_instantiation_expression" {
+                        func.child_by_field_name("function")
+                            .or_else(|| func.named_child(0))
+                            .unwrap_or(func)
+                    } else {
+                        func
+                    };
                     match func.kind() {
                         "identifier" => {
                             let target = node_text(func, src).to_string();
@@ -1517,13 +1584,76 @@ fn collect_refs_and_bridges(
                 }
             }
             "assignment_statement" | "short_var_declaration" => {
+                if n.kind() == "assignment_statement"
+                    && let Some(lhs) = n.child_by_field_name("left")
+                {
+                    emit_expr_list_refs(lhs, src, from_id, locals, env, refs);
+                }
                 if let Some(rhs) = n.child_by_field_name("right") {
                     emit_expr_list_refs(rhs, src, from_id, locals, env, refs);
                 }
             }
-            "var_spec" => {
+            "var_spec" | "const_spec" => {
                 if let Some(val) = n.child_by_field_name("value") {
                     emit_expr_list_refs(val, src, from_id, locals, env, refs);
+                }
+            }
+            "binary_expression" => {
+                if let Some(left) = n.child_by_field_name("left") {
+                    emit_value_ref(left, src, from_id, locals, env, refs);
+                }
+                if let Some(right) = n.child_by_field_name("right") {
+                    emit_value_ref(right, src, from_id, locals, env, refs);
+                }
+            }
+            "unary_expression" => {
+                if let Some(op) = n.child_by_field_name("operand") {
+                    emit_value_ref(op, src, from_id, locals, env, refs);
+                }
+            }
+            "index_expression" => {
+                if let Some(op) = n.child_by_field_name("operand") {
+                    emit_value_ref(op, src, from_id, locals, env, refs);
+                }
+                if let Some(idx) = n.child_by_field_name("index") {
+                    emit_value_ref(idx, src, from_id, locals, env, refs);
+                }
+            }
+            "slice_expression" => {
+                for field in ["operand", "start", "end", "capacity"] {
+                    if let Some(ch) = n.child_by_field_name(field) {
+                        emit_value_ref(ch, src, from_id, locals, env, refs);
+                    }
+                }
+            }
+            "expression_case" => {
+                if let Some(val) = n.child_by_field_name("value") {
+                    emit_expr_list_refs(val, src, from_id, locals, env, refs);
+                }
+            }
+            "if_statement" | "for_statement" => {
+                if let Some(cond) = n.child_by_field_name("condition") {
+                    emit_value_ref(cond, src, from_id, locals, env, refs);
+                }
+            }
+            "expression_switch_statement" => {
+                if let Some(val) = n.child_by_field_name("value") {
+                    emit_value_ref(val, src, from_id, locals, env, refs);
+                }
+            }
+            "range_clause" => {
+                if let Some(rhs) = n.child_by_field_name("right") {
+                    emit_value_ref(rhs, src, from_id, locals, env, refs);
+                }
+            }
+            "inc_statement" | "dec_statement" => {
+                if let Some(op) = n.named_child(0) {
+                    emit_value_ref(op, src, from_id, locals, env, refs);
+                }
+            }
+            "selector_expression" => {
+                if let Some(op) = n.child_by_field_name("operand") {
+                    emit_value_ref(op, src, from_id, locals, env, refs);
                 }
             }
             "return_statement" => {
@@ -1540,6 +1670,22 @@ fn collect_refs_and_bridges(
                 }
             }
             "keyed_element" => {
+                if let Some(key_elem) = n.child_by_field_name("key") {
+                    let key = if key_elem.kind() == "literal_element" {
+                        key_elem.named_child(0).unwrap_or(key_elem)
+                    } else {
+                        key_elem
+                    };
+                    let is_non_struct_literal = n
+                        .parent()
+                        .and_then(|p| p.parent())
+                        .filter(|p| p.kind() == "composite_literal")
+                        .and_then(|cl| cl.child_by_field_name("type"))
+                        .is_some_and(|t| matches!(t.kind(), "map_type" | "slice_type" | "array_type"));
+                    if key.kind() == "selector_expression" || is_non_struct_literal {
+                        emit_value_ref(key, src, from_id, locals, env, refs);
+                    }
+                }
                 if let Some(val_elem) = n.child_by_field_name("value") {
                     let val = if val_elem.kind() == "literal_element" {
                         val_elem.named_child(0).unwrap_or(val_elem)

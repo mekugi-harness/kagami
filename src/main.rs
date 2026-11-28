@@ -2,7 +2,7 @@ use anyhow::Result;
 use clap::{Parser, Subcommand, ValueEnum};
 use kagami::config::{build_path_filter, load_allowlist, KagamiConfig};
 use kagami::graph::blast::{analyze_blast_radius, BlastOptions, Direction};
-use kagami::graph::dead::{analyze_dead, DeadOptions, DeadScope};
+use kagami::graph::dead::{analyze_dead, DeadKinds, DeadOptions, DeadScope};
 use kagami::graph::scip::{apply_scip_overlay, load_scip_file};
 use kagami::graph::CodeGraph;
 use kagami::ir::similar::{find_similar, SimilarOptions};
@@ -91,6 +91,23 @@ impl From<CliDeadScope> for DeadScope {
 }
 
 #[derive(ValueEnum, Debug, Clone, Copy)]
+enum CliDeadKinds {
+    Callables,
+    Types,
+    All,
+}
+
+impl From<CliDeadKinds> for DeadKinds {
+    fn from(k: CliDeadKinds) -> Self {
+        match k {
+            CliDeadKinds::Callables => DeadKinds::Callables,
+            CliDeadKinds::Types => DeadKinds::Types,
+            CliDeadKinds::All => DeadKinds::All,
+        }
+    }
+}
+
+#[derive(ValueEnum, Debug, Clone, Copy)]
 enum CliConfidence {
     Heuristic,
     Resolved,
@@ -148,6 +165,9 @@ enum Commands {
         /// Minimum confidence level to report (heuristic, resolved, exact)
         #[arg(long = "min-confidence", value_enum, default_value = "heuristic")]
         min_confidence: CliConfidence,
+        /// Symbol kinds to report (callables: functions/methods/components/recipes; types: types/structs/interfaces/enums/traits/consts/vars; all: both)
+        #[arg(long, value_enum, default_value = "callables")]
+        kinds: CliDeadKinds,
         /// Max rows in markdown output (0 = unlimited)
         #[arg(long, default_value_t = 100)]
         limit: usize,
@@ -221,6 +241,7 @@ fn main() -> Result<()> {
             allowlist,
             no_clusters,
             min_confidence,
+            kinds,
             limit,
         } => {
             // Index whole repo so callers outside --path still keep symbols alive
@@ -249,6 +270,7 @@ fn main() -> Result<()> {
                     include_clusters: !no_clusters,
                     path_filter,
                     min_confidence: min_confidence.into(),
+                    kinds: kinds.into(),
                 },
             );
             print!("{}", render_dead(&report, fmt, limit)?);
