@@ -1332,6 +1332,7 @@ impl<'a> RustTypeIndex<'a> {
         }
 
         let mut out: Vec<String> = Vec::new();
+        let mut fallback_segs: &[&str] = &raw_segs;
         // When a caller inside an inline module uses `super::...`, consume leading `super`
         // segments against `caller_scope` first so `super::Config` resolves to the enclosing
         // same-file scope before climbing physical file modules.
@@ -1342,6 +1343,7 @@ impl<'a> RustTypeIndex<'a> {
                 scope_parts.pop();
                 idx += 1;
             }
+            fallback_segs = &raw_segs[idx..];
             if idx == raw_segs.len() {
                 let target_scope = scope_parts.join("::");
                 if let Some(ids) = self.file_non_method_syms.get(&(caller_file, target_name)) {
@@ -1381,9 +1383,9 @@ impl<'a> RustTypeIndex<'a> {
             }
         }
         // Fall back to the raw qualifier path only if no alias expansion resolved.
-        if out.is_empty() {
+        if out.is_empty() && !fallback_segs.is_empty() {
             let mut visited = HashSet::new();
-            for mf in self.resolve_module_files(caller_file, &raw_segs) {
+            for mf in self.resolve_module_files(caller_file, fallback_segs) {
                 for hit in
                     self.resolve_symbol_in_module(&mf, target_name, filter, symbols, 0, &mut visited)
                 {

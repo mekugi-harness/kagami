@@ -396,9 +396,16 @@ enum PatEnum {
 
 const MACRO_CONST: &str = "hello";
 
+struct ParentOnlyType;
+
+mod inner_scope {
+    pub fn use_parent(_: super::ParentOnlyType) {}
+}
+
 fn use_bounded<T: LiveBound>(_v: T) {}
 
 fn main() {
+    inner_scope::use_parent(ParentOnlyType);
     let h = LiveHolder {
         item: ReexportedStruct {
             inner: sub::TransitiveField { n: 1 },
@@ -451,6 +458,7 @@ fn main() {
         "LiveHolder",
         "PatEnum",
         "MACRO_CONST",
+        "ParentOnlyType",
     ] {
         assert!(
             !has(live),
