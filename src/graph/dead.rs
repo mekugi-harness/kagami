@@ -258,14 +258,7 @@ pub fn analyze_dead(graph: &CodeGraph, opts: &DeadOptions) -> DeadReport {
         });
     }
 
-    dead_list.sort_by(|a, b| {
-        b.confidence
-            .cmp(&a.confidence)
-            .then_with(|| a.reason.cmp(&b.reason))
-            .then_with(|| a.file.cmp(&b.file))
-            .then_with(|| a.span.start_line.cmp(&b.span.start_line))
-            .then_with(|| a.symbol.cmp(&b.symbol))
-    });
+    sort_dead_symbols(&mut dead_list);
 
     DeadReport {
         total_symbols: graph.symbols.len(),
@@ -414,14 +407,7 @@ pub fn analyze_dead_snapshot(snap: &GraphSnapshot, opts: &DeadOptions) -> DeadRe
         });
     }
 
-    dead_list.sort_by(|a, b| {
-        b.confidence
-            .cmp(&a.confidence)
-            .then_with(|| a.reason.cmp(&b.reason))
-            .then_with(|| a.file.cmp(&b.file))
-            .then_with(|| a.span.start_line.cmp(&b.span.start_line))
-            .then_with(|| a.symbol.cmp(&b.symbol))
-    });
+    sort_dead_symbols(&mut dead_list);
 
     DeadReport {
         total_symbols: n,
@@ -430,4 +416,25 @@ pub fn analyze_dead_snapshot(snap: &GraphSnapshot, opts: &DeadOptions) -> DeadRe
         unreachable_clusters,
         symbols: dead_list,
     }
+}
+
+fn dead_reason_rank(reason: &str) -> u8 {
+    match reason {
+        "unreferenced" => 0,
+        "unreachable_cluster" => 1,
+        _ => 2,
+    }
+}
+
+/// Sorts dead symbols by confidence descending, then unreferenced ahead of
+/// unreachable_cluster within each confidence tier, then file/line/symbol.
+fn sort_dead_symbols(dead_list: &mut [DeadSymbol]) {
+    dead_list.sort_by(|a, b| {
+        b.confidence
+            .cmp(&a.confidence)
+            .then_with(|| dead_reason_rank(&a.reason).cmp(&dead_reason_rank(&b.reason)))
+            .then_with(|| a.file.cmp(&b.file))
+            .then_with(|| a.span.start_line.cmp(&b.span.start_line))
+            .then_with(|| a.symbol.cmp(&b.symbol))
+    });
 }

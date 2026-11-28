@@ -4147,3 +4147,2098 @@ new Consumer().run();
         );
     }
 }
+
+#[test]
+fn test_bash_trap_just_default_and_dead_sort_order() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    fs::create_dir_all(root.join("scripts")).unwrap();
+
+    fs::write(
+        root.join("scripts/run.sh"),
+        r#"#!/usr/bin/env bash
+cleanup_simple() { echo "simple"; }
+cleanup_compound_a() { echo "a"; }
+cleanup_compound_b() { echo "b"; }
+cleanup_dashdash() { echo "dd"; }
+dead_helper() { echo "dead"; }
+cycle_x() { cycle_y; }
+cycle_y() { cycle_x; }
+
+trap cleanup_simple EXIT INT TERM
+trap 'cleanup_compound_a "$1"; cleanup_compound_b' HUP
+trap -- cleanup_dashdash ERR
+trap - EXIT
+trap '' INT
+trap -p EXIT
+"#,
+    )
+    .unwrap();
+
+    fs::write(
+        root.join("justfile"),
+        r#"
+[private]
+default:
+    echo "first private recipe is bare just entrypoint"
+
+build:
+    ./scripts/run.sh
+
+[private, default]
+explicit_default:
+    echo "explicit [default]"
+
+[private]
+unused_private_helper:
+    echo "should stay dead"
+"#,
+    )
+    .unwrap();
+
+    let ignores = KagamiConfig::default().build_ignore_globset().unwrap();
+    let files = discover_files(root, &ignores, None).unwrap();
+    let graph = CodeGraph::build_for_graph(root, &files, true).unwrap();
+    let opts = DeadOptions {
+        scope: DeadScope::Prod,
+        langs: None,
+        allowlist: std::collections::HashSet::new(),
+        include_clusters: true,
+        path_filter: None,
+        min_confidence: Confidence::Heuristic,
+        kinds: DeadKinds::Callables,
+    };
+
+    let dead = analyze_dead(&graph, &opts);
+    let snap = CodeGraph::try_load_cached_snapshot(root, &files).expect("cached snapshot");
+    let dead_snap = kagami::graph::dead::analyze_dead_snapshot(&snap, &opts);
+
+    for report in [&dead, &dead_snap] {
+        let names: Vec<&str> = report.symbols.iter().map(|s| s.symbol.as_str()).collect();
+        for live in [
+            "cleanup_simple",
+            "cleanup_compound_a",
+            "cleanup_compound_b",
+            "cleanup_dashdash",
+            "default",
+            "explicit_default",
+        ] {
+            assert!(
+                !names.contains(&live),
+                "Expected {live} to be live; dead={:?}",
+                report.symbols
+            );
+        }
+        for expected_dead in ["dead_helper", "unused_private_helper", "cycle_x", "cycle_y"] {
+            assert!(
+                names.contains(&expected_dead),
+                "Expected {expected_dead} to be dead; dead={:?}",
+                report.symbols
+            );
+        }
+        // Verify unreferenced symbols sort strictly before unreachable_cluster symbols
+        let first_cluster = report
+            .symbols
+            .iter()
+            .position(|s| s.reason == "unreachable_cluster")
+            .expect("expected unreachable_cluster entries");
+        let last_unreferenced = report
+            .symbols
+            .iter()
+            .rposition(|s| s.reason == "unreferenced")
+            .expect("expected unreferenced entries");
+        assert!(
+            last_unreferenced < first_cluster,
+            "Expected all unreferenced entries before unreachable_cluster; got {:?}",
+            report.symbols
+        );
+    }
+}
+
+#[test]
+fn test_rust_attr_callbacks_mod_path_and_top_level_macros() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    fs::create_dir_all(root.join("crate-a/src")).unwrap();
+
+    fs::write(
+        root.join("crate-a/Cargo.toml"),
+        "[package]\nname = \"crate-a\"\nversion = \"0.1.0\"\n",
+    )
+    .unwrap();
+
+    fs::write(
+        root.join("crate-a/src/custom_framing.rs"),
+        r#"
+pub(crate) fn contains_envelope(s: &str) -> bool { !s.is_empty() }
+pub(crate) fn unused_framing_fn() {}
+"#,
+    )
+    .unwrap();
+
+    fs::write(
+        root.join("crate-a/src/telemetry.rs"),
+        r#"
+pub(crate) fn trace_process_id(id: &str) -> &str { id }
+pub(crate) fn dead_telemetry_fn() {}
+"#,
+    )
+    .unwrap();
+
+    fs::write(
+        root.join("crate-a/src/main.rs"),
+        r#"
+#[path = "custom_framing.rs"]
+mod framing;
+mod telemetry;
+
+pub(crate) use framing::contains_envelope as contains_source_envelope;
+
+fn parse_socket_path(s: &str) -> String { s.to_string() }
+fn configure_help() {}
+fn positive_budget_limit_schema() {}
+fn positive_count() {}
+fn nullable<T>() {}
+fn hook_scope_label(s: &str) -> &str { s }
+fn unused_attr_callback() {}
+
+struct Handler {
+    event: String,
+}
+impl Handler {
+    fn execution_mode(&self) -> &str { &self.event }
+}
+
+#[command(defer(configure_help))]
+struct CliArgs {
+    #[arg(long = "sock", value_parser = parse_socket_path)]
+    sock: String,
+    #[schemars(schema_with = "positive_budget_limit_schema")]
+    budget: f64,
+}
+
+struct UnusedCliArgs {
+    #[arg(value_parser = unused_attr_callback)]
+    x: String,
+}
+
+#[derive(Deserialize)]
+struct HistoryListWindows {
+    #[serde(default, deserialize_with = "positive_count")]
+    limit: Option<usize>,
+    #[schemars(default, schema_with = "nullable::<String>")]
+    name: Option<String>,
+}
+
+#[tracing::instrument(
+    level = "trace",
+    skip_all,
+    fields(
+        process.id = crate::telemetry::trace_process_id(id),
+        hook.scope = hook_scope_label(handler.execution_mode()),
+    )
+)]
+fn run_hook(id: &str, handler: &Handler) {
+    let _ = contains_source_envelope(id);
+}
+
+fn merge_otel_metadata() {}
+fn dead_macro_helper() {}
+
+struct HelperTargets;
+impl HelperTargets {
+    fn merge_layer(&self) {}
+}
+
+macro_rules! otel_merge_functions {
+    ($($field:ident),+ $(,)?) => {
+        pub(crate) fn merge_otel_requirements(targets: &HelperTargets) {
+            merge_otel_metadata();
+            targets.merge_layer();
+        }
+    };
+}
+
+otel_merge_functions!(a, b);
+
+macro_rules! unused_gen_macro {
+    () => {
+        fn never_called_generated() {
+            dead_macro_helper();
+        }
+    };
+}
+
+unused_gen_macro!();
+
+macro_rules! register_tools {
+    ($($req:ty),+ $(,)?) => {
+        pub(crate) fn history_notes_tools() {
+            tool_spec();
+        }
+    };
+}
+
+fn tool_spec() {}
+
+register_tools!(HistoryListWindows);
+
+fn main() {
+    let _args = CliArgs { sock: String::new(), budget: 1.0 };
+    let h = Handler { event: "ok".into() };
+    run_hook("1", &h);
+    let t = HelperTargets;
+    merge_otel_requirements(&t);
+    history_notes_tools();
+}
+"#,
+    )
+    .unwrap();
+
+    let dead = analyze_rust_dead(root);
+    let is_dead = |sym: &str| dead.symbols.iter().any(|s| s.symbol == sym);
+
+    for live_sym in [
+        "contains_envelope",
+        "trace_process_id",
+        "parse_socket_path",
+        "configure_help",
+        "positive_budget_limit_schema",
+        "positive_count",
+        "nullable",
+        "hook_scope_label",
+        "Handler::execution_mode",
+        "merge_otel_metadata",
+        "HelperTargets::merge_layer",
+        "tool_spec",
+    ] {
+        assert!(
+            !is_dead(live_sym),
+            "Expected {live_sym} to be live; dead={:?}",
+            dead.symbols
+        );
+    }
+
+    for dead_sym in [
+        "unused_framing_fn",
+        "dead_telemetry_fn",
+        "unused_attr_callback",
+        "dead_macro_helper",
+    ] {
+        assert!(
+            is_dead(dead_sym),
+            "Expected {dead_sym} to remain dead; dead={:?}",
+            dead.symbols
+        );
+    }
+}
+
+#[test]
+fn test_rust_cfg_test_propagation_type_lookup_and_attrs() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    fs::create_dir_all(root.join("src/a")).unwrap();
+    fs::create_dir_all(root.join("src/b")).unwrap();
+    fs::create_dir_all(root.join("src/sub")).unwrap();
+    fs::create_dir_all(root.join("src/test_support")).unwrap();
+    fs::create_dir_all(root.join("benches")).unwrap();
+
+    fs::write(
+        root.join("Cargo.toml"),
+        r#"
+[package]
+name = "cfg_prop_demo"
+version = "0.1.0"
+"#,
+    )
+    .unwrap();
+
+    fs::write(
+        root.join("src/test_support.rs"),
+        r#"
+mod nested_fixture;
+pub fn make_test_env() {
+    nested_fixture::seed();
+}
+"#,
+    )
+    .unwrap();
+
+    fs::write(
+        root.join("src/test_support/nested_fixture.rs"),
+        r#"
+pub fn seed() {}
+"#,
+    )
+    .unwrap();
+
+    fs::write(
+        root.join("src/inner_cfg_test.rs"),
+        r#"
+#![cfg(test)]
+pub fn inner_test_helper() {}
+"#,
+    )
+    .unwrap();
+
+    // Associated type `type Selection` in module a must not shadow `struct Selection` in module b.
+    fs::write(
+        root.join("src/a/mod.rs"),
+        r#"
+pub trait HasSelection {
+    type Selection;
+}
+pub struct Decoy;
+impl HasSelection for Decoy {
+    type Selection = u8;
+}
+pub struct Session;
+impl Session {
+    pub fn decoy_run(&self) {}
+}
+"#,
+    )
+    .unwrap();
+
+    fs::write(
+        root.join("src/b/mod.rs"),
+        r#"
+pub struct Selection;
+impl Selection {
+    pub fn apply(&self) {}
+    pub fn unused_sel(&self) {}
+}
+pub struct Session;
+impl Session {
+    pub fn real_run(&self) {}
+}
+"#,
+    )
+    .unwrap();
+
+    // Parent module with private `use ... as SessionAlias;` inherited by submodule via `use super::*;`.
+    fs::write(
+        root.join("src/sub/mod.rs"),
+        r#"
+use crate::b::Session as SessionAlias;
+pub mod child;
+pub fn run_parent() {
+    let s = SessionAlias;
+    child::drive(&s);
+}
+"#,
+    )
+    .unwrap();
+
+    fs::write(
+        root.join("src/sub/child.rs"),
+        r#"
+use super::*;
+pub fn drive(s: &SessionAlias) {
+    s.real_run();
+}
+"#,
+    )
+    .unwrap();
+
+    fs::write(
+        root.join("src/platform.rs"),
+        r#"
+pub struct Platform;
+impl Platform {
+    pub fn open() -> Self { Self }
+    pub fn service(&self) {}
+}
+"#,
+    )
+    .unwrap();
+
+    fs::write(
+        root.join("src/platform_fallback.rs"),
+        r#"
+pub struct Platform;
+impl Platform {
+    pub fn open() -> Self { Self }
+    pub fn service(&self) {}
+}
+"#,
+    )
+    .unwrap();
+
+    fs::write(
+        root.join("src/platform_win.rs"),
+        r#"
+pub struct Platform;
+impl Platform {
+    pub fn open() -> Self { Self }
+    pub fn service(&self) {}
+}
+"#,
+    )
+    .unwrap();
+
+    fs::write(
+        root.join("src/linux_warn.rs"),
+        r#"
+pub fn system_warning() {}
+"#,
+    )
+    .unwrap();
+
+    fs::write(
+        root.join("benches/perf.rs"),
+        r#"
+fn bench_helper() {}
+#[divan::bench]
+fn bench_entry() {
+    bench_helper();
+}
+"#,
+    )
+    .unwrap();
+
+    fs::write(
+        root.join("src/main.rs"),
+        r#"
+mod a;
+mod b;
+mod sub;
+mod linux_warn;
+#[cfg(test)]
+// Comment between #[cfg(test)] and mod item must not wipe pending_attrs!
+mod test_support;
+mod inner_cfg_test;
+
+#[cfg_attr(target_os = "macos", path = "platform_fallback.rs")]
+#[cfg_attr(target_os = "windows", path = "platform_win.rs")]
+mod platform;
+
+#[cfg(target_os = "linux")]
+pub use linux_warn::system_warning;
+#[cfg(not(target_os = "linux"))]
+pub fn system_warning() {}
+
+#[ctor::ctor]
+fn init_global() {
+    ctor_helper();
+}
+fn ctor_helper() {}
+
+fn use_selection(sel: &crate::b::Selection) {
+    sel.apply();
+}
+
+fn dead_prod_fn() {}
+
+fn main() {
+    use_selection(&b::Selection);
+    sub::run_parent();
+    let p = platform::Platform::open();
+    p.service();
+    system_warning();
+}
+"#,
+    )
+    .unwrap();
+
+    let dead_prod = analyze_rust_dead(root);
+    let is_dead_prod = |file_suffix: &str, sym: &str| {
+        dead_prod
+            .symbols
+            .iter()
+            .any(|s| s.file.ends_with(file_suffix) && s.symbol == sym)
+    };
+
+    for (file, sym) in [
+        ("src/test_support.rs", "make_test_env"),
+        ("src/test_support/nested_fixture.rs", "seed"),
+        ("src/inner_cfg_test.rs", "inner_test_helper"),
+        ("benches/perf.rs", "bench_entry"),
+        ("benches/perf.rs", "bench_helper"),
+        ("src/b/mod.rs", "Selection::apply"),
+        ("src/b/mod.rs", "Session::real_run"),
+        ("src/platform.rs", "Platform::open"),
+        ("src/platform.rs", "Platform::service"),
+        ("src/platform_fallback.rs", "Platform::open"),
+        ("src/platform_fallback.rs", "Platform::service"),
+        ("src/platform_win.rs", "Platform::open"),
+        ("src/platform_win.rs", "Platform::service"),
+        ("src/linux_warn.rs", "system_warning"),
+        ("src/main.rs", "system_warning"),
+        ("src/main.rs", "init_global"),
+        ("src/main.rs", "ctor_helper"),
+    ] {
+        assert!(
+            !is_dead_prod(file, sym),
+            "Expected {file}::{sym} to be live/excluded in prod; dead={:?}",
+            dead_prod.symbols
+        );
+    }
+
+    for (file, sym) in [
+        ("src/a/mod.rs", "Session::decoy_run"),
+        ("src/b/mod.rs", "Selection::unused_sel"),
+        ("src/main.rs", "dead_prod_fn"),
+    ] {
+        assert!(
+            is_dead_prod(file, sym),
+            "Expected {file}::{sym} to remain dead in prod; dead={:?}",
+            dead_prod.symbols
+        );
+    }
+}
+
+#[test]
+fn test_rust_tuples_generics_select_cfg_and_ext_traits() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    fs::create_dir_all(root.join("src")).unwrap();
+
+    fs::write(
+        root.join("Cargo.toml"),
+        r#"
+[package]
+name = "rust_batch3_demo"
+version = "0.1.0"
+"#,
+    )
+    .unwrap();
+
+    fs::write(
+        root.join("src/ext.rs"),
+        r#"
+pub trait ForeignConnExt {
+    fn write_query(&self);
+}
+impl ForeignConnExt for external_db::Conn {
+    fn write_query(&self) {
+        ext_impl_helper();
+    }
+}
+fn ext_impl_helper() {}
+
+pub trait AccessBase {
+    fn base_call(&self);
+}
+pub trait AccessExt: AccessBase {
+    fn get_env_var(&self);
+}
+impl<T: AccessBase + ?Sized> AccessExt for T {
+    fn get_env_var(&self) {
+        blanket_ext_helper();
+    }
+}
+fn blanket_ext_helper() {}
+"#,
+    )
+    .unwrap();
+
+    fs::write(
+        root.join("src/unix_obs.rs"),
+        r#"
+pub struct UnixObserver;
+impl UnixObserver {
+    pub fn observe(&self) {}
+}
+"#,
+    )
+    .unwrap();
+
+    fs::write(
+        root.join("src/win_obs.rs"),
+        r#"
+pub struct WinObserver;
+impl WinObserver {
+    pub fn observe(&self) {}
+}
+"#,
+    )
+    .unwrap();
+
+    fs::write(
+        root.join("src/main.rs"),
+        r#"
+mod ext;
+mod unix_obs;
+mod win_obs;
+
+use ext::{AccessBase, AccessExt, ForeignConnExt};
+use std::sync::Arc;
+
+#[cfg(unix)]
+use unix_obs as imp;
+#[cfg(windows)]
+use win_obs as imp;
+
+pub struct CustomError;
+impl CustomError {
+    pub fn sub_error_type(&self) {}
+}
+
+pub struct ViewSpec;
+impl ViewSpec {
+    pub fn label(&self) {}
+}
+
+const VIEWS: [ViewSpec; 1] = [ViewSpec];
+
+pub enum DisplayTab {
+    Analytics,
+}
+impl DisplayTab {
+    pub fn tab_title(&self) {}
+}
+
+pub struct HintItem;
+impl HintItem {
+    pub fn render_hint(&self) {}
+}
+
+pub struct FieldEntry;
+impl FieldEntry {
+    pub fn field_key(&self) {}
+}
+
+pub struct InputEntry;
+impl InputEntry {
+    pub fn input_text(&self) {}
+}
+
+pub struct NetPerms;
+impl NetPerms {
+    pub fn is_empty(&self) -> bool { false }
+}
+
+pub struct TypeMapItem;
+impl TypeMapItem {
+    pub fn from_typemap(&self) {}
+    pub fn from_init(&self) {}
+}
+
+pub struct Value;
+impl Value {
+    pub fn render_val(&self) {}
+}
+
+pub trait DiffConsumer {
+    fn consume_diff(&mut self);
+}
+#[derive(Default)]
+pub struct PatchConsumer;
+impl DiffConsumer for PatchConsumer {
+    fn consume_diff(&mut self) {
+        patch_consumer_helper();
+    }
+}
+fn patch_consumer_helper() {}
+
+pub struct Watcher {
+    #[cfg(unix)]
+    inner: unix_obs::UnixObserver,
+    #[cfg(windows)]
+    inner: win_obs::WinObserver,
+}
+impl Watcher {
+    fn poll(&self) {
+        self.inner.observe();
+    }
+}
+
+pub struct Client {
+    label: String,
+}
+impl Client {
+    fn fail_fast(&self) {}
+}
+
+pub struct SessionHolder {
+    cached: Option<Client>,
+}
+impl SessionHolder {
+    fn cached_client(&self) -> Option<Client> { None }
+    fn run_fail_fast(&self) {
+        let client = match self.cached_client() {
+            Some(c) => c,
+            None => return,
+        };
+        client.fail_fast();
+    }
+}
+
+pub struct SelectTarget;
+impl SelectTarget {
+    fn on_select(&self) {}
+    fn needs_refresh(&self) -> bool { true }
+}
+
+pub struct SelectWrapper {
+    inner: std::cell::RefCell<SelectTarget>,
+}
+
+mod inline_serde {
+    pub fn serialize() {}
+    pub fn deserialize() {}
+}
+
+#[derive(serde::Serialize)]
+pub struct TupleModel(#[serde(with = "inline_serde")] u64);
+
+fn make_tooltip_data() {}
+lazy_static::lazy_static! {
+    static ref ALL_TOOLTIPS: Vec<&'static str> = {
+        make_tooltip_data();
+        vec![]
+    };
+}
+
+fn fallible_op() -> Result<NetPerms, CustomError> {
+    Err(CustomError)
+}
+
+fn get_pair() -> Option<(u64, Arc<HintItem>)> {
+    None
+}
+
+fn get_entries() -> Vec<(FieldEntry, InputEntry)> {
+    Vec::new()
+}
+
+fn run_ext_conn(conn: &external_db::Conn, access: &dyn AccessBase) {
+    conn.write_query();
+    access.get_env_var();
+}
+
+fn use_typemap(ext: &external::Extensions) {
+    if let Some(item) = ext.get::<TypeMapItem>() {
+        item.from_typemap();
+    }
+    let init = ext.get_or_insert_with(TypeMapItem::default);
+    init.from_init();
+}
+
+fn unused_fn_marker() {}
+
+fn main() {
+    let _ = ALL_TOOLTIPS.len();
+    let _ = TupleModel(1);
+    VIEWS[0].label();
+    DisplayTab::Analytics.tab_title();
+    let v = Value;
+    v.render_val();
+
+    if let Err(err) = fallible_op() {
+        err.sub_error_type();
+    }
+    let _ = fallible_op().ok().filter(|p| !p.is_empty());
+
+    let pair = get_pair();
+    match (pair, Some(HintItem)) {
+        (Some((_, h1)), Some(h2)) => {
+            h1.render_hint();
+            h2.render_hint();
+        }
+        _ => {}
+    }
+    for (_i, (f, inp)) in get_entries().iter().enumerate() {
+        f.field_key();
+        inp.input_text();
+    }
+
+    let mut consumer: Option<(u64, Box<dyn DiffConsumer>)> =
+        Some((0, Box::<PatchConsumer>::default()));
+    if let Some((_, c)) = consumer.as_mut() {
+        c.consume_diff();
+    }
+
+    let w = Watcher { inner: unix_obs::UnixObserver };
+    w.poll();
+    let _ = imp::UnixObserver;
+
+    let sh = SessionHolder { cached: None };
+    sh.run_fail_fast();
+
+    let sel_wrap = SelectWrapper {
+        inner: std::cell::RefCell::new(SelectTarget),
+    };
+    let sel_target = SelectTarget;
+    tokio::select! {
+        _ = async {} => {
+            sel_target.on_select();
+        }
+    }
+    let _ = matches!(sel_wrap.inner.borrow().needs_refresh(), true);
+    let _ = (run_ext_conn, use_typemap);
+}
+"#,
+    )
+    .unwrap();
+
+    let dead = analyze_rust_dead(root);
+    let is_dead = |sym: &str| dead.symbols.iter().any(|s| s.symbol == sym);
+
+    for live_sym in [
+        "CustomError::sub_error_type",
+        "ViewSpec::label",
+        "DisplayTab::tab_title",
+        "HintItem::render_hint",
+        "FieldEntry::field_key",
+        "InputEntry::input_text",
+        "NetPerms::is_empty",
+        "TypeMapItem::from_typemap",
+        "TypeMapItem::from_init",
+        "Value::render_val",
+        "PatchConsumer::consume_diff",
+        "patch_consumer_helper",
+        "UnixObserver::observe",
+        "WinObserver::observe",
+        "Client::fail_fast",
+        "SelectTarget::on_select",
+        "SelectTarget::needs_refresh",
+        "serialize",
+        "deserialize",
+        "make_tooltip_data",
+        "ext_impl_helper",
+        "blanket_ext_helper",
+    ] {
+        assert!(
+            !is_dead(live_sym),
+            "Expected {live_sym} to be live; dead={:?}",
+            dead.symbols
+        );
+    }
+
+    assert!(
+        is_dead("unused_fn_marker"),
+        "Expected unused_fn_marker to remain dead; dead={:?}",
+        dead.symbols
+    );
+}
+
+#[test]
+fn test_ts_generators_tests_dir_and_qualifier_disambiguation() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    fs::create_dir_all(root.join("sdk/src")).unwrap();
+    fs::create_dir_all(root.join("sdk/tests")).unwrap();
+    fs::create_dir_all(root.join("src/routes/tests")).unwrap();
+    fs::create_dir_all(root.join("src/lib")).unwrap();
+    fs::create_dir_all(root.join("tests/routes")).unwrap();
+
+    fs::write(
+        root.join("sdk/src/thread.ts"),
+        r#"
+export class Thread {
+  run(): string {
+    return "ok";
+  }
+  start(): void {}
+  unusedThreadMethod(): void {}
+}
+"#,
+    )
+    .unwrap();
+
+    fs::write(
+        root.join("sdk/src/worker.ts"),
+        r#"
+export class Worker {
+  start(): void {}
+}
+export function makeWorker(): any {
+  return new Worker();
+}
+"#,
+    )
+    .unwrap();
+
+    fs::write(
+        root.join("sdk/src/gen.ts"),
+        r#"
+export function* prodGenLive() {
+  yield 1;
+}
+export function* prodGenDead() {
+  yield 2;
+}
+"#,
+    )
+    .unwrap();
+
+    fs::write(
+        root.join("src/lib/results.ts"),
+        r#"
+import { makeWorker } from "../../sdk/src/worker";
+import { prodGenLive } from "../../sdk/src/gen";
+
+export function fetchResults() {
+  const thread = makeWorker();
+  thread.start();
+  return [...prodGenLive()];
+}
+"#,
+    )
+    .unwrap();
+
+    fs::write(
+        root.join("src/lib/route_builder.ts"),
+        r#"
+export function buildRoute() {
+  return "/tests";
+}
+"#,
+    )
+    .unwrap();
+
+    fs::write(
+        root.join("tests/routes/setup.ts"),
+        r#"
+import { buildRoute } from "../../src/lib/route_builder";
+buildRoute();
+"#,
+    )
+    .unwrap();
+
+    fs::write(
+        root.join("src/routes/tests/queries.ts"),
+        r#"
+import { fetchResults } from "../../lib/results";
+
+export function loadTestQueries() {
+  return fetchResults();
+}
+"#,
+    )
+    .unwrap();
+
+    fs::write(
+        root.join("src/routes/tests/+page.ts"),
+        r#"
+import { loadTestQueries } from "./queries";
+
+export function load() {
+  return loadTestQueries();
+}
+"#,
+    )
+    .unwrap();
+
+    fs::write(
+        root.join("sdk/src/exec.ts"),
+        r#"
+export class CodexExec {
+  run(): string {
+    return "exec";
+  }
+}
+"#,
+    )
+    .unwrap();
+
+    fs::write(
+        root.join("sdk/tests/proxy.ts"),
+        r#"
+export function* genStream() {
+  yield 1;
+}
+export function helperInTestsDir() {
+  return [...genStream()];
+}
+"#,
+    )
+    .unwrap();
+
+    fs::write(
+        root.join("sdk/tests/run.test.ts"),
+        r#"
+import { helperInTestsDir } from "./proxy";
+
+function testRun(thread: any) {
+  helperInTestsDir();
+  return thread.run();
+}
+testRun({});
+"#,
+    )
+    .unwrap();
+
+    let ignores = KagamiConfig::default().build_ignore_globset().unwrap();
+    let files = discover_files(root, &ignores, None).unwrap();
+    let graph = CodeGraph::build(root, &files, false).unwrap();
+
+    let dead_all = analyze_dead(
+        &graph,
+        &DeadOptions {
+            scope: DeadScope::All,
+            langs: None,
+            allowlist: std::collections::HashSet::new(),
+            include_clusters: true,
+            path_filter: None,
+            min_confidence: Confidence::Heuristic,
+            kinds: DeadKinds::Callables,
+        },
+    );
+    let is_dead_all = |sym: &str| dead_all.symbols.iter().any(|s| s.symbol == sym);
+
+    assert!(
+        graph.symbols.values().any(|s| s.name == "genStream"),
+        "Expected generator function genStream to be extracted into graph.symbols"
+    );
+    assert!(
+        graph.symbols.values().any(|s| s.name == "prodGenLive"),
+        "Expected generator function prodGenLive to be extracted into graph.symbols"
+    );
+    assert!(
+        graph.symbols.values().any(|s| s.name == "prodGenDead"),
+        "Expected generator function prodGenDead to be extracted into graph.symbols"
+    );
+    assert!(
+        !is_dead_all("genStream"),
+        "Expected generator function genStream to be live; dead={:?}",
+        dead_all.symbols
+    );
+    assert!(
+        !is_dead_all("prodGenLive"),
+        "Expected called production generator prodGenLive to be live; dead={:?}",
+        dead_all.symbols
+    );
+    assert!(
+        is_dead_all("prodGenDead"),
+        "Expected uncalled production generator prodGenDead to be dead; dead={:?}",
+        dead_all.symbols
+    );
+    assert!(
+        !is_dead_all("Worker.start"),
+        "Expected Worker.start to stay live when variable named thread holds a Worker; dead={:?}",
+        dead_all.symbols
+    );
+    assert!(
+        !is_dead_all("Thread.run"),
+        "Expected Thread.run to be resolved via qualifier disambiguation; dead={:?}",
+        dead_all.symbols
+    );
+    assert!(
+        is_dead_all("CodexExec.run"),
+        "Expected CodexExec.run to remain dead when only thread.run() is called; dead={:?}",
+        dead_all.symbols
+    );
+    assert!(
+        is_dead_all("Thread.unusedThreadMethod"),
+        "Expected Thread.unusedThreadMethod to remain dead; dead={:?}",
+        dead_all.symbols
+    );
+
+    let dead_prod = analyze_dead(
+        &graph,
+        &DeadOptions {
+            scope: DeadScope::Prod,
+            langs: None,
+            allowlist: std::collections::HashSet::new(),
+            include_clusters: true,
+            path_filter: None,
+            min_confidence: Confidence::Heuristic,
+            kinds: DeadKinds::Callables,
+        },
+    );
+    assert!(
+        !dead_prod
+            .symbols
+            .iter()
+            .any(|s| s.file.contains("sdk/tests/")),
+        "Expected files under sdk/tests/ to be excluded from --scope prod; dead={:?}",
+        dead_prod.symbols
+    );
+    assert!(
+        !dead_prod
+            .symbols
+            .iter()
+            .any(|s| s.symbol == "loadTestQueries"),
+        "Expected colocated helper src/routes/tests/queries.ts to stay live in --scope prod; dead={:?}",
+        dead_prod.symbols
+    );
+    assert!(
+        !dead_prod.symbols.iter().any(|s| s.symbol == "fetchResults"),
+        "Expected helper called by SvelteKit route src/routes/tests/+page.ts to stay live in --scope prod; dead={:?}",
+        dead_prod.symbols
+    );
+    assert!(
+        !dead_prod.symbols.iter().any(|s| s.symbol == "prodGenLive"),
+        "Expected prodGenLive called via src/routes/tests/+page.ts to stay live in --scope prod; dead={:?}",
+        dead_prod.symbols
+    );
+    assert!(
+        dead_prod.symbols.iter().any(|s| s.symbol == "prodGenDead"),
+        "Expected uncalled prodGenDead to be dead in --scope prod; dead={:?}",
+        dead_prod.symbols
+    );
+    assert!(
+        dead_prod.symbols.iter().any(|s| s.symbol == "buildRoute"),
+        "Expected tests/routes/setup.ts to stay classified as test so buildRoute is dead in --scope prod; dead={:?}",
+        dead_prod.symbols
+    );
+}
+
+#[test]
+fn test_rust_pr20_review_regressions() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    fs::create_dir_all(root.join("src/outer/inner")).unwrap();
+    fs::create_dir_all(root.join("src/bin/tools")).unwrap();
+    fs::create_dir_all(root.join("src/bin/subbin/tools")).unwrap();
+    fs::create_dir_all(root.join("src/bin/tool")).unwrap();
+    fs::create_dir_all(root.join("src/helpers")).unwrap();
+    fs::create_dir_all(root.join("src/feature/helpers")).unwrap();
+    fs::create_dir_all(root.join("src/platform/support")).unwrap();
+    fs::create_dir_all(root.join("src/examples/client")).unwrap();
+    fs::create_dir_all(root.join("src/dir_worker")).unwrap();
+    fs::create_dir_all(root.join("src/branch/selected")).unwrap();
+    fs::create_dir_all(root.join("src/bin/custom_entry")).unwrap();
+    fs::create_dir_all(root.join("src/adapters")).unwrap();
+    fs::create_dir_all(root.join("src/other")).unwrap();
+    fs::create_dir_all(root.join("src/nested_outer/inner_ov")).unwrap();
+    fs::create_dir_all(root.join("src/cond_support")).unwrap();
+    fs::create_dir_all(root.join("src/cond_alt")).unwrap();
+    fs::create_dir_all(root.join("src/bin/server")).unwrap();
+    fs::create_dir_all(root.join("src/unix_layout")).unwrap();
+    fs::create_dir_all(root.join("src/portable_layout")).unwrap();
+    fs::create_dir_all(root.join("src/exh_layout")).unwrap();
+    fs::create_dir_all(root.join("src/exh_unix")).unwrap();
+    fs::create_dir_all(root.join("src/exh_portable")).unwrap();
+    fs::create_dir_all(root.join("src/test_sel")).unwrap();
+    fs::create_dir_all(root.join("src/prod_sel")).unwrap();
+    fs::create_dir_all(root.join("named_pkg/src/bin")).unwrap();
+    fs::create_dir_all(root.join("cli/src")).unwrap();
+    fs::create_dir_all(root.join("shared/sub")).unwrap();
+    fs::create_dir_all(root.join("app")).unwrap();
+
+    fs::write(
+        root.join("Cargo.toml"),
+        r#"[package]
+name = "review_reg"
+version = "0.1.0"
+edition = "2024"
+
+[[bin]]
+name = "custom_app"
+path = "app/entry.rs"
+
+[[bin]]
+name = "custom_entry_bin"
+path = "src/bin/custom_entry/entry.rs"
+
+[[bin]]
+name = "standalone_api_bin"
+path = "src/bin/api.rs"
+"#,
+    )
+    .unwrap();
+
+    // Standalone explicit binary src/bin/api.rs alongside auto-discovered src/bin/server/main.rs
+    fs::write(
+        root.join("src/bin/api.rs"),
+        r#"
+pub fn srv_api_run() {}
+fn main() {}
+"#,
+    )
+    .unwrap();
+    fs::write(
+        root.join("src/bin/server/main.rs"),
+        r#"
+mod api;
+mod worker;
+fn main() {
+    worker::run();
+}
+"#,
+    )
+    .unwrap();
+    fs::write(
+        root.join("src/bin/server/api.rs"),
+        r#"
+pub fn srv_api_run() {}
+"#,
+    )
+    .unwrap();
+    fs::write(
+        root.join("src/bin/server/worker.rs"),
+        r#"
+pub fn run() {
+    crate::api::srv_api_run();
+}
+"#,
+    )
+    .unwrap();
+
+    // Conditional-before-unconditional #[path] + exhaustive complementary cfg_attr
+    fs::write(
+        root.join("src/unix_layout/fixtures.rs"),
+        r#"
+pub fn unix_layout_fixture() {}
+"#,
+    )
+    .unwrap();
+    fs::write(
+        root.join("src/portable_layout/fixtures.rs"),
+        r#"
+pub fn portable_layout_fixture() {}
+"#,
+    )
+    .unwrap();
+    fs::write(
+        root.join("src/exh_layout/fixtures.rs"),
+        r#"
+pub fn orphan_default_layout_fn() {}
+"#,
+    )
+    .unwrap();
+    fs::write(
+        root.join("src/exh_unix/fixtures.rs"),
+        r#"
+pub fn exh_unix_fixture() {}
+"#,
+    )
+    .unwrap();
+    fs::write(
+        root.join("src/exh_portable/fixtures.rs"),
+        r#"
+pub fn exh_portable_fixture() {}
+"#,
+    )
+    .unwrap();
+
+    // #[cfg_attr(test, path = "test_sel")] before #[path = "prod_sel"]: test variant must not keep prod probe live
+    fs::write(
+        root.join("src/test_sel/backend.rs"),
+        r#"
+pub fn run_sel() {
+    crate::test_only_probe();
+}
+"#,
+    )
+    .unwrap();
+    fs::write(
+        root.join("src/prod_sel/backend.rs"),
+        r#"
+pub fn run_sel() {}
+"#,
+    )
+    .unwrap();
+
+    // Name-only [[bin]] with autobins = false
+    fs::write(
+        root.join("named_pkg/Cargo.toml"),
+        r#"[package]
+name = "named_pkg"
+version = "0.1.0"
+edition = "2024"
+autobins = false
+
+[[bin]]
+name = "named_only"
+"#,
+    )
+    .unwrap();
+    fs::write(root.join("named_pkg/src/lib.rs"), "").unwrap();
+    fs::write(
+        root.join("named_pkg/src/bin/named_only.rs"),
+        r#"
+#[cfg(test)]
+mod fixtures;
+fn main() {}
+"#,
+    )
+    .unwrap();
+    fs::write(
+        root.join("named_pkg/src/bin/fixtures.rs"),
+        r#"
+pub fn named_only_bin_fixture() {}
+"#,
+    )
+    .unwrap();
+
+    // Custom entry filename under src/bin/custom_entry/entry.rs with sibling worker.rs calling crate::api::custom_entry_run()
+    fs::write(
+        root.join("src/bin/custom_entry/entry.rs"),
+        r#"
+mod api;
+mod worker;
+fn main() {
+    worker::start();
+}
+"#,
+    )
+    .unwrap();
+    fs::write(
+        root.join("src/bin/custom_entry/api.rs"),
+        r#"
+pub fn custom_entry_run() {}
+"#,
+    )
+    .unwrap();
+    fs::write(
+        root.join("src/bin/custom_entry/worker.rs"),
+        r#"
+pub fn start() {
+    crate::api::custom_entry_run();
+}
+"#,
+    )
+    .unwrap();
+
+    // Nested #[path] inside a #[path]-loaded file + same-named competing module
+    fs::write(
+        root.join("src/worker_impl.rs"),
+        r#"
+pub mod adapters {
+    #[path = "custom.rs"]
+    pub mod chosen;
+    pub fn invoke() {
+        chosen::run_nested();
+    }
+}
+"#,
+    )
+    .unwrap();
+    fs::write(
+        root.join("src/adapters/custom.rs"),
+        r#"
+pub fn run_nested() {}
+"#,
+    )
+    .unwrap();
+    fs::write(
+        root.join("src/other/chosen.rs"),
+        r#"
+pub fn run_nested() {}
+"#,
+    )
+    .unwrap();
+
+    // Inline #[path = "."] mod support { #[cfg(test)] #[path = "fixture_impl.rs"] mod fixtures; }
+    fs::write(
+        root.join("src/fixture_impl.rs"),
+        r#"
+pub fn inline_dot_path_fixture() {}
+"#,
+    )
+    .unwrap();
+
+    // Nested inline #[path] beneath an ordinary inline module: outer/inner_ov/fixtures.rs
+    fs::write(
+        root.join("src/nested_outer/inner_ov/fixtures.rs"),
+        r#"
+pub fn nested_inline_override_fixture() {}
+"#,
+    )
+    .unwrap();
+
+    // Conditional #[cfg_attr(..., path = "cond_alt")] on inline mod keeps both default and alt fixtures
+    fs::write(
+        root.join("src/cond_support/fixtures.rs"),
+        r#"
+pub fn cond_default_fixture() {}
+"#,
+    )
+    .unwrap();
+    fs::write(
+        root.join("src/cond_alt/fixtures.rs"),
+        r#"
+pub fn cond_alt_fixture() {}
+"#,
+    )
+    .unwrap();
+
+    // Binary crate root src/bin/admin.rs -> src/bin/tools/fixtures.rs
+    fs::write(
+        root.join("src/bin/admin.rs"),
+        r#"
+mod tools {
+    #[cfg(test)]
+    mod fixtures;
+}
+fn main() {}
+"#,
+    )
+    .unwrap();
+    fs::write(
+        root.join("src/bin/tools/fixtures.rs"),
+        r#"
+pub fn bin_fixture_helper() {}
+"#,
+    )
+    .unwrap();
+
+    // Custom [[bin]] root app/entry.rs calling crate::api::make().go()
+    fs::write(
+        root.join("app/entry.rs"),
+        r#"
+#[cfg(test)]
+mod fixtures;
+
+pub struct CustomClient;
+impl CustomClient {
+    pub fn go(&self) {}
+}
+mod api {
+    use super::CustomClient;
+    pub fn make() -> CustomClient {
+        CustomClient
+    }
+}
+fn main() {
+    let c = crate::api::make();
+    c.go();
+}
+"#,
+    )
+    .unwrap();
+    fs::write(
+        root.join("app/fixtures.rs"),
+        r#"
+pub fn custom_bin_fixture() {}
+"#,
+    )
+    .unwrap();
+
+    // Binary child module src/bin/subbin/main.rs -> tools.rs -> tools/fixtures.rs
+    fs::write(
+        root.join("src/bin/subbin/main.rs"),
+        r#"
+mod tools;
+fn main() {}
+"#,
+    )
+    .unwrap();
+    fs::write(
+        root.join("src/bin/subbin/tools.rs"),
+        r#"
+#[cfg(test)]
+mod fixtures;
+"#,
+    )
+    .unwrap();
+    fs::write(
+        root.join("src/bin/subbin/tools/fixtures.rs"),
+        r#"
+pub fn subbin_tool_fixture() {}
+"#,
+    )
+    .unwrap();
+
+    // Disjoint same-named fixtures: src/helpers/fixtures.rs (test-only from main.rs)
+    // vs src/feature/helpers/fixtures.rs (prod from feature.rs)
+    fs::write(
+        root.join("src/helpers/fixtures.rs"),
+        r#"
+pub fn root_test_fixture() {}
+"#,
+    )
+    .unwrap();
+    fs::write(
+        root.join("src/feature.rs"),
+        r#"
+pub mod helpers {
+    pub mod fixtures;
+}
+"#,
+    )
+    .unwrap();
+    fs::write(
+        root.join("src/feature/helpers/fixtures.rs"),
+        r#"
+pub fn feature_prod_fixture() {}
+"#,
+    )
+    .unwrap();
+
+    // Parent-relative Cargo target path: cli/Cargo.toml -> ../shared/entry.rs
+    fs::write(
+        root.join("cli/Cargo.toml"),
+        r#"[package]
+name = "cli_app"
+version = "0.1.0"
+edition = "2024"
+
+[[bin]]
+name = "shared_cli"
+path = "../shared/entry.rs"
+"#,
+    )
+    .unwrap();
+    fs::write(root.join("cli/src/lib.rs"), "").unwrap();
+    fs::write(
+        root.join("shared/entry.rs"),
+        r#"
+mod sub {
+    #[cfg(test)]
+    mod fixtures;
+}
+fn main() {}
+"#,
+    )
+    .unwrap();
+    fs::write(
+        root.join("shared/sub/fixtures.rs"),
+        r#"
+pub fn shared_cli_fixture() {}
+"#,
+    )
+    .unwrap();
+
+    // Binary under src/bin/tool/main.rs with inline mod api vs library src/api.rs
+    fs::write(
+        root.join("src/bin/tool/main.rs"),
+        r#"
+mod api {
+    pub fn bin_api_run() {}
+}
+fn main() {
+    crate::api::bin_api_run();
+}
+"#,
+    )
+    .unwrap();
+
+    // #[path = "platform/linux.rs"] mod platform_mod; -> src/platform/support/fixtures.rs
+    fs::write(
+        root.join("src/platform/linux.rs"),
+        r#"
+mod support {
+    #[cfg(test)]
+    mod fixtures;
+}
+"#,
+    )
+    .unwrap();
+    fs::write(
+        root.join("src/platform/support/fixtures.rs"),
+        r#"
+pub fn path_override_fixture() {}
+"#,
+    )
+    .unwrap();
+
+    // Ordinary module under src/examples/ (not a Cargo example target) -> src/examples/client/fixtures.rs
+    fs::write(
+        root.join("src/examples.rs"),
+        r#"
+pub mod client;
+"#,
+    )
+    .unwrap();
+    fs::write(
+        root.join("src/examples/client.rs"),
+        r#"
+#[cfg(test)]
+mod fixtures;
+"#,
+    )
+    .unwrap();
+    fs::write(
+        root.join("src/examples/client/fixtures.rs"),
+        r#"
+pub fn src_examples_client_fixture() {}
+"#,
+    )
+    .unwrap();
+
+    // Cross-file crate::api::nested::make() must resolve to src/api.rs, not worker.rs's inline api::nested
+    fs::write(
+        root.join("src/api.rs"),
+        r#"
+pub fn bin_api_run() {}
+pub fn api_init() {}
+pub mod nested {
+    pub fn make() {}
+}
+"#,
+    )
+    .unwrap();
+
+    // Directory module src/dir_worker/mod.rs calling crate::api::api_init() must reach src/api.rs, not local inline api
+    fs::write(
+        root.join("src/dir_worker/mod.rs"),
+        r#"
+mod api {
+    pub fn api_init() {}
+}
+pub fn run_dir_worker() {
+    crate::api::api_init();
+}
+"#,
+    )
+    .unwrap();
+
+    // Top-level #[path = "selected.rs"] in src/branch.rs must NOT mark src/branch/selected.rs as path-loaded
+    fs::write(
+        root.join("src/selected.rs"),
+        r#"
+pub fn chosen_selected() {}
+"#,
+    )
+    .unwrap();
+    fs::write(
+        root.join("src/branch.rs"),
+        r#"
+#[path = "selected.rs"]
+pub mod chosen;
+pub mod selected;
+"#,
+    )
+    .unwrap();
+    fs::write(
+        root.join("src/branch/selected.rs"),
+        r#"
+#[cfg(test)]
+mod fixtures;
+"#,
+    )
+    .unwrap();
+    fs::write(
+        root.join("src/branch/selected/fixtures.rs"),
+        r#"
+pub fn branch_selected_fixture() {}
+"#,
+    )
+    .unwrap();
+    fs::write(
+        root.join("src/worker.rs"),
+        r#"
+mod api {
+    pub mod nested {
+        pub fn make() {}
+    }
+}
+pub fn run_worker() {
+    crate::api::nested::make();
+}
+"#,
+    )
+    .unwrap();
+
+    // Nested inline module inside non-root file outer.rs -> outer/inner/fixtures.rs
+    fs::write(
+        root.join("src/outer.rs"),
+        r#"
+pub mod inner {
+    #[cfg(test)]
+    mod fixtures;
+}
+"#,
+    )
+    .unwrap();
+
+    fs::write(
+        root.join("src/outer/inner/fixtures.rs"),
+        r#"
+pub fn nested_fixture_helper() {}
+"#,
+    )
+    .unwrap();
+
+    // Multi-platform constructor with short method name go() (below 5-char fallback)
+    fs::write(
+        root.join("src/plat_unix.rs"),
+        r#"
+pub struct Plat;
+impl Plat {
+    pub fn open() -> Self { Self }
+    pub fn go(&self) {}
+}
+"#,
+    )
+    .unwrap();
+    fs::write(
+        root.join("src/plat_win.rs"),
+        r#"
+pub struct Plat;
+impl Plat {
+    pub fn open() -> Self { Self }
+    pub fn go(&self) {}
+}
+"#,
+    )
+    .unwrap();
+    fs::write(
+        root.join("src/plat_mac.rs"),
+        r#"
+pub struct Plat;
+impl Plat {
+    pub fn open() -> Self { Self }
+    pub fn go(&self) {}
+}
+"#,
+    )
+    .unwrap();
+
+    // Re-exported platform function
+    fs::write(
+        root.join("src/windows.rs"),
+        r#"
+pub fn run_windows() {}
+"#,
+    )
+    .unwrap();
+
+    // Separate modules for map_err error-type test
+    fs::write(
+        root.join("src/raw_err.rs"),
+        r#"
+pub struct RawError;
+impl RawError {
+    pub fn report(&self) {}
+}
+pub fn parse_raw() -> Result<(), RawError> {
+    Err(RawError)
+}
+"#,
+    )
+    .unwrap();
+    fs::write(
+        root.join("src/pub_err.rs"),
+        r#"
+pub struct PublicError;
+impl PublicError {
+    pub fn report(&self) {}
+}
+"#,
+    )
+    .unwrap();
+
+    fs::write(
+        root.join("src/main.rs"),
+        r#"
+mod outer;
+mod windows;
+mod raw_err;
+mod pub_err;
+mod feature;
+mod api;
+mod worker;
+mod dir_worker;
+mod branch;
+mod examples;
+#[path = "platform/linux.rs"]
+mod platform_mod;
+#[path = "worker_impl.rs"]
+mod path_worker;
+#[path = "."]
+mod inline_dot_support {
+    #[cfg(test)]
+    #[path = "fixture_impl.rs"]
+    mod fixtures;
+}
+mod nested_outer {
+    #[path = "inner_ov"]
+    mod inner {
+        #[cfg(test)]
+        mod fixtures;
+    }
+}
+#[cfg_attr(feature = "alternate", path = "cond_alt")]
+mod cond_support {
+    #[cfg(test)]
+    mod fixtures;
+}
+#[cfg_attr(unix, path = "unix_layout")]
+#[path = "portable_layout"]
+mod cond_before_fallback {
+    #[cfg(test)]
+    mod fixtures;
+}
+#[cfg_attr(unix, path = "exh_unix")]
+#[cfg_attr(not(unix), path = "exh_portable")]
+mod exh_layout {
+    #[cfg(test)]
+    mod fixtures;
+}
+#[cfg_attr(all(test, unix), path = "test_sel")]
+#[path = "prod_sel"]
+mod test_vs_prod_sel {
+    pub mod backend;
+}
+fn test_only_probe() {}
+
+mod helpers {
+    #[cfg(test)]
+    mod fixtures;
+}
+
+#[cfg_attr(target_os = "linux", path = "plat_unix.rs")]
+#[cfg_attr(target_os = "windows", path = "plat_win.rs")]
+#[cfg_attr(target_os = "macos", path = "plat_mac.rs")]
+mod plat;
+
+#[cfg(unix)]
+mod imp {
+    pub fn run() {}
+}
+#[cfg(windows)]
+mod imp {
+    pub use crate::windows::run_windows as run;
+}
+
+// Doc mentioning "criterion" must NOT mark prod code as test
+#[doc = "Updates the selection criterion."]
+fn update_criterion() {
+    criterion_prod_helper();
+}
+fn criterion_prod_helper() {}
+
+// Out-of-scope inline module trait must NOT be kept live by stdlib text.trim()
+mod legacy {
+    pub trait Trim {
+        fn trim(&self) {
+            legacy_cleanup();
+        }
+    }
+    fn legacy_cleanup() {}
+}
+
+// Aliased parent extension trait import (`use super::Ext as Alias;`)
+mod ext_parent {
+    pub trait CheckExt {
+        fn check_val(&self) {
+            record_check();
+        }
+    }
+    impl CheckExt for str {}
+    fn record_check() {}
+
+    pub mod inner {
+        use super::CheckExt as Alias;
+        pub fn run_check() {
+            "text".check_val();
+        }
+    }
+}
+
+fn main() {
+    update_criterion();
+    imp::run();
+    ext_parent::inner::run_check();
+    worker::run_worker();
+    dir_worker::run_dir_worker();
+    branch::chosen::chosen_selected();
+    path_worker::adapters::invoke();
+    test_vs_prod_sel::backend::run_sel();
+    feature::helpers::fixtures::feature_prod_fixture();
+    let p = plat::Plat::open();
+    p.go();
+    let text = String::from(" hi ");
+    let _ = text.trim();
+    if let Err(err) = raw_err::parse_raw().map_err(|_| pub_err::PublicError) {
+        err.report();
+    }
+}
+"#,
+    )
+    .unwrap();
+
+    let dead_prod = analyze_rust_dead(root);
+    let is_dead = |file_suffix: &str, sym: &str| {
+        dead_prod
+            .symbols
+            .iter()
+            .any(|s| s.file.ends_with(file_suffix) && s.symbol == sym)
+    };
+
+    assert!(
+        !is_dead("src/outer/inner/fixtures.rs", "nested_fixture_helper"),
+        "Expected nested #[cfg(test)] fixture under outer/inner/ to be excluded from prod; dead={:?}",
+        dead_prod.symbols
+    );
+    assert!(
+        !is_dead("src/bin/tools/fixtures.rs", "bin_fixture_helper"),
+        "Expected src/bin/admin.rs #[cfg(test)] fixture under src/bin/tools/ to be excluded from prod; dead={:?}",
+        dead_prod.symbols
+    );
+    assert!(
+        !is_dead("app/entry.rs", "CustomClient::go"),
+        "Expected crate::api::make().go() in custom [[bin]] app/entry.rs to keep CustomClient::go live; dead={:?}",
+        dead_prod.symbols
+    );
+    assert!(
+        !is_dead("app/fixtures.rs", "custom_bin_fixture"),
+        "Expected custom [[bin]] top-level #[cfg(test)] mod fixtures to exclude app/fixtures.rs from prod; dead={:?}",
+        dead_prod.symbols
+    );
+    assert!(
+        !is_dead("src/bin/subbin/tools/fixtures.rs", "subbin_tool_fixture"),
+        "Expected binary child module src/bin/subbin/tools.rs #[cfg(test)] fixture to be excluded from prod; dead={:?}",
+        dead_prod.symbols
+    );
+    assert!(
+        !is_dead("src/helpers/fixtures.rs", "root_test_fixture"),
+        "Expected src/helpers/fixtures.rs to remain test-only and not be adopted by src/feature.rs; dead={:?}",
+        dead_prod.symbols
+    );
+    assert!(
+        !is_dead("src/api.rs", "make"),
+        "Expected crate::api::nested::make() from worker.rs to resolve to src/api.rs; dead={:?}",
+        dead_prod.symbols
+    );
+    assert!(
+        is_dead("src/worker.rs", "make"),
+        "Expected shadowing inline worker::api::nested::make to remain dead; dead={:?}",
+        dead_prod.symbols
+    );
+    assert!(
+        !is_dead("src/bin/tool/main.rs", "bin_api_run"),
+        "Expected src/bin/tool/main.rs crate::api::bin_api_run() to stay live; dead={:?}",
+        dead_prod.symbols
+    );
+    assert!(
+        is_dead("src/api.rs", "bin_api_run"),
+        "Expected library src/api.rs::bin_api_run to stay dead when only bin/tool calls crate::api::bin_api_run(); dead={:?}",
+        dead_prod.symbols
+    );
+    assert!(
+        !is_dead("src/api.rs", "api_init"),
+        "Expected src/dir_worker/mod.rs crate::api::api_init() to resolve to src/api.rs; dead={:?}",
+        dead_prod.symbols
+    );
+    assert!(
+        is_dead("src/dir_worker/mod.rs", "api_init"),
+        "Expected shadowing inline dir_worker::api::api_init to remain dead; dead={:?}",
+        dead_prod.symbols
+    );
+    assert!(
+        !is_dead("src/branch/selected/fixtures.rs", "branch_selected_fixture"),
+        "Expected ordinary src/branch/selected.rs #[cfg(test)] fixture to be excluded from prod; dead={:?}",
+        dead_prod.symbols
+    );
+    assert!(
+        !is_dead("src/platform/support/fixtures.rs", "path_override_fixture"),
+        "Expected #[path]-loaded module's inline #[cfg(test)] fixture to be excluded from prod; dead={:?}",
+        dead_prod.symbols
+    );
+    assert!(
+        !is_dead(
+            "src/examples/client/fixtures.rs",
+            "src_examples_client_fixture"
+        ),
+        "Expected ordinary src/examples/client.rs #[cfg(test)] fixture to be excluded from prod; dead={:?}",
+        dead_prod.symbols
+    );
+    assert!(
+        !is_dead("shared/sub/fixtures.rs", "shared_cli_fixture"),
+        "Expected normalized ../shared/entry.rs binary root #[cfg(test)] fixture to be excluded from prod; dead={:?}",
+        dead_prod.symbols
+    );
+    assert!(
+        !is_dead("named_pkg/src/bin/fixtures.rs", "named_only_bin_fixture"),
+        "Expected name-only [[bin]] with autobins=false fixture to be excluded from prod; dead={:?}",
+        dead_prod.symbols
+    );
+    assert!(
+        !is_dead("src/bin/custom_entry/api.rs", "custom_entry_run"),
+        "Expected sibling module under custom-entry binary to resolve crate::api::custom_entry_run(); dead={:?}",
+        dead_prod.symbols
+    );
+    assert!(
+        !is_dead("src/adapters/custom.rs", "run_nested"),
+        "Expected nested #[path] inside #[path]-loaded file to keep src/adapters/custom.rs::run_nested live; dead={:?}",
+        dead_prod.symbols
+    );
+    assert!(
+        is_dead("src/other/chosen.rs", "run_nested"),
+        "Expected competing src/other/chosen.rs::run_nested to remain dead; dead={:?}",
+        dead_prod.symbols
+    );
+    assert!(
+        !is_dead("src/fixture_impl.rs", "inline_dot_path_fixture"),
+        "Expected #[path = \".\"] inline module #[cfg(test)] fixture to be excluded from prod; dead={:?}",
+        dead_prod.symbols
+    );
+    assert!(
+        !is_dead(
+            "src/nested_outer/inner_ov/fixtures.rs",
+            "nested_inline_override_fixture"
+        ),
+        "Expected nested inline #[path] under ordinary inline mod to exclude outer/inner_ov/fixtures.rs; dead={:?}",
+        dead_prod.symbols
+    );
+    assert!(
+        !is_dead("src/cond_support/fixtures.rs", "cond_default_fixture"),
+        "Expected conditional #[cfg_attr(..., path = ...)] inline mod to retain default fixture dir; dead={:?}",
+        dead_prod.symbols
+    );
+    assert!(
+        !is_dead("src/cond_alt/fixtures.rs", "cond_alt_fixture"),
+        "Expected conditional #[cfg_attr(..., path = ...)] inline mod to also cover alt fixture dir; dead={:?}",
+        dead_prod.symbols
+    );
+    assert!(
+        !is_dead("src/bin/server/api.rs", "srv_api_run"),
+        "Expected src/bin/server/worker.rs crate::api::srv_api_run() to resolve to src/bin/server/api.rs; dead={:?}",
+        dead_prod.symbols
+    );
+    assert!(
+        is_dead("src/bin/api.rs", "srv_api_run"),
+        "Expected standalone src/bin/api.rs::srv_api_run to remain dead; dead={:?}",
+        dead_prod.symbols
+    );
+    assert!(
+        !is_dead("src/unix_layout/fixtures.rs", "unix_layout_fixture"),
+        "Expected conditional #[cfg_attr(unix, path = ...)] before #[path = ...] to exclude unix_layout/fixtures.rs; dead={:?}",
+        dead_prod.symbols
+    );
+    assert!(
+        !is_dead("src/portable_layout/fixtures.rs", "portable_layout_fixture"),
+        "Expected fallback #[path = ...] fixture to be excluded; dead={:?}",
+        dead_prod.symbols
+    );
+    assert!(
+        is_dead("src/exh_layout/fixtures.rs", "orphan_default_layout_fn"),
+        "Expected orphan file in unreachable default dir of exhaustive cfg_attr to remain reportable; dead={:?}",
+        dead_prod.symbols
+    );
+    assert!(
+        !is_dead("src/exh_unix/fixtures.rs", "exh_unix_fixture"),
+        "Expected exhaustive cfg_attr unix fixture to be excluded; dead={:?}",
+        dead_prod.symbols
+    );
+    assert!(
+        !is_dead("src/exh_portable/fixtures.rs", "exh_portable_fixture"),
+        "Expected exhaustive cfg_attr portable fixture to be excluded; dead={:?}",
+        dead_prod.symbols
+    );
+    assert!(
+        is_dead("src/main.rs", "test_only_probe"),
+        "Expected symbol called only by #[cfg_attr(test, path = ...)] backend to remain dead in --scope prod; dead={:?}",
+        dead_prod.symbols
+    );
+    assert!(
+        !is_dead("src/main.rs", "record_check"),
+        "Expected aliased parent trait import (use super::CheckExt as Alias) to keep record_check live; dead={:?}",
+        dead_prod.symbols
+    );
+    assert!(
+        !is_dead("src/main.rs", "criterion_prod_helper"),
+        "Expected helper called by #[doc = \"...criterion...\"] fn to stay live in prod; dead={:?}",
+        dead_prod.symbols
+    );
+    assert!(
+        !is_dead("src/windows.rs", "run_windows"),
+        "Expected Windows inline mod re-export run_windows to stay live; dead={:?}",
+        dead_prod.symbols
+    );
+    for f in ["src/plat_unix.rs", "src/plat_win.rs", "src/plat_mac.rs"] {
+        assert!(
+            !is_dead(f, "Plat::go"),
+            "Expected platform variant {f} Plat::go to stay live; dead={:?}",
+            dead_prod.symbols
+        );
+    }
+    assert!(
+        is_dead("src/main.rs", "legacy_cleanup"),
+        "Expected out-of-scope legacy::Trim helper legacy_cleanup to remain dead; dead={:?}",
+        dead_prod.symbols
+    );
+    assert!(
+        !is_dead("src/pub_err.rs", "PublicError::report"),
+        "Expected PublicError::report to stay live after map_err; dead={:?}",
+        dead_prod.symbols
+    );
+}

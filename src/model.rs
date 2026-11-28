@@ -134,6 +134,8 @@ pub enum ReceiverStep {
     },
     /// Element access via indexing (x[i]) or range iteration on a slice/array/map.
     Elem,
+    /// Tuple element projection (e.g. `let (a, b) = pair;` or `if let Some((_, setup)) = opt`).
+    TupleElem(usize),
     /// Callback parameter type inferred from a callee's Fn/FnMut/FnOnce parameter signature.
     /// When used as the first step, resolves a free or scoped function call; when used after
     /// another step, resolves a method call on the current receiver type.
@@ -210,11 +212,24 @@ pub struct RustUseItem {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RustModPath {
+    #[serde(default)]
+    pub mod_scope: String,
+    pub mod_name: String,
+    #[serde(default)]
+    pub path: Option<String>,
+    #[serde(default)]
+    pub is_test: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct FileExtract {
     pub file: String,
     pub lang: Language,
     pub blake3: String,
     pub package_or_module: String,
+    #[serde(default)]
+    pub is_test_file: bool,
     pub imports: Vec<String>,
     pub symbols: Vec<Symbol>,
     pub refs: Vec<RawRef>,
@@ -252,6 +267,15 @@ pub struct FileExtract {
     /// Structured Rust `use` items (aliases, imports, and `pub use` re-exports).
     #[serde(default)]
     pub rust_uses: Vec<RustUseItem>,
+    /// Rust external `mod name;` declarations (with optional `#[path = "..."]` override).
+    #[serde(default)]
+    pub rust_mod_paths: Vec<RustModPath>,
+    /// Rust `macro_rules! foo` definitions -> literal fn/const/static item names generated in their body.
+    #[serde(default)]
+    pub rust_macro_defs: HashMap<String, Vec<String>>,
+    /// Top-level Rust macro invocations: (invocation_symbol_id, macro_name_with_bang).
+    #[serde(default)]
+    pub rust_top_level_macros: Vec<(String, String)>,
     /// Symbol ID -> inline module path where the symbol was defined (non-empty only inside inline `mod`).
     #[serde(default)]
     pub symbol_mod_scopes: HashMap<String, String>,

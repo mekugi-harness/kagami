@@ -262,11 +262,12 @@ impl CodeGraph {
     }
 
     pub fn from_extracts_with_crates(
-        extracts: Vec<FileExtract>,
+        mut extracts: Vec<FileExtract>,
         crate_roots: HashMap<String, CargoCrateInfo>,
     ) -> Self {
         let prof = std::env::var_os("KAGAMI_PROFILE").is_some();
         let t0 = std::time::Instant::now();
+        crate::graph::rust_index::propagate_rust_cfg_test_modules(&mut extracts, &crate_roots);
         let total_syms: usize = extracts.iter().map(|e| e.symbols.len()).sum();
         let mut symbols: HashMap<String, Symbol> = HashMap::with_capacity(total_syms);
         let mut known_files: HashSet<&str> = HashSet::with_capacity(extracts.len());
@@ -1324,7 +1325,8 @@ impl<'a> GoTypeIndex<'a> {
                 }
                 ReceiverStep::Type(_)
                 | ReceiverStep::Call { .. }
-                | ReceiverStep::ClosureParam { .. } => return None,
+                | ReceiverStep::ClosureParam { .. }
+                | ReceiverStep::TupleElem(_) => return None,
             }
         }
         Some(state)
@@ -1815,46 +1817,65 @@ fn resolve_ref(
     // 0c. Precise Rust receiver/field/method-return chain resolution
     if ext.lang == Language::Rust
         && let Some(ref chain) = r.receiver_chain
-        && let Some((target_type_id, 0)) = rust_index.resolve_receiver_chain(
-            ext,
-            &r.from_symbol_id,
-            chain,
-            by_file_name,
-            by_pkg_name,
-            symbols,
-        )
     {
-        let caller_is_test = symbols
-            .get(&r.from_symbol_id)
-            .map(|s| s.is_test)
-            .unwrap_or(false);
-        let methods = rust_index.lookup_methods_on_type(
-            &target_type_id,
-            &r.target_name,
-            caller_is_test,
-        );
-        if !methods.is_empty() {
-            return methods
-                .into_iter()
-                .map(|id| (id, Confidence::Resolved))
-                .collect();
-        }
-        if symbols
-            .get(&target_type_id)
-            .map(|s| s.kind == SymbolKind::Trait)
-            .unwrap_or(false)
-        {
-            if rust_index
-                .trait_methods
-                .get(&target_type_id)
-                .map(|ms| ms.contains(&r.target_name))
-                .unwrap_or(false)
-            {
-                return vec![(target_type_id, Confidence::Resolved)];
+        let resolved_targets: Vec<String> = rust_index
+            .resolve_receiver_chains(
+                ext,
+                &r.from_symbol_id,
+                chain,
+                by_file_name,
+                by_pkg_name,
+                symbols,
+            )
+            .into_iter()
+            .filter_map(|(tid, depth)| if depth == 0 { Some(tid) } else { None })
+            .collect();
+        if !resolved_targets.is_empty() {
+            let caller_is_test = symbols
+                .get(&r.from_symbol_id)
+                .map(|s| s.is_test)
+                .unwrap_or(false);
+            let mut hits: Vec<(String, Confidence)> = Vec::new();
+            let mut seen_ids: FxHashSet<String> = FxHashSet::default();
+            for target_type_id in resolved_targets {
+                let methods = rust_index.lookup_methods_on_type(
+                    &target_type_id,
+                    &r.target_name,
+                    caller_is_test,
+                );
+                if !methods.is_empty() {
+                    for id in methods {
+                        if seen_ids.insert(id.clone()) {
+                            hits.push((id, Confidence::Resolved));
+                        }
+                    }
+                    continue;
+                }
+                if symbols
+                    .get(&target_type_id)
+                    .map(|s| s.kind == SymbolKind::Trait)
+                    .unwrap_or(false)
+                    && rust_index
+                        .trait_methods
+                        .get(&target_type_id)
+                        .map(|ms| ms.contains(&r.target_name))
+                        .unwrap_or(false)
+                    && seen_ids.insert(target_type_id.clone())
+                {
+                    hits.push((target_type_id, Confidence::Resolved));
+                }
             }
-            return Vec::new();
+            if !hits.is_empty() {
+                return hits;
+            }
+            return rust_index.resolve_extension_trait_methods(
+                &ext.file,
+                &r.from_symbol_id,
+                &r.target_name,
+                caller_is_test,
+                symbols,
+            );
         }
-        return Vec::new();
     }
 
     // 1. O(1) same-file match
@@ -1950,33 +1971,53 @@ fn resolve_ref(
             }
         }
 
-        // Rust associated call through a type alias (e.g. TypeAlias::new())
-        if ext.lang == Language::Rust
+        // Rust associated call through a type or module-qualified type (e.g. `TypeAlias::new()`,
+        // `imp::SleepInhibitor::new()`).
+        let is_rust_path_qual = ext.lang == Language::Rust
+            && !qual.is_empty()
+            && qual
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b':');
+        if is_rust_path_qual
             && r.kind == EdgeKind::Calls
-            && qual.chars().next().is_some_and(|c| c.is_ascii_uppercase())
-            && let Some(tid) = rust_index.resolve_direct_type(
-                &ext.file,
-                &ext.package_or_module,
-                &ext.imports,
-                qual,
-                symbols,
-            )
+            && qual
+                .rsplit("::")
+                .next()
+                .is_some_and(|s| s.chars().next().is_some_and(|c| c.is_ascii_uppercase()))
         {
             let caller_is_test = symbols
                 .get(&r.from_symbol_id)
                 .map(|s| s.is_test)
                 .unwrap_or(false);
-            let methods =
-                rust_index.lookup_direct_methods_on_type(&tid, &r.target_name, caller_is_test);
-            return methods
-                .into_iter()
-                .map(|id| (id, Confidence::Resolved))
-                .collect();
+            let tids = rust_index.resolve_direct_types(
+                &ext.file,
+                &ext.package_or_module,
+                &ext.imports,
+                &r.from_symbol_id,
+                qual,
+                caller_is_test,
+                symbols,
+            );
+            if !tids.is_empty() {
+                let mut out = Vec::new();
+                let mut seen_ids: FxHashSet<String> = FxHashSet::default();
+                for tid in tids {
+                    for id in rust_index.lookup_direct_methods_on_type(
+                        &tid,
+                        &r.target_name,
+                        caller_is_test,
+                    ) {
+                        if seen_ids.insert(id.clone()) {
+                            out.push((id, Confidence::Resolved));
+                        }
+                    }
+                }
+                return out;
+            }
         }
 
         // Rust module-qualified function/const/type refs (e.g. auth::connect, types::Config)
-        if ext.lang == Language::Rust && qual.chars().next().is_some_and(|c| c.is_ascii_lowercase())
-        {
+        if is_rust_path_qual && qual.chars().next().is_some_and(|c| c.is_ascii_lowercase()) {
             let caller_is_test = symbols
                 .get(&r.from_symbol_id)
                 .map(|s| s.is_test)
@@ -2052,6 +2093,25 @@ fn resolve_ref(
             {
                 results.push((id.clone(), Confidence::Resolved));
                 found_method = true;
+            }
+        }
+        // For Rust receiver calls where receiver type is external (e.g. sqlx::SqliteConnection),
+        // check extension traits explicitly in scope before falling back to package/global heuristics.
+        if !found_method && ext.lang == Language::Rust && r.kind == EdgeKind::Calls {
+            let caller_is_test = symbols
+                .get(&r.from_symbol_id)
+                .map(|s| s.is_test)
+                .unwrap_or(false);
+            let ext_traits = rust_index.resolve_extension_trait_methods(
+                &ext.file,
+                &r.from_symbol_id,
+                &r.target_name,
+                caller_is_test,
+                symbols,
+            );
+            if !ext_traits.is_empty() {
+                results.extend(ext_traits);
+                return results;
             }
         }
         // Fall back to combined same-package + imported-package methods when same-file lookup finds
@@ -2241,6 +2301,43 @@ fn resolve_ref(
                 .iter()
                 .map(|id| ((*id).clone(), Confidence::Heuristic))
                 .collect();
+        }
+        if matches!(
+            ext.lang,
+            Language::TypeScript | Language::JavaScript | Language::Svelte
+        ) && r.kind == EdgeKind::Calls
+            && cands.len() <= 16
+            && let Some(ref qual) = r.qualifier
+        {
+            let qual_leaf = qual.rsplit('.').next().unwrap_or(qual);
+            let cls_matched: Vec<&String> = cands
+                .iter()
+                .copied()
+                .filter(|id| {
+                    symbols
+                        .get(*id)
+                        .and_then(|s| s.qualified_name.split('.').next())
+                        .is_some_and(|cls| cls.eq_ignore_ascii_case(qual_leaf))
+                })
+                .collect();
+            if cls_matched.len() == 1 {
+                return vec![(cls_matched[0].clone(), Confidence::Heuristic)];
+            }
+            if cls_matched.len() > 1
+                && let Some(top_dir) = ext.file.split('/').next()
+            {
+                let same_dir: Vec<&String> = cls_matched
+                    .into_iter()
+                    .filter(|id| {
+                        symbols
+                            .get(*id)
+                            .is_some_and(|s| s.file.split('/').next() == Some(top_dir))
+                    })
+                    .collect();
+                if same_dir.len() == 1 {
+                    return vec![(same_dir[0].clone(), Confidence::Heuristic)];
+                }
+            }
         }
     }
 

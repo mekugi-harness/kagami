@@ -82,6 +82,7 @@ pub fn extract(
         lang: Language::Bash,
         blake3: blake3_hex,
         package_or_module: rel_path.to_string(),
+        is_test_file: rel_path.contains("test"),
         imports: Vec::new(),
         symbols,
         refs,
@@ -96,6 +97,9 @@ pub fn extract(
         cfg_gated_symbols: std::collections::HashMap::new(),
         type_aliases: std::collections::HashMap::new(),
         rust_uses: Vec::new(),
+        rust_mod_paths: Vec::new(),
+        rust_macro_defs: std::collections::HashMap::new(),
+        rust_top_level_macros: Vec::new(),
         symbol_mod_scopes: std::collections::HashMap::new(),
         func_callback_params: std::collections::HashMap::new(),
         ts_star_reexports: Vec::new(),
@@ -171,6 +175,9 @@ fn collect_bash_walk(
                         line,
                         receiver_chain: None,
                     });
+                    if cmd == "trap" {
+                        extract_bash_trap_refs(&args, current_sym, line, refs);
+                    }
                     // Emit ExecTarget bridges for scripts, binaries, go run, bun run, just
                     emit_bash_exec_bridges(&cmd, &args, current_sym, line, bridges);
                 }
@@ -195,6 +202,89 @@ fn collect_bash_walk(
             _ => {}
         }
         collect_bash_walk(ch, src, rel_path, line_offset, current_sym, symbols, refs, bridges, ir_funcs);
+    }
+}
+
+fn is_simple_bash_ident(s: &str) -> bool {
+    !s.is_empty()
+        && s.chars()
+            .next()
+            .is_some_and(|c| c.is_ascii_alphabetic() || c == '_')
+        && s.chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
+}
+
+fn extract_bash_trap_refs(args: &[String], from_id: &str, line: usize, refs: &mut Vec<RawRef>) {
+    let mut idx = 0;
+    while idx < args.len() {
+        let a = args[idx].as_str();
+        if a == "--" {
+            idx += 1;
+            break;
+        }
+        if a.starts_with('-') && a.len() > 1 {
+            if a.contains('p') || a.contains('l') {
+                return;
+            }
+            idx += 1;
+            continue;
+        }
+        break;
+    }
+    let positional = &args[idx..];
+    if positional.len() < 2 {
+        return;
+    }
+    let action = positional[0].trim();
+    if action.is_empty() || action == "-" {
+        return;
+    }
+    if is_simple_bash_ident(action) {
+        refs.push(RawRef {
+            from_symbol_id: from_id.to_string(),
+            target_name: action.to_string(),
+            qualifier: None,
+            kind: EdgeKind::Calls,
+            line,
+            receiver_chain: None,
+        });
+        return;
+    }
+    let mut parser = Parser::new();
+    if parser
+        .set_language(&tree_sitter_bash::LANGUAGE.into())
+        .is_ok()
+        && let Some(tree) = parser.parse(action, None)
+    {
+        collect_bash_command_names(tree.root_node(), action, from_id, line, refs);
+    }
+}
+
+fn collect_bash_command_names(
+    node: Node<'_>,
+    src: &str,
+    from_id: &str,
+    line: usize,
+    refs: &mut Vec<RawRef>,
+) {
+    if node.kind() == "command"
+        && let Some(cmd_name) = node.child_by_field_name("name")
+    {
+        let cmd = strip_quotes(node_text(cmd_name, src));
+        if is_simple_bash_ident(&cmd) {
+            refs.push(RawRef {
+                from_symbol_id: from_id.to_string(),
+                target_name: cmd,
+                qualifier: None,
+                kind: EdgeKind::Calls,
+                line,
+                receiver_chain: None,
+            });
+        }
+    }
+    let mut c = node.walk();
+    for ch in node.children(&mut c) {
+        collect_bash_command_names(ch, src, from_id, line, refs);
     }
 }
 

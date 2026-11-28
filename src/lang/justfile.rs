@@ -15,6 +15,8 @@ pub fn extract(rel_path: &str, src: &str, blake3_hex: String) -> Result<FileExtr
 
     let mut i = 0;
     let mut pending_private = false;
+    let mut pending_default = false;
+    let mut seen_first_recipe = false;
 
     while i < lines.len() {
         let line = lines[i];
@@ -26,8 +28,13 @@ pub fn extract(rel_path: &str, src: &str, blake3_hex: String) -> Result<FileExtr
             continue;
         }
         if trimmed.starts_with('[') && trimmed.ends_with(']') {
-            if trimmed.contains("private") {
-                pending_private = true;
+            for attr in trimmed[1..trimmed.len() - 1].split(',') {
+                let attr_name = attr.trim();
+                if attr_name == "private" {
+                    pending_private = true;
+                } else if attr_name == "default" {
+                    pending_default = true;
+                }
             }
             i += 1;
             continue;
@@ -61,12 +68,14 @@ pub fn extract(rel_path: &str, src: &str, blake3_hex: String) -> Result<FileExtr
                 });
             }
             pending_private = false;
+            pending_default = false;
             i += 1;
             continue;
         }
         // Variable assignment (:=) or setting (set ...)
         if trimmed.starts_with("set ") || trimmed.contains(":=") {
             pending_private = false;
+            pending_default = false;
             i += 1;
             continue;
         }
@@ -100,6 +109,7 @@ pub fn extract(rel_path: &str, src: &str, blake3_hex: String) -> Result<FileExtr
                 });
             }
             pending_private = false;
+            pending_default = false;
             i += 1;
             continue;
         }
@@ -112,6 +122,9 @@ pub fn extract(rel_path: &str, src: &str, blake3_hex: String) -> Result<FileExtr
                     let name = raw_name.trim_start_matches('@').to_string();
                     if is_valid_recipe_name(&name) {
                         let is_private = pending_private || name.starts_with('_');
+                        let is_first_recipe = !seen_first_recipe;
+                        seen_first_recipe = true;
+                        let is_default_recipe = pending_default || is_first_recipe;
                         let start_line = line_num;
                         let mut body_lines = Vec::new();
                         let mut j = i + 1;
@@ -136,7 +149,7 @@ pub fn extract(rel_path: &str, src: &str, blake3_hex: String) -> Result<FileExtr
                             span: Span { start_line, end_line },
                             visibility: if is_private { Visibility::Private } else { Visibility::Public },
                             is_test: name.contains("test"),
-                            is_entrypoint: !is_private,
+                            is_entrypoint: !is_private || is_default_recipe,
                             is_dynamic_candidate: false,
                             package_or_module: "justfile".to_string(),
                         });
@@ -188,6 +201,7 @@ pub fn extract(rel_path: &str, src: &str, blake3_hex: String) -> Result<FileExtr
                             }
                         }
                         pending_private = false;
+                        pending_default = false;
                         i = j;
                         continue;
                     }
@@ -195,6 +209,7 @@ pub fn extract(rel_path: &str, src: &str, blake3_hex: String) -> Result<FileExtr
             }
         }
         pending_private = false;
+        pending_default = false;
         i += 1;
     }
 
@@ -203,6 +218,7 @@ pub fn extract(rel_path: &str, src: &str, blake3_hex: String) -> Result<FileExtr
         lang: Language::Just,
         blake3: blake3_hex,
         package_or_module: "justfile".to_string(),
+        is_test_file: false,
         imports: Vec::new(),
         symbols,
         refs,
@@ -217,6 +233,9 @@ pub fn extract(rel_path: &str, src: &str, blake3_hex: String) -> Result<FileExtr
         cfg_gated_symbols: std::collections::HashMap::new(),
         type_aliases: std::collections::HashMap::new(),
         rust_uses: Vec::new(),
+        rust_mod_paths: Vec::new(),
+        rust_macro_defs: std::collections::HashMap::new(),
+        rust_top_level_macros: Vec::new(),
         symbol_mod_scopes: std::collections::HashMap::new(),
         func_callback_params: std::collections::HashMap::new(),
         ts_star_reexports: Vec::new(),
