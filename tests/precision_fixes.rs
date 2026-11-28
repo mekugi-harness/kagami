@@ -5952,7 +5952,7 @@ mod exh_layout {
     #[cfg(test)]
     mod fixtures;
 }
-#[cfg_attr(test, path = "test_sel")]
+#[cfg_attr(all(test, unix), path = "test_sel")]
 #[path = "prod_sel"]
 mod test_vs_prod_sel {
     pub mod backend;

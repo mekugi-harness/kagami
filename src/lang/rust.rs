@@ -243,6 +243,19 @@ fn extract_balanced_parens(s: &str) -> Option<&str> {
     None
 }
 
+fn split_top_level_comma(s: &str) -> Option<(&str, &str)> {
+    let mut depth = 0usize;
+    for (i, ch) in s.char_indices() {
+        match ch {
+            '(' => depth += 1,
+            ')' => depth = depth.saturating_sub(1),
+            ',' if depth == 0 => return Some((&s[..i], &s[i + 1..])),
+            _ => {}
+        }
+    }
+    None
+}
+
 fn split_top_level_cfg_args(s: &str) -> Vec<&str> {
     let mut parts = Vec::new();
     let mut depth = 0usize;
@@ -1000,7 +1013,7 @@ fn walk_rust_items(
                             let mut pred_is_test = false;
                             if let Some(idx) = txt.find("cfg_attr(")
                                 && let Some(inner) = extract_balanced_parens(&txt[idx + 9..])
-                                && let Some((pred, _)) = inner.split_once(',')
+                                && let Some((pred, _)) = split_top_level_comma(inner)
                             {
                                 let p = pred.trim();
                                 pred_is_test = !cfg_may_hold_without_test(p);

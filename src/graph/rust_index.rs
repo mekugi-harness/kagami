@@ -397,6 +397,10 @@ pub fn propagate_rust_cfg_test_modules(
         }
     }
 
+    let lib_roots: FxHashSet<&str> = crate_roots
+        .values()
+        .map(|info| info.lib_file.as_str())
+        .collect();
     let mut prod_reachable: FxHashSet<String> = FxHashSet::default();
     let mut queue: std::collections::VecDeque<String> = std::collections::VecDeque::new();
     for ext in extracts.iter() {
@@ -404,7 +408,10 @@ pub fn propagate_rust_cfg_test_modules(
             continue;
         }
         let has_prod_entry = ext.symbols.iter().any(|s| s.is_entrypoint && !s.is_test);
-        if ((!ext.is_test_file && !has_incoming_mod.contains(&ext.file)) || has_prod_entry)
+        let is_prod_lib_root = !ext.is_test_file && lib_roots.contains(ext.file.as_str());
+        if ((!ext.is_test_file && !has_incoming_mod.contains(&ext.file))
+            || has_prod_entry
+            || is_prod_lib_root)
             && prod_reachable.insert(ext.file.clone())
         {
             queue.push_back(ext.file.clone());
