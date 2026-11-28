@@ -108,7 +108,7 @@ pub fn extract(rel_path: &str, src: &str, blake3_hex: String) -> Result<FileExtr
                         func_return_types.insert(id.clone(), ret_types);
                     }
                     let mut env = GoLocalEnv::new(&pkg_aliases, &pkg_var_types);
-                    collect_signature_type_refs(child, src, &id, &env, &mut refs, &mut bridges);
+                    collect_signature_type_refs(child, src, &id, &env, &mut refs);
                     if let Some(body) = child.child_by_field_name("body") {
                         let params = extract_go_params(child, src);
                         let mut seed_locals = params.clone();
@@ -170,7 +170,7 @@ pub fn extract(rel_path: &str, src: &str, blake3_hex: String) -> Result<FileExtr
                         func_return_types.insert(id.clone(), ret_types);
                     }
                     let mut env = GoLocalEnv::new(&pkg_aliases, &pkg_var_types);
-                    collect_signature_type_refs(child, src, &id, &env, &mut refs, &mut bridges);
+                    collect_signature_type_refs(child, src, &id, &env, &mut refs);
                     if let Some(body) = child.child_by_field_name("body") {
                         let params = extract_go_params(child, src);
                         let mut seed_locals = params.clone();
@@ -798,20 +798,58 @@ fn extract_go_return_types(node: Node<'_>, src: &str) -> Vec<String> {
     out
 }
 
+fn is_go_builtin_func(name: &str) -> bool {
+    matches!(
+        name,
+        "append"
+            | "cap"
+            | "clear"
+            | "close"
+            | "complex"
+            | "copy"
+            | "delete"
+            | "imag"
+            | "len"
+            | "make"
+            | "max"
+            | "min"
+            | "new"
+            | "panic"
+            | "print"
+            | "println"
+            | "real"
+            | "recover"
+    )
+}
+
 fn collect_signature_type_refs(
     node: Node<'_>,
     src: &str,
     from_id: &str,
     env: &GoLocalEnv<'_>,
     refs: &mut Vec<RawRef>,
-    bridges: &mut Vec<BridgeHint>,
 ) {
     let empty_locals = HashMap::new();
+    let mut sig_refs = Vec::new();
+    let mut ignored_bridges = Vec::new();
     for field in ["receiver", "type_parameters", "parameters", "result"] {
         if let Some(ch) = node.child_by_field_name(field) {
-            collect_refs_and_bridges(ch, src, from_id, &empty_locals, env, refs, bridges);
+            collect_refs_and_bridges(
+                ch,
+                src,
+                from_id,
+                &empty_locals,
+                env,
+                &mut sig_refs,
+                &mut ignored_bridges,
+            );
         }
     }
+    refs.extend(sig_refs.into_iter().filter(|r| {
+        !(r.kind == EdgeKind::Calls
+            && r.qualifier.is_none()
+            && is_go_builtin_func(&r.target_name))
+    }));
 }
 
 fn emit_qualified_type_ref(node: Node<'_>, src: &str, from_id: &str, refs: &mut Vec<RawRef>) {

@@ -711,6 +711,13 @@ fn test_go_array_type_length_refs() {
 
 const CrossPkgN = 3
 const UnusedCrossPkgN = 9
+
+func min(a, b int) int {
+	if a < b {
+		return a
+	}
+	return b
+}
 "#,
     )
     .unwrap();
@@ -728,6 +735,7 @@ const SliceElemN = 6
 const ExprN = 2
 const StructFieldN = 7
 const LenTarget = "abcd"
+const MinBound = 4
 const TestOnlyN = 8
 const UnusedLocalN = 9
 
@@ -745,9 +753,10 @@ func consumeRows(
 	cross *[pkg.CrossPkgN]int,
 	expr *[ExprN + 1]int,
 	sized *[len(LenTarget)]byte,
+	clamped *[min(MinBound, 2)]byte,
 ) int {
 	var parts [BodyVarN]string
-	_, _, _, _ = p, cross, expr, sized
+	_, _, _, _, _ = p, cross, expr, sized, clamped
 	return len(rows) + len(parts)
 }
 
@@ -755,7 +764,7 @@ func main() {
 	var h Holder
 	_ = h
 	_ = sigRetOnly()
-	_ = consumeRows(nil, nil, nil, nil, nil)
+	_ = consumeRows(nil, nil, nil, nil, nil, nil)
 }
 "#,
     )
@@ -787,6 +796,7 @@ func TestArrayLengthConst(t *testing.T) {
         "ExprN",
         "StructFieldN",
         "LenTarget",
+        "MinBound",
     ] {
         assert!(
             !has(live),
@@ -810,6 +820,13 @@ func TestArrayLengthConst(t *testing.T) {
         has("TestOnlyN"),
         "test-only Go const used in [TestOnlyN]T in *_test.go must stay dead: {:?}",
         dead
+    );
+
+    let dead_callables = run_dead(root, DeadKinds::Callables, DeadScope::Prod);
+    assert!(
+        dead_callables.iter().any(|(_, s, _)| s == "min"),
+        "predeclared min() in array_type length must not keep unrelated pkg.min alive: {:?}",
+        dead_callables
     );
 }
 
@@ -836,8 +853,8 @@ fn accept(a: [u8; LIVE_LEN], b: [u8; EXPR_LEN + 1]) -> usize {
 }
 
 fn main() {
-    let a: [u8; LIVE_LEN] = [0; LIVE_LEN];
-    let b: [u8; EXPR_LEN + 1] = [0; EXPR_LEN + 1];
+    let a: [u8; LIVE_LEN] = [0; 4];
+    let b: [u8; EXPR_LEN + 1] = [0; 3];
     let _ = accept(a, b);
 }
 
