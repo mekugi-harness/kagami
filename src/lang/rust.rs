@@ -34,7 +34,7 @@ struct RustExtractCtx<'a> {
     rust_macro_defs: HashMap<String, Vec<String>>,
     rust_top_level_macros: Vec<(String, String)>,
     symbol_mod_scopes: HashMap<String, String>,
-    mod_dir_override: Option<String>,
+    mod_dir_scopes: Vec<String>,
 }
 
 /// Lexical scope stack for Rust local variables and inferred receiver chains.
@@ -123,7 +123,7 @@ pub fn extract(rel_path: &str, src: &str, blake3_hex: String) -> Result<FileExtr
         rust_macro_defs: HashMap::new(),
         rust_top_level_macros: Vec::new(),
         symbol_mod_scopes: HashMap::new(),
-        mod_dir_override: None,
+        mod_dir_scopes: Vec::new(),
     };
 
     let mut top_methods = Vec::new();
@@ -982,28 +982,60 @@ fn walk_rust_items(
                     format!("{}::{}", mod_path, mod_name)
                 };
                 if let Some(body) = child.child_by_field_name("body") {
-                    let prev_dir_override = ctx.mod_dir_override.clone();
-                    let inline_paths = extract_rust_attr_path_overrides(&attrs, ctx.src);
-                    if let Some(raw) = inline_paths.first() {
-                        let clean = raw.trim().trim_start_matches("./").trim_matches('/');
-                        let seg = if clean == "." { "" } else { clean };
-                        let next_dir = match prev_dir_override.as_deref() {
-                            Some(prev) if !prev.is_empty() && !seg.is_empty() => {
-                                format!("{}/{}", prev, seg)
-                            }
-                            Some(prev) if !prev.is_empty() => prev.to_string(),
-                            _ => seg.to_string(),
-                        };
-                        ctx.mod_dir_override = Some(next_dir);
-                    } else if let Some(ref prev) = prev_dir_override {
-                        let next_dir = if prev.is_empty() {
-                            mod_name.to_string()
-                        } else if mod_name.is_empty() {
-                            prev.clone()
+                    let prev_dir_scopes = ctx.mod_dir_scopes.clone();
+                    let mut uncond_paths = Vec::new();
+                    let mut cond_paths = Vec::new();
+                    for &a in &attrs {
+                        let ps = extract_rust_attr_path_overrides(&[a], ctx.src);
+                        if ps.is_empty() {
+                            continue;
+                        }
+                        if attr_path(node_text(a, ctx.src)) == "path" {
+                            uncond_paths.extend(ps);
                         } else {
-                            format!("{}/{}", prev, mod_name)
+                            cond_paths.extend(ps);
+                        }
+                    }
+                    let join_dir = |base: &str, seg: &str| -> String {
+                        let clean = seg.trim().trim_start_matches("./").trim_matches('/');
+                        let s = if clean == "." { "" } else { clean };
+                        match (base.is_empty(), s.is_empty()) {
+                            (true, true) => String::new(),
+                            (true, false) => s.to_string(),
+                            (false, true) => base.to_string(),
+                            (false, false) => format!("{}/{}", base, s),
+                        }
+                    };
+                    if !uncond_paths.is_empty()
+                        || !cond_paths.is_empty()
+                        || !prev_dir_scopes.is_empty()
+                    {
+                        let bases: Vec<String> = if prev_dir_scopes.is_empty() {
+                            vec![mod_path.replace("::", "/")]
+                        } else {
+                            prev_dir_scopes.clone()
                         };
-                        ctx.mod_dir_override = Some(next_dir);
+                        let mut next_scopes: Vec<String> = Vec::new();
+                        let mut push_scope = |s: String| {
+                            if !next_scopes.contains(&s) {
+                                next_scopes.push(s);
+                            }
+                        };
+                        if !uncond_paths.is_empty() {
+                            for b in &bases {
+                                for p in &uncond_paths {
+                                    push_scope(join_dir(b, p));
+                                }
+                            }
+                        } else {
+                            for b in &bases {
+                                push_scope(join_dir(b, mod_name));
+                                for p in &cond_paths {
+                                    push_scope(join_dir(b, p));
+                                }
+                            }
+                        }
+                        ctx.mod_dir_scopes = next_scopes;
                     }
                     let mut dummy = Vec::new();
                     walk_rust_items(
@@ -1016,29 +1048,31 @@ fn walk_rust_items(
                         sub_cfg,
                         &mut dummy,
                     );
-                    ctx.mod_dir_override = prev_dir_override;
+                    ctx.mod_dir_scopes = prev_dir_scopes;
                 } else if !mod_name.is_empty() {
                     let path_overrides = extract_rust_attr_path_overrides(&attrs, ctx.src);
-                    let dir_scope = ctx
-                        .mod_dir_override
-                        .as_deref()
-                        .unwrap_or(mod_path)
-                        .to_string();
-                    if path_overrides.is_empty() {
-                        ctx.rust_mod_paths.push(RustModPath {
-                            mod_scope: dir_scope,
-                            mod_name: mod_name.to_string(),
-                            path: None,
-                            is_test: sub_test,
-                        });
+                    let scopes: Vec<String> = if ctx.mod_dir_scopes.is_empty() {
+                        vec![mod_path.to_string()]
                     } else {
-                        for p in path_overrides {
+                        ctx.mod_dir_scopes.clone()
+                    };
+                    for dir_scope in scopes {
+                        if path_overrides.is_empty() {
                             ctx.rust_mod_paths.push(RustModPath {
-                                mod_scope: dir_scope.clone(),
+                                mod_scope: dir_scope,
                                 mod_name: mod_name.to_string(),
-                                path: Some(p),
+                                path: None,
                                 is_test: sub_test,
                             });
+                        } else {
+                            for p in &path_overrides {
+                                ctx.rust_mod_paths.push(RustModPath {
+                                    mod_scope: dir_scope.clone(),
+                                    mod_name: mod_name.to_string(),
+                                    path: Some(p.clone()),
+                                    is_test: sub_test,
+                                });
+                            }
                         }
                     }
                 }

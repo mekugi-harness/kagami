@@ -273,6 +273,7 @@ fn discover_path_loaded_files(
     known_rust_files: &FxHashSet<&str>,
     target_roots: &FxHashSet<String>,
     target_root_dirs: &FxHashSet<String>,
+    include_test: bool,
 ) -> FxHashSet<String> {
     let mut path_loaded_files: FxHashSet<String> = FxHashSet::default();
     for _ in 0..4 {
@@ -281,7 +282,13 @@ fn discover_path_loaded_files(
             if ext.lang != Language::Rust || ext.rust_mod_paths.is_empty() {
                 continue;
             }
+            if !include_test && ext.is_test_file {
+                continue;
+            }
             for mp in &ext.rust_mod_paths {
+                if !include_test && mp.is_test {
+                    continue;
+                }
                 let Some(ref raw_path) = mp.path else {
                     continue;
                 };
@@ -332,8 +339,13 @@ pub fn propagate_rust_cfg_test_modules(
         return;
     }
     let known_refs: FxHashSet<&str> = known_rust_files.iter().map(String::as_str).collect();
-    let path_loaded_files =
-        discover_path_loaded_files(extracts, &known_refs, &target_roots, &target_root_dirs);
+    let path_loaded_files = discover_path_loaded_files(
+        extracts,
+        &known_refs,
+        &target_roots,
+        &target_root_dirs,
+        true,
+    );
 
     let mut has_incoming_mod: FxHashSet<String> = FxHashSet::default();
     let mut prod_children: FxHashMap<String, Vec<String>> = FxHashMap::default();
@@ -512,9 +524,20 @@ impl<'a> RustTypeIndex<'a> {
             .filter(|tr| known_files.contains(tr.as_str()))
             .filter_map(|tr| tr.rsplit_once('/').map(|(d, _)| d))
             .filter(|d| !d.is_empty())
+            .filter(|d| !crate_roots.values().any(|info| info.src_dir == *d))
             .collect();
         let mut file_to_crate_root: HashMap<&'a str, String> = HashMap::new();
         for &file in &known_files {
+            // Files inside an explicit non-library target root's directory (works even when autobins = false).
+            if let Some(best_dir) = explicit_target_dirs
+                .iter()
+                .copied()
+                .filter(|d| file.starts_with(&format!("{}/", d)))
+                .max_by_key(|d| d.len())
+            {
+                file_to_crate_root.insert(file, best_dir.to_string());
+                continue;
+            }
             // A multi-file binary under src/bin/<name>/... has its own crate root dir iff
             // src/bin/<name>/main.rs or an explicit Cargo target entry exists inside that directory.
             if let Some(bin_dir) = target_root_dirs
@@ -758,8 +781,13 @@ impl<'a> RustTypeIndex<'a> {
         // Resolve #[path = "..."] mod declarations against known_files and index macro-generated items.
         let mut file_mod_paths: FxHashMap<(&'a str, &'a str), Vec<String>> = FxHashMap::default();
         let mut mod_path_names: FxHashSet<&'a str> = FxHashSet::default();
-        let path_loaded_files =
-            discover_path_loaded_files(extracts, &known_files, &target_roots, &target_root_dirs);
+        let path_loaded_files = discover_path_loaded_files(
+            extracts,
+            &known_files,
+            &target_roots,
+            &target_root_dirs,
+            false,
+        );
         for ext in extracts {
             if ext.lang != Language::Rust {
                 continue;

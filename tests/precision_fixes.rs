@@ -5294,6 +5294,9 @@ fn test_rust_pr20_review_regressions() {
     fs::create_dir_all(root.join("src/bin/custom_entry")).unwrap();
     fs::create_dir_all(root.join("src/adapters")).unwrap();
     fs::create_dir_all(root.join("src/other")).unwrap();
+    fs::create_dir_all(root.join("src/nested_outer/inner_ov")).unwrap();
+    fs::create_dir_all(root.join("src/cond_support")).unwrap();
+    fs::create_dir_all(root.join("src/cond_alt")).unwrap();
     fs::create_dir_all(root.join("named_pkg/src/bin")).unwrap();
     fs::create_dir_all(root.join("cli/src")).unwrap();
     fs::create_dir_all(root.join("shared/sub")).unwrap();
@@ -5412,6 +5415,31 @@ pub fn run_nested() {}
         root.join("src/fixture_impl.rs"),
         r#"
 pub fn inline_dot_path_fixture() {}
+"#,
+    )
+    .unwrap();
+
+    // Nested inline #[path] beneath an ordinary inline module: outer/inner_ov/fixtures.rs
+    fs::write(
+        root.join("src/nested_outer/inner_ov/fixtures.rs"),
+        r#"
+pub fn nested_inline_override_fixture() {}
+"#,
+    )
+    .unwrap();
+
+    // Conditional #[cfg_attr(..., path = "cond_alt")] on inline mod keeps both default and alt fixtures
+    fs::write(
+        root.join("src/cond_support/fixtures.rs"),
+        r#"
+pub fn cond_default_fixture() {}
+"#,
+    )
+    .unwrap();
+    fs::write(
+        root.join("src/cond_alt/fixtures.rs"),
+        r#"
+pub fn cond_alt_fixture() {}
 "#,
     )
     .unwrap();
@@ -5796,6 +5824,18 @@ mod inline_dot_support {
     #[path = "fixture_impl.rs"]
     mod fixtures;
 }
+mod nested_outer {
+    #[path = "inner_ov"]
+    mod inner {
+        #[cfg(test)]
+        mod fixtures;
+    }
+}
+#[cfg_attr(feature = "alternate", path = "cond_alt")]
+mod cond_support {
+    #[cfg(test)]
+    mod fixtures;
+}
 
 mod helpers {
     #[cfg(test)]
@@ -5986,6 +6026,24 @@ fn main() {
     assert!(
         !is_dead("src/fixture_impl.rs", "inline_dot_path_fixture"),
         "Expected #[path = \".\"] inline module #[cfg(test)] fixture to be excluded from prod; dead={:?}",
+        dead_prod.symbols
+    );
+    assert!(
+        !is_dead(
+            "src/nested_outer/inner_ov/fixtures.rs",
+            "nested_inline_override_fixture"
+        ),
+        "Expected nested inline #[path] under ordinary inline mod to exclude outer/inner_ov/fixtures.rs; dead={:?}",
+        dead_prod.symbols
+    );
+    assert!(
+        !is_dead("src/cond_support/fixtures.rs", "cond_default_fixture"),
+        "Expected conditional #[cfg_attr(..., path = ...)] inline mod to retain default fixture dir; dead={:?}",
+        dead_prod.symbols
+    );
+    assert!(
+        !is_dead("src/cond_alt/fixtures.rs", "cond_alt_fixture"),
+        "Expected conditional #[cfg_attr(..., path = ...)] inline mod to also cover alt fixture dir; dead={:?}",
         dead_prod.symbols
     );
     assert!(
