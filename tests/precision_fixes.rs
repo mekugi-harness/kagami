@@ -5291,6 +5291,10 @@ fn test_rust_pr20_review_regressions() {
     fs::create_dir_all(root.join("src/examples/client")).unwrap();
     fs::create_dir_all(root.join("src/dir_worker")).unwrap();
     fs::create_dir_all(root.join("src/branch/selected")).unwrap();
+    fs::create_dir_all(root.join("src/bin/custom_entry")).unwrap();
+    fs::create_dir_all(root.join("src/adapters")).unwrap();
+    fs::create_dir_all(root.join("src/other")).unwrap();
+    fs::create_dir_all(root.join("named_pkg/src/bin")).unwrap();
     fs::create_dir_all(root.join("cli/src")).unwrap();
     fs::create_dir_all(root.join("shared/sub")).unwrap();
     fs::create_dir_all(root.join("app")).unwrap();
@@ -5305,6 +5309,109 @@ edition = "2024"
 [[bin]]
 name = "custom_app"
 path = "app/entry.rs"
+
+[[bin]]
+name = "custom_entry_bin"
+path = "src/bin/custom_entry/entry.rs"
+"#,
+    )
+    .unwrap();
+
+    // Name-only [[bin]] with autobins = false
+    fs::write(
+        root.join("named_pkg/Cargo.toml"),
+        r#"[package]
+name = "named_pkg"
+version = "0.1.0"
+edition = "2024"
+autobins = false
+
+[[bin]]
+name = "named_only"
+"#,
+    )
+    .unwrap();
+    fs::write(root.join("named_pkg/src/lib.rs"), "").unwrap();
+    fs::write(
+        root.join("named_pkg/src/bin/named_only.rs"),
+        r#"
+#[cfg(test)]
+mod fixtures;
+fn main() {}
+"#,
+    )
+    .unwrap();
+    fs::write(
+        root.join("named_pkg/src/bin/fixtures.rs"),
+        r#"
+pub fn named_only_bin_fixture() {}
+"#,
+    )
+    .unwrap();
+
+    // Custom entry filename under src/bin/custom_entry/entry.rs with sibling worker.rs calling crate::api::custom_entry_run()
+    fs::write(
+        root.join("src/bin/custom_entry/entry.rs"),
+        r#"
+mod api;
+mod worker;
+fn main() {
+    worker::start();
+}
+"#,
+    )
+    .unwrap();
+    fs::write(
+        root.join("src/bin/custom_entry/api.rs"),
+        r#"
+pub fn custom_entry_run() {}
+"#,
+    )
+    .unwrap();
+    fs::write(
+        root.join("src/bin/custom_entry/worker.rs"),
+        r#"
+pub fn start() {
+    crate::api::custom_entry_run();
+}
+"#,
+    )
+    .unwrap();
+
+    // Nested #[path] inside a #[path]-loaded file + same-named competing module
+    fs::write(
+        root.join("src/worker_impl.rs"),
+        r#"
+pub mod adapters {
+    #[path = "custom.rs"]
+    pub mod chosen;
+    pub fn invoke() {
+        chosen::run_nested();
+    }
+}
+"#,
+    )
+    .unwrap();
+    fs::write(
+        root.join("src/adapters/custom.rs"),
+        r#"
+pub fn run_nested() {}
+"#,
+    )
+    .unwrap();
+    fs::write(
+        root.join("src/other/chosen.rs"),
+        r#"
+pub fn run_nested() {}
+"#,
+    )
+    .unwrap();
+
+    // Inline #[path = "."] mod support { #[cfg(test)] #[path = "fixture_impl.rs"] mod fixtures; }
+    fs::write(
+        root.join("src/fixture_impl.rs"),
+        r#"
+pub fn inline_dot_path_fixture() {}
 "#,
     )
     .unwrap();
@@ -5681,6 +5788,14 @@ mod branch;
 mod examples;
 #[path = "platform/linux.rs"]
 mod platform_mod;
+#[path = "worker_impl.rs"]
+mod path_worker;
+#[path = "."]
+mod inline_dot_support {
+    #[cfg(test)]
+    #[path = "fixture_impl.rs"]
+    mod fixtures;
+}
 
 mod helpers {
     #[cfg(test)]
@@ -5743,6 +5858,7 @@ fn main() {
     worker::run_worker();
     dir_worker::run_dir_worker();
     branch::chosen::chosen_selected();
+    path_worker::adapters::invoke();
     feature::helpers::fixtures::feature_prod_fixture();
     let p = plat::Plat::open();
     p.go();
@@ -5845,6 +5961,31 @@ fn main() {
     assert!(
         !is_dead("shared/sub/fixtures.rs", "shared_cli_fixture"),
         "Expected normalized ../shared/entry.rs binary root #[cfg(test)] fixture to be excluded from prod; dead={:?}",
+        dead_prod.symbols
+    );
+    assert!(
+        !is_dead("named_pkg/src/bin/fixtures.rs", "named_only_bin_fixture"),
+        "Expected name-only [[bin]] with autobins=false fixture to be excluded from prod; dead={:?}",
+        dead_prod.symbols
+    );
+    assert!(
+        !is_dead("src/bin/custom_entry/api.rs", "custom_entry_run"),
+        "Expected sibling module under custom-entry binary to resolve crate::api::custom_entry_run(); dead={:?}",
+        dead_prod.symbols
+    );
+    assert!(
+        !is_dead("src/adapters/custom.rs", "run_nested"),
+        "Expected nested #[path] inside #[path]-loaded file to keep src/adapters/custom.rs::run_nested live; dead={:?}",
+        dead_prod.symbols
+    );
+    assert!(
+        is_dead("src/other/chosen.rs", "run_nested"),
+        "Expected competing src/other/chosen.rs::run_nested to remain dead; dead={:?}",
+        dead_prod.symbols
+    );
+    assert!(
+        !is_dead("src/fixture_impl.rs", "inline_dot_path_fixture"),
+        "Expected #[path = \".\"] inline module #[cfg(test)] fixture to be excluded from prod; dead={:?}",
         dead_prod.symbols
     );
     assert!(

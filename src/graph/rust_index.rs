@@ -266,6 +266,47 @@ fn rust_mod_base_dirs(
     vec![scoped_dir]
 }
 
+/// Discover Rust files loaded via explicit `#[path = "..."]` (fixed-point up to depth 4)
+/// since Rust resolves children of path-overridden modules relative to their containing directory.
+fn discover_path_loaded_files(
+    extracts: &[FileExtract],
+    known_rust_files: &FxHashSet<&str>,
+    target_roots: &FxHashSet<String>,
+    target_root_dirs: &FxHashSet<String>,
+) -> FxHashSet<String> {
+    let mut path_loaded_files: FxHashSet<String> = FxHashSet::default();
+    for _ in 0..4 {
+        let before = path_loaded_files.len();
+        for ext in extracts.iter() {
+            if ext.lang != Language::Rust || ext.rust_mod_paths.is_empty() {
+                continue;
+            }
+            for mp in &ext.rust_mod_paths {
+                let Some(ref raw_path) = mp.path else {
+                    continue;
+                };
+                for bd in rust_mod_base_dirs(
+                    &ext.file,
+                    &mp.mod_scope,
+                    true,
+                    target_roots,
+                    target_root_dirs,
+                    &path_loaded_files,
+                ) {
+                    let cand = normalize_rel_path_join(&bd, raw_path);
+                    if known_rust_files.contains(cand.as_str()) {
+                        path_loaded_files.insert(cand);
+                    }
+                }
+            }
+        }
+        if path_loaded_files.len() == before {
+            break;
+        }
+    }
+    path_loaded_files
+}
+
 /// Propagate `#[cfg(test)]` transitively from parent Rust files to external child `mod` files
 /// (both `mod foo;` and `#[path = "..."] mod foo;`). Any Rust module file that has incoming `mod`
 /// declarations and is not reachable from any non-test crate/file root via non-test `mod` edges
@@ -290,39 +331,9 @@ pub fn propagate_rust_cfg_test_modules(
     if known_rust_files.is_empty() {
         return;
     }
-
-    // Discover files loaded via explicit `#[path = "..."]` (fixed-point up to depth 4)
-    // since Rust resolves children of path-overridden modules relative to their containing directory.
-    let mut path_loaded_files: FxHashSet<String> = FxHashSet::default();
-    for _ in 0..4 {
-        let before = path_loaded_files.len();
-        for ext in extracts.iter() {
-            if ext.lang != Language::Rust || ext.rust_mod_paths.is_empty() {
-                continue;
-            }
-            for mp in &ext.rust_mod_paths {
-                let Some(ref raw_path) = mp.path else {
-                    continue;
-                };
-                for bd in rust_mod_base_dirs(
-                    &ext.file,
-                    &mp.mod_scope,
-                    true,
-                    &target_roots,
-                    &target_root_dirs,
-                    &path_loaded_files,
-                ) {
-                    let cand = normalize_rel_path_join(&bd, raw_path);
-                    if known_rust_files.contains(&cand) {
-                        path_loaded_files.insert(cand);
-                    }
-                }
-            }
-        }
-        if path_loaded_files.len() == before {
-            break;
-        }
-    }
+    let known_refs: FxHashSet<&str> = known_rust_files.iter().map(String::as_str).collect();
+    let path_loaded_files =
+        discover_path_loaded_files(extracts, &known_refs, &target_roots, &target_root_dirs);
 
     let mut has_incoming_mod: FxHashSet<String> = FxHashSet::default();
     let mut prod_children: FxHashMap<String, Vec<String>> = FxHashMap::default();
@@ -496,9 +507,16 @@ impl<'a> RustTypeIndex<'a> {
             .values()
             .flat_map(|info| info.target_root_dirs.iter().cloned())
             .collect();
+        let explicit_target_dirs: FxHashSet<&str> = target_roots
+            .iter()
+            .filter(|tr| known_files.contains(tr.as_str()))
+            .filter_map(|tr| tr.rsplit_once('/').map(|(d, _)| d))
+            .filter(|d| !d.is_empty())
+            .collect();
         let mut file_to_crate_root: HashMap<&'a str, String> = HashMap::new();
         for &file in &known_files {
-            // A multi-file binary under src/bin/<name>/... has its own crate root dir iff src/bin/<name>/main.rs exists.
+            // A multi-file binary under src/bin/<name>/... has its own crate root dir iff
+            // src/bin/<name>/main.rs or an explicit Cargo target entry exists inside that directory.
             if let Some(bin_dir) = target_root_dirs
                 .iter()
                 .filter(|d| *d == "src/bin" || d.ends_with("/src/bin"))
@@ -508,7 +526,9 @@ impl<'a> RustTypeIndex<'a> {
                         rest.split_once('/').and_then(|(sub, _)| {
                             let cand_dir = format!("{}/{}", d, sub);
                             let cand_main = format!("{}/main.rs", cand_dir);
-                            known_files.contains(cand_main.as_str()).then_some(cand_dir)
+                            (known_files.contains(cand_main.as_str())
+                                || explicit_target_dirs.contains(cand_dir.as_str()))
+                            .then_some(cand_dir)
                         })
                     })
                 })
@@ -738,7 +758,8 @@ impl<'a> RustTypeIndex<'a> {
         // Resolve #[path = "..."] mod declarations against known_files and index macro-generated items.
         let mut file_mod_paths: FxHashMap<(&'a str, &'a str), Vec<String>> = FxHashMap::default();
         let mut mod_path_names: FxHashSet<&'a str> = FxHashSet::default();
-        let empty_path_loaded: FxHashSet<String> = FxHashSet::default();
+        let path_loaded_files =
+            discover_path_loaded_files(extracts, &known_files, &target_roots, &target_root_dirs);
         for ext in extracts {
             if ext.lang != Language::Rust {
                 continue;
@@ -754,7 +775,7 @@ impl<'a> RustTypeIndex<'a> {
                         true,
                         &target_roots,
                         &target_root_dirs,
-                        &empty_path_loaded,
+                        &path_loaded_files,
                     ) {
                         let cand = normalize_rel_path_join(&bd, raw_path);
                         if known_files.contains(cand.as_str()) {
