@@ -3,7 +3,7 @@
 ## Global Flags
 - `--root <dir>`: Repository root (default: current directory).
 - `--path <glob>`: Repeatable glob filter restricting reported results (or indexed scope) to matching relative paths.
-- `--no-cache`: Bypass `.kagami/cache.json`.
+- `--no-cache`: Bypass `.kagami/` binary caches (`cache.bin`, `manifest.bin`, `graph.bin`).
 - `--scip <path>`: Repeatable path to SCIP index files (`.scip` protobuf or `.scip.json`) to overlay compiler-exact edges (`Confidence::Exact`).
 - `--format <md|json>`: Output format (command-specific default: `md`).
 
