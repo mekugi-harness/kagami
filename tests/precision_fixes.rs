@@ -5284,8 +5284,13 @@ fn test_rust_pr20_review_regressions() {
     fs::create_dir_all(root.join("src/outer/inner")).unwrap();
     fs::create_dir_all(root.join("src/bin/tools")).unwrap();
     fs::create_dir_all(root.join("src/bin/subbin/tools")).unwrap();
+    fs::create_dir_all(root.join("src/bin/tool")).unwrap();
     fs::create_dir_all(root.join("src/helpers")).unwrap();
     fs::create_dir_all(root.join("src/feature/helpers")).unwrap();
+    fs::create_dir_all(root.join("src/platform/support")).unwrap();
+    fs::create_dir_all(root.join("src/examples/client")).unwrap();
+    fs::create_dir_all(root.join("cli/src")).unwrap();
+    fs::create_dir_all(root.join("shared/sub")).unwrap();
     fs::create_dir_all(root.join("app")).unwrap();
 
     fs::write(
@@ -5401,6 +5406,97 @@ pub mod helpers {
         root.join("src/feature/helpers/fixtures.rs"),
         r#"
 pub fn feature_prod_fixture() {}
+"#,
+    )
+    .unwrap();
+
+    // Parent-relative Cargo target path: cli/Cargo.toml -> ../shared/entry.rs
+    fs::write(
+        root.join("cli/Cargo.toml"),
+        r#"[package]
+name = "cli_app"
+version = "0.1.0"
+edition = "2024"
+
+[[bin]]
+name = "shared_cli"
+path = "../shared/entry.rs"
+"#,
+    )
+    .unwrap();
+    fs::write(root.join("cli/src/lib.rs"), "").unwrap();
+    fs::write(
+        root.join("shared/entry.rs"),
+        r#"
+mod sub {
+    #[cfg(test)]
+    mod fixtures;
+}
+fn main() {}
+"#,
+    )
+    .unwrap();
+    fs::write(
+        root.join("shared/sub/fixtures.rs"),
+        r#"
+pub fn shared_cli_fixture() {}
+"#,
+    )
+    .unwrap();
+
+    // Binary under src/bin/tool/main.rs with inline mod api vs library src/api.rs
+    fs::write(
+        root.join("src/bin/tool/main.rs"),
+        r#"
+mod api {
+    pub fn bin_api_run() {}
+}
+fn main() {
+    crate::api::bin_api_run();
+}
+"#,
+    )
+    .unwrap();
+
+    // #[path = "platform/linux.rs"] mod platform_mod; -> src/platform/support/fixtures.rs
+    fs::write(
+        root.join("src/platform/linux.rs"),
+        r#"
+mod support {
+    #[cfg(test)]
+    mod fixtures;
+}
+"#,
+    )
+    .unwrap();
+    fs::write(
+        root.join("src/platform/support/fixtures.rs"),
+        r#"
+pub fn path_override_fixture() {}
+"#,
+    )
+    .unwrap();
+
+    // Ordinary module under src/examples/ (not a Cargo example target) -> src/examples/client/fixtures.rs
+    fs::write(
+        root.join("src/examples.rs"),
+        r#"
+pub mod client;
+"#,
+    )
+    .unwrap();
+    fs::write(
+        root.join("src/examples/client.rs"),
+        r#"
+#[cfg(test)]
+mod fixtures;
+"#,
+    )
+    .unwrap();
+    fs::write(
+        root.join("src/examples/client/fixtures.rs"),
+        r#"
+pub fn src_examples_client_fixture() {}
 "#,
     )
     .unwrap();
@@ -5529,6 +5625,9 @@ mod pub_err;
 mod feature;
 mod api;
 mod worker;
+mod examples;
+#[path = "platform/linux.rs"]
+mod platform_mod;
 
 mod helpers {
     #[cfg(test)]
@@ -5648,6 +5747,29 @@ fn main() {
     assert!(
         is_dead("src/worker.rs", "make"),
         "Expected shadowing inline worker::api::nested::make to remain dead; dead={:?}",
+        dead_prod.symbols
+    );
+    assert!(
+        !is_dead("src/bin/tool/main.rs", "bin_api_run"),
+        "Expected src/bin/tool/main.rs crate::api::bin_api_run() to stay live; dead={:?}",
+        dead_prod.symbols
+    );
+    assert!(
+        !is_dead("src/platform/support/fixtures.rs", "path_override_fixture"),
+        "Expected #[path]-loaded module's inline #[cfg(test)] fixture to be excluded from prod; dead={:?}",
+        dead_prod.symbols
+    );
+    assert!(
+        !is_dead(
+            "src/examples/client/fixtures.rs",
+            "src_examples_client_fixture"
+        ),
+        "Expected ordinary src/examples/client.rs #[cfg(test)] fixture to be excluded from prod; dead={:?}",
+        dead_prod.symbols
+    );
+    assert!(
+        !is_dead("shared/sub/fixtures.rs", "shared_cli_fixture"),
+        "Expected normalized ../shared/entry.rs binary root #[cfg(test)] fixture to be excluded from prod; dead={:?}",
         dead_prod.symbols
     );
     assert!(
