@@ -1107,9 +1107,17 @@ fn resolve_ts_exported_symbol(
     target_name: &str,
     known_files: &HashSet<&str>,
     by_file_name: &HashMap<(&str, &str), String>,
+    symbols: &HashMap<String, Symbol>,
     ts_star_reexports: &HashMap<&str, &[String]>,
 ) -> Option<String> {
-    if let Some(id) = by_file_name.get(&(start_file, target_name)) {
+    let is_exported = |id: &String| -> bool {
+        symbols
+            .get(id)
+            .is_some_and(|s| s.visibility == crate::model::Visibility::Public)
+    };
+    if let Some(id) = by_file_name.get(&(start_file, target_name))
+        && is_exported(id)
+    {
         return Some(id.clone());
     }
     let mut visited: HashSet<String> = HashSet::new();
@@ -1128,14 +1136,17 @@ fn resolve_ts_exported_symbol(
                 if !visited.insert(tf.clone()) {
                     continue;
                 }
-                if let Some(id) = by_file_name.get(&(tf.as_str(), target_name)) {
+                if let Some(id) = by_file_name.get(&(tf.as_str(), target_name))
+                    && is_exported(id)
+                {
                     return Some(id.clone());
                 }
                 queue.push_back((tf, depth + 1));
             }
         }
     }
-    None
+    // Fallback for same-name non-exported fallback (e.g. Svelte components or default bindings)
+    by_file_name.get(&(start_file, target_name)).cloned()
 }
 
 fn resolve_ts_module_file(qual: &str, known_files: &HashSet<&str>) -> Option<String> {
@@ -1489,6 +1500,7 @@ fn resolve_ref(
                     &r.target_name,
                     known_files,
                     by_file_name,
+                    symbols,
                     ts_star_reexports,
                 ) {
                     return vec![(id, Confidence::Resolved)];

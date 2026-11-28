@@ -1,6 +1,6 @@
 use globset::GlobSet;
-use kagami::graph::dead::{analyze_dead, DeadKinds, DeadOptions, DeadScope};
 use kagami::graph::CodeGraph;
+use kagami::graph::dead::{DeadKinds, DeadOptions, DeadScope, analyze_dead};
 use kagami::model::{Confidence, SymbolKind};
 use kagami::walker::discover_files;
 use std::collections::HashSet;

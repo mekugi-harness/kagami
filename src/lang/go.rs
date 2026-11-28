@@ -309,6 +309,7 @@ pub fn extract(rel_path: &str, src: &str, blake3_hex: String) -> Result<FileExtr
             "const_declaration" | "var_declaration" => {
                 let specs = collect_var_const_specs(child);
                 let mut inherited_const_type: Option<Node<'_>> = None;
+                let mut inherited_const_value: Option<Node<'_>> = None;
                 for spec in specs {
                     let is_var = spec.kind() == "var_spec";
                     if !is_var {
@@ -316,6 +317,9 @@ pub fn extract(rel_path: &str, src: &str, blake3_hex: String) -> Result<FileExtr
                             inherited_const_type = Some(t);
                         } else if spec.child_by_field_name("value").is_some() {
                             inherited_const_type = None;
+                        }
+                        if let Some(v) = spec.child_by_field_name("value") {
+                            inherited_const_value = Some(v);
                         }
                     }
                     let names = collect_spec_names(spec, src);
@@ -353,6 +357,21 @@ pub fn extract(rel_path: &str, src: &str, blake3_hex: String) -> Result<FileExtr
                         {
                             collect_refs_and_bridges(
                                 ty,
+                                src,
+                                &id,
+                                &empty_locals,
+                                &empty_env,
+                                &mut refs,
+                                &mut bridges,
+                            );
+                        }
+                        if !is_var
+                            && spec.child_by_field_name("value").is_none()
+                            && let Some(val) = inherited_const_value
+                        {
+                            emit_expr_list_refs(val, src, &id, &empty_locals, &empty_env, &mut refs);
+                            collect_refs_and_bridges(
+                                val,
                                 src,
                                 &id,
                                 &empty_locals,
@@ -446,16 +465,22 @@ fn contains_call_outside_func_literal(node: Node<'_>) -> bool {
         match n.kind() {
             "call_expression" => {
                 // Ignore compile-time pointer type conversions like `(*MyStruct)(nil)`
-                // used in `var _ MyInterface = (*MyStruct)(nil)`.
+                // used in `var _ MyInterface = (*MyStruct)(nil)`, while still inspecting
+                // their single argument for nested runtime calls (e.g. `(*Config)(load())`).
                 let is_ptr_conversion = n
                     .child_by_field_name("function")
                     .filter(|f| f.kind() == "parenthesized_expression")
                     .and_then(|p| p.named_child(0))
                     .is_some_and(|inner| {
                         matches!(inner.kind(), "pointer_type" | "unary_expression")
-                    });
+                    })
+                    && n.child_by_field_name("arguments")
+                        .is_some_and(|args| args.named_child_count() == 1);
                 if !is_ptr_conversion {
                     return true;
+                }
+                if let Some(args) = n.child_by_field_name("arguments") {
+                    stack.push(args);
                 }
             }
             "func_literal" => continue,

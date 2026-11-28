@@ -11,7 +11,7 @@ use std::path::Path;
 enum RustSymFilter {
     TypesOnly,
     ValuesOnly,
-    TypesAndValues,
+    TypesAndConsts,
 }
 
 impl RustSymFilter {
@@ -20,11 +20,12 @@ impl RustSymFilter {
             kind,
             SymbolKind::Struct | SymbolKind::Enum | SymbolKind::Type | SymbolKind::Trait
         );
+        let is_const = matches!(kind, SymbolKind::Const | SymbolKind::Var);
         let is_val = matches!(kind, SymbolKind::Function | SymbolKind::Const | SymbolKind::Var);
         match self {
             RustSymFilter::TypesOnly => is_type,
             RustSymFilter::ValuesOnly => is_val,
-            RustSymFilter::TypesAndValues => is_type || is_val,
+            RustSymFilter::TypesAndConsts => is_type || is_const,
         }
     }
 }
@@ -1093,7 +1094,7 @@ impl<'a> RustTypeIndex<'a> {
         symbols: &HashMap<String, Symbol>,
     ) -> Vec<(String, Confidence)> {
         let filter = if include_types {
-            RustSymFilter::TypesAndValues
+            RustSymFilter::TypesAndConsts
         } else {
             RustSymFilter::ValuesOnly
         };
@@ -1296,7 +1297,7 @@ impl<'a> RustTypeIndex<'a> {
         symbols: &HashMap<String, Symbol>,
     ) -> Vec<(String, Confidence)> {
         let filter = if include_types {
-            RustSymFilter::TypesAndValues
+            RustSymFilter::TypesAndConsts
         } else {
             RustSymFilter::ValuesOnly
         };
@@ -2070,7 +2071,7 @@ pub fn resolve_rust_module_qualified(
     symbols: &HashMap<String, Symbol>,
 ) -> Vec<(String, Confidence)> {
     let filter = if include_types {
-        RustSymFilter::TypesAndValues
+        RustSymFilter::TypesAndConsts
     } else {
         RustSymFilter::ValuesOnly
     };
@@ -2210,7 +2211,7 @@ pub fn materialize_rust_trait_and_macro_edges(
                     for mid in &imp.method_ids {
                         if symbols
                             .get(mid)
-                            .is_some_and(|s| s.kind == SymbolKind::Method)
+                            .is_some_and(|s| matches!(s.kind, SymbolKind::Method | SymbolKind::Const))
                         {
                             let line = symbols.get(mid).map(|s| s.span.start_line).unwrap_or(1);
                             push_edge(mid, &tr_id, EdgeKind::TypeRef, Confidence::Resolved, &ext.file, line);

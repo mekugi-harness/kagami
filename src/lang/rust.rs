@@ -411,7 +411,7 @@ fn emit_scoped_call_ref(
     let prefix_parts: Vec<&str> = parts[..parts.len() - 1]
         .iter()
         .copied()
-        .filter(|p| !matches!(*p, "crate" | "super" | "self"))
+        .filter(|p| *p != "self")
         .collect();
     let qual = if prefix_parts.is_empty() {
         None

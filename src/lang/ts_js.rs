@@ -474,7 +474,7 @@ pub(crate) fn collect_svelte_script_context(
     ctx.type_namespace_imports
         .extend(ts_imports.type_namespaces);
     ctx.local_callables
-        .extend(collect_ts_local_callables(tree.root_node(), script_src));
+        .extend(collect_ts_local_callables(tree.root_node(), script_src, false));
     ctx.local_classes
         .extend(collect_ts_local_classes(tree.root_node(), script_src));
     Ok(())
@@ -586,7 +586,8 @@ pub(crate) fn extract_with_context(
     let mut type_imported_bindings = ts_imports.type_bindings;
     let mut namespace_imports = ts_imports.namespaces;
     let mut type_namespace_imports = ts_imports.type_namespaces;
-    let mut local_callables = collect_ts_local_callables(tree.root_node(), src);
+    let mut local_callables =
+        collect_ts_local_callables(tree.root_node(), src, lang != Language::Svelte);
     let mut local_classes = collect_ts_local_classes(tree.root_node(), src);
     let mut svelte_bind_this = HashMap::new();
     if let Some(extra) = extra_ctx {
@@ -980,13 +981,22 @@ fn collect_ts_local_classes(root: Node<'_>, src: &str) -> HashSet<String> {
     classes
 }
 
-fn collect_ts_local_callables(root: Node<'_>, src: &str) -> HashSet<String> {
+fn collect_ts_local_callables(
+    root: Node<'_>,
+    src: &str,
+    include_non_func_vars: bool,
+) -> HashSet<String> {
     let mut callables = HashSet::new();
-    fn visit_top(node: Node<'_>, src: &str, out: &mut HashSet<String>) {
+    fn visit_top(
+        node: Node<'_>,
+        src: &str,
+        include_non_func_vars: bool,
+        out: &mut HashSet<String>,
+    ) {
         let mut c = node.walk();
         for ch in node.children(&mut c) {
             match ch.kind() {
-                "export_statement" => visit_top(ch, src, out),
+                "export_statement" => visit_top(ch, src, include_non_func_vars, out),
                 "function_declaration"
                 | "class_declaration"
                 | "abstract_class_declaration"
@@ -1001,6 +1011,11 @@ fn collect_ts_local_callables(root: Node<'_>, src: &str) -> HashSet<String> {
                         if decl.kind() == "variable_declarator"
                             && let Some(name_node) = decl.child_by_field_name("name")
                             && name_node.kind() == "identifier"
+                            && (include_non_func_vars
+                                || decl
+                                    .child_by_field_name("value")
+                                    .and_then(unwrap_ts_function_value)
+                                    .is_some())
                         {
                             out.insert(node_text(name_node, src).to_string());
                         }
@@ -1010,7 +1025,7 @@ fn collect_ts_local_callables(root: Node<'_>, src: &str) -> HashSet<String> {
             }
         }
     }
-    visit_top(root, src, &mut callables);
+    visit_top(root, src, include_non_func_vars, &mut callables);
     callables
 }
 
@@ -1025,7 +1040,7 @@ fn contains_ts_call_outside_fn(node: Node<'_>) -> bool {
     let mut stack = vec![node];
     while let Some(n) = stack.pop() {
         match n.kind() {
-            "call_expression" | "new_expression" => return true,
+            "call_expression" | "new_expression" | "member_expression" => return true,
             "arrow_function" | "function_expression" | "class" => continue,
             _ => {}
         }
@@ -1242,6 +1257,7 @@ fn walk_ts_nodes(
                             if reexport_source.is_none()
                                 && export_name == ident
                                 && !ctx.imported_bindings.contains_key(ident)
+                                && !ctx.type_imported_bindings.contains_key(ident)
                             {
                                 continue;
                             }
@@ -1538,6 +1554,16 @@ fn walk_ts_nodes(
                                 member.kind(),
                                 "public_field_definition" | "field_definition"
                             ) {
+                                let static_field_cls_info;
+                                let field_cls_info = if has_child_kind(member, "static") {
+                                    static_field_cls_info = EnclosingClassInfo {
+                                        in_static_method: true,
+                                        ..cls_info.clone()
+                                    };
+                                    &static_field_cls_info
+                                } else {
+                                    &cls_info
+                                };
                                 collect_ts_refs_and_bridges(
                                     member,
                                     src,
@@ -1545,7 +1571,7 @@ fn walk_ts_nodes(
                                     &cls_id,
                                     ctx,
                                     &[],
-                                    Some(&cls_info),
+                                    Some(field_cls_info),
                                     refs,
                                     bridges,
                                 );
@@ -2626,7 +2652,20 @@ fn walk_ts_expr_refs(
         }
         "type_identifier" => {
             let t = node_text(n, src);
-            if !matches!(
+            if let Some(binding) = ctx
+                .type_imported_bindings
+                .get(t)
+                .or_else(|| ctx.imported_bindings.get(t))
+            {
+                refs.push(RawRef {
+                    from_symbol_id: from_id.to_string(),
+                    target_name: binding.target_name.clone(),
+                    qualifier: binding.resolved_file.clone(),
+                    kind: EdgeKind::TypeRef,
+                    line,
+                    receiver_chain: None,
+                });
+            } else if !matches!(
                 t,
                 "string"
                     | "number"
@@ -2650,29 +2689,14 @@ fn walk_ts_expr_refs(
                     | "Parameters"
                     | "Awaited"
             ) {
-                if let Some(binding) = ctx
-                    .type_imported_bindings
-                    .get(t)
-                    .or_else(|| ctx.imported_bindings.get(t))
-                {
-                    refs.push(RawRef {
-                        from_symbol_id: from_id.to_string(),
-                        target_name: binding.target_name.clone(),
-                        qualifier: binding.resolved_file.clone(),
-                        kind: EdgeKind::TypeRef,
-                        line,
-                        receiver_chain: None,
-                    });
-                } else {
-                    refs.push(RawRef {
-                        from_symbol_id: from_id.to_string(),
-                        target_name: t.to_string(),
-                        qualifier: None,
-                        kind: EdgeKind::TypeRef,
-                        line,
-                        receiver_chain: None,
-                    });
-                }
+                refs.push(RawRef {
+                    from_symbol_id: from_id.to_string(),
+                    target_name: t.to_string(),
+                    qualifier: None,
+                    kind: EdgeKind::TypeRef,
+                    line,
+                    receiver_chain: None,
+                });
             }
             return;
         }
